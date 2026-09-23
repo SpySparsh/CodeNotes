@@ -36,7 +36,7 @@ describe('GET /api/notes', () => {
     } as any);
 
     const response = await GET();
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(201);
 
     const body = await response.json();
     expect(body.success).toBe(true);
