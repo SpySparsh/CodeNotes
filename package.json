@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "db:migrate": "node scripts/migrate.js",
+    "db:seed": "node scripts/seed-from-json.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.0",
