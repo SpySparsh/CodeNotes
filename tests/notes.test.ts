@@ -47,7 +47,8 @@ describe('GET /api/notes', () => {
     });
 
     expect(db.query).toHaveBeenCalledWith(
-      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC'
+      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC LIMIT $1',
+      [200]
     );
   });
 

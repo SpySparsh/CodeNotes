@@ -4,13 +4,18 @@ import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
 import { recordHttpRequest } from '@/lib/metrics';
 
+// Temporary safety cap: prevents unbounded full-table transfers until explicit
+// cursor/offset pagination is implemented on this endpoint.
+const MAX_NOTES_RETURNED = 200;
+
 export async function GET(request?: Request) {
   const startTime = performance.now();
   const requestId = getRequestId(request);
 
   try {
     const result = await query(
-      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC'
+      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC LIMIT $1',
+      [MAX_NOTES_RETURNED]
     );
 
     const notes = result.rows.map(row => ({
