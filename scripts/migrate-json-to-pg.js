@@ -33,8 +33,19 @@ async function migrate() {
         shorthands TEXT[],
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+
+      CREATE TABLE IF NOT EXISTS generation_idempotency (
+        key VARCHAR(64) PRIMARY KEY,
+        status VARCHAR(20) NOT NULL,
+        note_id UUID REFERENCES notes(id) ON DELETE SET NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_generation_idempotency_created_at
+        ON generation_idempotency(created_at);
     `);
-    console.log("Table 'notes' is ready.");
+    console.log("Tables 'notes' and 'generation_idempotency' are ready.");
 
     // 2. Read the local JSON file
     const dataPath = path.join(process.cwd(), 'data', 'codenotes.json');

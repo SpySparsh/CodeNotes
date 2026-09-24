@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { Youtube, Search, ArrowRight } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import LoadingState from '@/components/LoadingState';
@@ -9,6 +9,7 @@ export default function UrlInput() {
   const [url, setUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const isSubmittingRef = useRef(false);
   const router = useRouter();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -20,14 +21,24 @@ export default function UrlInput() {
       setError('Please enter a valid YouTube video URL');
       return;
     }
+
+    if (isSubmittingRef.current) {
+      return;
+    }
+    isSubmittingRef.current = true;
     
     setError('');
     setIsLoading(true);
 
+    const idempotencyKey = crypto.randomUUID();
+
     try {
       const response = await fetch('/api/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
         body: JSON.stringify({ url }),
       });
 
@@ -42,6 +53,7 @@ export default function UrlInput() {
       console.error(err);
       setError(err.message || 'Something went wrong');
       setIsLoading(false);
+      isSubmittingRef.current = false;
     }
   };
 
@@ -66,7 +78,7 @@ export default function UrlInput() {
         <div className="absolute inset-y-0 right-2 flex items-center">
           <button
             type="submit"
-            disabled={!url}
+            disabled={!url || isLoading}
             className="flex items-center gap-2 px-6 py-3 bg-primary hover:bg-purple-700 text-white font-semibold rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md"
           >
             <span className="flex items-center gap-2">

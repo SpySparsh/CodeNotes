@@ -5,6 +5,8 @@ export interface VideoMetadata {
   title: string;
 }
 
+export const TRANSCRIPT_TIMEOUT_MS = 15000;
+
 export async function fetchTranscript(url: string): Promise<{ text: string; videoId: string }> {
   try {
     const videoIdMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
@@ -14,12 +16,30 @@ export async function fetchTranscript(url: string): Promise<{ text: string; vide
       throw new Error('Invalid YouTube URL');
     }
 
-    const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(`Transcript fetch timed out after ${TRANSCRIPT_TIMEOUT_MS / 1000} seconds.`));
+      }, TRANSCRIPT_TIMEOUT_MS);
+    });
+
+    const transcriptItems = await Promise.race([
+      YoutubeTranscript.fetchTranscript(videoId),
+      timeoutPromise,
+    ]).finally(() => {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    });
+
     const fullText = transcriptItems.map(item => item.text).join(' ');
 
     return { text: fullText, videoId };
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error fetching transcript:', error);
+    if (error.message?.includes('timed out')) {
+      throw new Error('Failed to fetch video transcript: Operation timed out. Please try again.');
+    }
     throw new Error('Failed to fetch video transcript. The video might not have captions enabled.');
   }
 }

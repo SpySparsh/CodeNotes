@@ -1,0 +1,33 @@
+# NOTE: These are LOCAL LEARNING alerting rules for development/testing,
+# NOT production Service Level Objectives (SLOs).
+# They are sized for low-volume, bursty local traffic patterns.
+
+groups:
+  - name: codenotes_alerts
+    rules:
+      - alert: HighHttpErrorRate
+        expr: >-
+          (sum(rate(http_requests_total{status=~"[45].."}[2m])) or vector(0))
+          /
+          (sum(rate(http_requests_total[2m])) > 0)
+          > 0.10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP error rate exceeded 10% (local learning threshold)"
+          description: "Over 10% of HTTP requests returned 4xx or 5xx status codes over the last 2 minutes."
+
+      - alert: HighGenerateLatency
+        expr: >-
+          (
+            sum(rate(http_request_duration_seconds_sum{route="/api/generate"}[5m]))
+            /
+            sum(rate(http_request_duration_seconds_count{route="/api/generate"}[5m]))
+          ) > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average /api/generate latency exceeded 60 seconds (local learning threshold)"
+          description: "Average duration of /api/generate exceeded 60 seconds over the last 5 minutes."
