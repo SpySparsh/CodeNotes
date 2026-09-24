@@ -44,6 +44,9 @@ async function migrate() {
 
       CREATE INDEX IF NOT EXISTS idx_generation_idempotency_created_at
         ON generation_idempotency(created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_notes_created_at
+        ON notes(created_at DESC);
     `);
     console.log("Tables 'notes' and 'generation_idempotency' are ready.");
 

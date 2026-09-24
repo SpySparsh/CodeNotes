@@ -9,18 +9,16 @@ export async function GET(request?: Request) {
   const requestId = getRequestId(request);
 
   try {
-    const result = await query('SELECT * FROM notes ORDER BY created_at DESC');
-    
+    const result = await query(
+      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC'
+    );
+
     const notes = result.rows.map(row => ({
       id: row.id,
       videoId: row.video_id,
       videoTitle: row.video_title,
-      videoUrl: row.video_url,
       thumbnailUrl: row.thumbnail_url,
       overview: row.overview,
-      keyConcepts: row.key_concepts,
-      detailedNotes: row.detailed_notes,
-      shorthands: row.shorthands,
       createdAt: row.created_at
     }));
 

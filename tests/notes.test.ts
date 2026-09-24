@@ -17,12 +17,8 @@ describe('GET /api/notes', () => {
         id: '123e4567-e89b-12d3-a456-426614174000',
         video_id: 'vid12345678',
         video_title: 'Learn TypeScript in 10 Minutes',
-        video_url: 'https://www.youtube.com/watch?v=vid12345678',
         thumbnail_url: 'https://img.youtube.com/vi/vid12345678/maxresdefault.jpg',
         overview: 'A quick overview of TypeScript.',
-        key_concepts: ['Types', 'Interfaces'],
-        detailed_notes: '# TypeScript Basics\n```typescript\nconst x: number = 1;\n```',
-        shorthands: ['Use strict mode'],
         created_at: '2026-09-23T10:00:00Z',
       },
     ];
@@ -45,16 +41,14 @@ describe('GET /api/notes', () => {
       id: '123e4567-e89b-12d3-a456-426614174000',
       videoId: 'vid12345678',
       videoTitle: 'Learn TypeScript in 10 Minutes',
-      videoUrl: 'https://www.youtube.com/watch?v=vid12345678',
       thumbnailUrl: 'https://img.youtube.com/vi/vid12345678/maxresdefault.jpg',
       overview: 'A quick overview of TypeScript.',
-      keyConcepts: ['Types', 'Interfaces'],
-      detailedNotes: '# TypeScript Basics\n```typescript\nconst x: number = 1;\n```',
-      shorthands: ['Use strict mode'],
       createdAt: '2026-09-23T10:00:00Z',
     });
 
-    expect(db.query).toHaveBeenCalledWith('SELECT * FROM notes ORDER BY created_at DESC');
+    expect(db.query).toHaveBeenCalledWith(
+      'SELECT id, video_id, video_title, thumbnail_url, overview, created_at FROM notes ORDER BY created_at DESC'
+    );
   });
 
   it('should return 500 when database query fails', async () => {
