@@ -3,9 +3,9 @@ import { logger } from '@/lib/logger';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
+  // Disable SSL for local development; enable full TLS certificate verification in production.
+  // rejectUnauthorized:false is intentionally avoided — it silently disables cert validation.
+  ssl: process.env.NODE_ENV === 'production' ? true : false,
   max: 10,
   connectionTimeoutMillis: 5000,
   idleTimeoutMillis: 30000,

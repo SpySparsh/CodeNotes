@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
+import { logger } from '@/lib/logger';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
 const genAI = new GoogleGenerativeAI(apiKey);
@@ -98,8 +99,10 @@ ${transcript}
       const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
       return parsedData;
     } catch (parseError) {
-      console.error('Failed to parse Gemini output as JSON:', parseError);
-      console.error('Raw Output:', responseText);
+      logger.error('gemini_json_parse_failed', {
+        errorMessage: String(parseError),
+        rawOutputPreview: cleanedText.slice(0, 200),
+      });
       throw new Error('AI returned malformed data.');
     }
   } catch (error: any) {
@@ -110,11 +113,11 @@ ${transcript}
       error.message?.includes('aborted');
 
     if (isTimeout) {
-      console.error('Gemini request timed out after', GEMINI_TIMEOUT_MS, 'ms');
+      logger.warn('gemini_timeout', { timeoutMs: GEMINI_TIMEOUT_MS });
       throw new Error(`AI generation timed out after ${GEMINI_TIMEOUT_MS / 1000} seconds.`);
     }
 
-    console.error('Error generating notes with Gemini:', error);
+    // Route handler (generate/route.ts) already logs this error with errorMessage + errorStack.
     throw new Error(error.message || 'Failed to generate notes using AI.');
   }
 }
