@@ -10,41 +10,48 @@ export interface GeneratedNotes {
   shorthands: string[];
 }
 
+export const GEMINI_TIMEOUT_MS = 75000;
+
 export async function generateNotes(transcript: string, videoTitle: string): Promise<GeneratedNotes> {
   if (!apiKey || apiKey === 'your_api_key_here') {
     throw new Error('Gemini API key is missing or invalid. Please check .env.local');
   }
 
-  const model = genAI.getGenerativeModel({ 
-    model: 'gemini-2.5-flash',
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: SchemaType.OBJECT,
-        properties: {
-          overview: { 
-            type: SchemaType.STRING, 
-            description: "A compelling overview of the video's purpose (2-3 sentences)." 
+  const model = genAI.getGenerativeModel(
+    {
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: SchemaType.OBJECT,
+          properties: {
+            overview: {
+              type: SchemaType.STRING,
+              description: "A compelling overview of the video's purpose (2-3 sentences)."
+            },
+            keyConcepts: {
+              type: SchemaType.ARRAY,
+              items: { type: SchemaType.STRING },
+              description: "List of key concepts"
+            },
+            detailedNotes: {
+              type: SchemaType.STRING,
+              description: "The exhaustive, comprehensive markdown string containing all the Detailed Topics with contextual inline code blocks and Markdown Comparison Tables."
+            },
+            shorthands: {
+              type: SchemaType.ARRAY,
+              items: { type: SchemaType.STRING },
+              description: "List of shorthands or quick tips"
+            }
           },
-          keyConcepts: { 
-            type: SchemaType.ARRAY, 
-            items: { type: SchemaType.STRING }, 
-            description: "List of key concepts" 
-          },
-          detailedNotes: { 
-            type: SchemaType.STRING, 
-            description: "The exhaustive, comprehensive markdown string containing all the Detailed Topics with contextual inline code blocks and Markdown Comparison Tables." 
-          },
-          shorthands: { 
-            type: SchemaType.ARRAY, 
-            items: { type: SchemaType.STRING }, 
-            description: "List of shorthands or quick tips" 
-          }
-        },
-        required: ["overview", "keyConcepts", "detailedNotes", "shorthands"]
+          required: ["overview", "keyConcepts", "detailedNotes", "shorthands"]
+        }
       }
+    },
+    {
+      timeout: GEMINI_TIMEOUT_MS,
     }
-  });
+  );
 
   const prompt = `
 You are a Senior Full-Stack Engineer and Technical Content Architect.
@@ -96,6 +103,17 @@ ${transcript}
       throw new Error('AI returned malformed data.');
     }
   } catch (error: any) {
+    const isTimeout =
+      error.name === 'AbortError' ||
+      error.name === 'TimeoutError' ||
+      error.message?.includes('timeout') ||
+      error.message?.includes('aborted');
+
+    if (isTimeout) {
+      console.error('Gemini request timed out after', GEMINI_TIMEOUT_MS, 'ms');
+      throw new Error(`AI generation timed out after ${GEMINI_TIMEOUT_MS / 1000} seconds.`);
+    }
+
     console.error('Error generating notes with Gemini:', error);
     throw new Error(error.message || 'Failed to generate notes using AI.');
   }

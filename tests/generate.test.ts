@@ -162,4 +162,27 @@ describe('POST /api/generate', () => {
     const body = await response.json();
     expect(body.error).toBe('Database disk full');
   });
+
+  it('should return 500 with user-friendly error when Gemini times out', async () => {
+    vi.mocked(transcript.fetchTranscript).mockResolvedValueOnce({
+      text: 'Transcript text',
+      videoId: 'vid12345678',
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Sample Video');
+    vi.mocked(gemini.generateNotes).mockRejectedValueOnce(
+      new Error('AI generation timed out after 75 seconds.')
+    );
+
+    const request = new Request('http://localhost:3000/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=vid12345678' }),
+    });
+
+    const response = await POST(request);
+    expect(response.status).toBe(500);
+
+    const body = await response.json();
+    expect(body.error).toBe('Note generation timed out. Please try again with a shorter video.');
+  });
 });

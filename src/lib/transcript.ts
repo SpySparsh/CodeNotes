@@ -26,7 +26,12 @@ export async function fetchTranscript(url: string): Promise<{ text: string; vide
 
 export async function extractVideoTitle(url: string): Promise<string> {
   try {
-    const response = await fetch(`https://noembed.com/embed?url=${url}`);
+    const response = await fetch(`https://noembed.com/embed?url=${url}`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!response.ok) {
+      return 'Unknown Video';
+    }
     const data = await response.json();
     return data.title || 'Unknown Video';
   } catch (error) {
