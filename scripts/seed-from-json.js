@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * scripts/seed-from-json.js
  *
@@ -34,7 +34,13 @@ if (!process.env.DATABASE_URL) {
 }
 
 // Mirror the SSL policy in src/lib/db.ts exactly.
-const ssl = process.env.NODE_ENV === 'production' ? true : false;
+const ssl =
+  process.env.NODE_ENV === 'production'
+    ? {
+        ca: process.env.DATABASE_CA_CERT,
+        rejectUnauthorized: true,
+      }
+    : false;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

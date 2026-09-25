@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * scripts/migrate.js
  *
@@ -31,9 +31,15 @@ if (!process.env.DATABASE_URL) {
 }
 
 // Mirror the SSL policy in src/lib/db.ts exactly.
-// production  → ssl: true  (rejectUnauthorized defaults to true — full cert validation)
+// production  → ssl: { ca: DATABASE_CA_CERT, rejectUnauthorized: true }
 // development → ssl: false (local PostgreSQL requires no TLS)
-const ssl = process.env.NODE_ENV === 'production' ? true : false;
+const ssl =
+  process.env.NODE_ENV === 'production'
+    ? {
+        ca: process.env.DATABASE_CA_CERT,
+        rejectUnauthorized: true,
+      }
+    : false;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
