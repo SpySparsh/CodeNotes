@@ -7,10 +7,15 @@ import * as db from '@/lib/db';
 vi.mock('@/lib/transcript', () => ({
   fetchTranscript: vi.fn(),
   extractVideoTitle: vi.fn(),
+  extractVideoId: vi.fn((url: string) => {
+    const videoIdMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
+    return videoIdMatch ? videoIdMatch[1] : null;
+  }),
 }));
 
 vi.mock('@/lib/gemini', () => ({
   generateNotes: vi.fn(),
+  generateNotesFromVideoUrl: vi.fn(),
 }));
 
 vi.mock('@/lib/db', () => {
@@ -104,9 +109,53 @@ describe('POST /api/generate', () => {
     expect(sqlParams![8]).toEqual(mockAiNotes.shorthands);
   });
 
-  it('should return 500 when fetchTranscript fails', async () => {
+  it('should fall back to generateNotesFromVideoUrl when fetchTranscript fails and succeed', async () => {
+    const testUrl = 'https://www.youtube.com/watch?v=nocaptions12';
+    const mockTitle = 'No Caption Video';
+    const mockAiNotes = {
+      overview: 'Overview from direct video analysis',
+      keyConcepts: ['Concept 1'],
+      detailedNotes: '## Details from direct video',
+      shorthands: ['Shorthand 1'],
+    };
+
     vi.mocked(transcript.fetchTranscript).mockRejectedValueOnce(
       new Error('Failed to fetch video transcript. The video might not have captions enabled.')
+    );
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(mockTitle);
+    vi.mocked(gemini.generateNotesFromVideoUrl).mockResolvedValueOnce(mockAiNotes);
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 1,
+      command: 'INSERT',
+      oid: 0,
+      fields: [],
+    } as any);
+
+    const request = new Request('http://localhost:3000/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: testUrl }),
+    });
+
+    const response = await POST(request);
+    expect(response.status).toBe(200);
+
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.noteId).toBeDefined();
+
+    expect(gemini.generateNotes).not.toHaveBeenCalled();
+    expect(gemini.generateNotesFromVideoUrl).toHaveBeenCalledWith(testUrl, mockTitle);
+  });
+
+  it('should return 500 when both fetchTranscript and generateNotesFromVideoUrl fail', async () => {
+    vi.mocked(transcript.fetchTranscript).mockRejectedValueOnce(
+      new Error('Failed to fetch video transcript. The video might not have captions enabled.')
+    );
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('No Caption Video');
+    vi.mocked(gemini.generateNotesFromVideoUrl).mockRejectedValueOnce(
+      new Error('Direct video ingestion failed')
     );
 
     const request = new Request('http://localhost:3000/api/generate', {
@@ -119,7 +168,7 @@ describe('POST /api/generate', () => {
     expect(response.status).toBe(500);
 
     const body = await response.json();
-    expect(body.error).toContain('Failed to fetch video transcript');
+    expect(body.error).toBe('Something went wrong while generating your notes. Please try again.');
   });
 
   it('should return 500 when Gemini note generation fails', async () => {
@@ -336,11 +385,14 @@ describe('POST /api/generate', () => {
       expect(gemini.generateNotes).toHaveBeenCalledWith('Valid transcript', 'Unknown Video');
     });
 
-    it('fails generation immediately if transcript fetch fails even if title succeeds', async () => {
+    it('falls back to generateNotesFromVideoUrl if transcript fetch fails even if title succeeds', async () => {
       vi.mocked(transcript.fetchTranscript).mockRejectedValueOnce(
         new Error('Failed to fetch video transcript. The video might not have captions enabled.')
       );
       vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Some Title');
+      vi.mocked(gemini.generateNotesFromVideoUrl).mockRejectedValueOnce(
+        new Error('Video fallback failed')
+      );
 
       const request = new Request('http://localhost:3000/api/generate', {
         method: 'POST',
@@ -352,8 +404,9 @@ describe('POST /api/generate', () => {
       expect(response.status).toBe(500);
 
       const body = await response.json();
-      expect(body.error).toContain('Failed to fetch video transcript');
+      expect(body.error).toBe('Something went wrong while generating your notes. Please try again.');
       expect(gemini.generateNotes).not.toHaveBeenCalled();
+      expect(gemini.generateNotesFromVideoUrl).toHaveBeenCalledWith('https://www.youtube.com/watch?v=vid12345678', 'Some Title');
     });
   });
 
@@ -592,6 +645,9 @@ describe('POST /api/generate', () => {
 
       vi.mocked(transcript.fetchTranscript).mockRejectedValueOnce(
         new Error('Transcript network failure')
+      );
+      vi.mocked(gemini.generateNotesFromVideoUrl).mockRejectedValueOnce(
+        new Error('Fallback video failure')
       );
 
       // 1. Acquire key succeeds

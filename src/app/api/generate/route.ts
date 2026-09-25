@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { fetchTranscript, extractVideoTitle } from '@/lib/transcript';
-import { generateNotes } from '@/lib/gemini';
+import { fetchTranscript, extractVideoTitle, extractVideoId } from '@/lib/transcript';
+import { generateNotes, generateNotesFromVideoUrl, GeneratedNotes } from '@/lib/gemini';
 import { query, withTransaction } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
@@ -160,13 +160,25 @@ export async function POST(request: Request) {
     // 1 & 2. Concurrently fetch transcript and video title
     let transcriptDurationMs = 0;
     let titleDurationMs = 0;
+    let fallbackDurationMs = 0;
+    let generationMethod: 'transcript' | 'direct_video' = 'transcript';
 
     const transcriptPromise = (async () => {
       const t0 = performance.now();
-      const res = await fetchTranscript(url);
-      transcriptDurationMs = performance.now() - t0;
-      recordGenerateStageDuration('transcript_fetch', transcriptDurationMs / 1000);
-      return res;
+      try {
+        const res = await fetchTranscript(url);
+        transcriptDurationMs = performance.now() - t0;
+        recordGenerateStageDuration('transcript_fetch', transcriptDurationMs / 1000);
+        return res;
+      } catch (err: any) {
+        transcriptDurationMs = performance.now() - t0;
+        logger.warn('transcript_fetch_failed', {
+          requestId,
+          durationMs: transcriptDurationMs,
+          errorMessage: err.message,
+        });
+        return null;
+      }
     })();
 
     const titlePromise = (async () => {
@@ -177,16 +189,44 @@ export async function POST(request: Request) {
       return res;
     })();
 
-    const [{ text, videoId }, videoTitle] = await Promise.all([
+    const [transcriptResult, videoTitle] = await Promise.all([
       transcriptPromise,
       titlePromise,
     ]);
 
-    // 3. Generate notes using Gemini
+    const videoId = transcriptResult?.videoId || extractVideoId(url);
+    if (!videoId) {
+      throw new Error('Invalid YouTube URL');
+    }
+
+    // 3. Generate notes using Gemini (transcript if available, fallback to direct video analysis)
     const t0Gemini = performance.now();
-    const aiNotes = await generateNotes(text, videoTitle);
-    const geminiDurationMs = performance.now() - t0Gemini;
-    recordGenerateStageDuration('gemini_inference', geminiDurationMs / 1000);
+    let aiNotes: GeneratedNotes;
+    let geminiDurationMs = 0;
+
+    if (transcriptResult) {
+      aiNotes = await generateNotes(transcriptResult.text, videoTitle);
+      geminiDurationMs = performance.now() - t0Gemini;
+      recordGenerateStageDuration('gemini_inference', geminiDurationMs / 1000);
+    } else {
+      generationMethod = 'direct_video';
+      logger.info('direct_video_fallback_started', {
+        requestId,
+        videoId,
+      });
+
+      const t0Fallback = performance.now();
+      aiNotes = await generateNotesFromVideoUrl(url, videoTitle);
+      fallbackDurationMs = performance.now() - t0Fallback;
+      geminiDurationMs = fallbackDurationMs;
+      recordGenerateStageDuration('gemini_inference', fallbackDurationMs / 1000);
+
+      logger.info('direct_video_fallback_completed', {
+        requestId,
+        videoId,
+        durationMs: fallbackDurationMs,
+      });
+    }
 
     // 4. Save to DB atomically using a PostgreSQL transaction
     const noteId = crypto.randomUUID();
@@ -238,10 +278,12 @@ export async function POST(request: Request) {
       status: 200,
       durationMs: totalDurationMs,
       videoId,
+      generationMethod,
       timings: {
         transcriptFetchMs: Math.round(transcriptDurationMs * 100) / 100,
         titleFetchMs: Math.round(titleDurationMs * 100) / 100,
         geminiInferenceMs: Math.round(geminiDurationMs * 100) / 100,
+        ...(fallbackDurationMs ? { fallbackDurationMs: Math.round(fallbackDurationMs * 100) / 100 } : {}),
         dbInsertMs: Math.round(dbDurationMs * 100) / 100,
       },
     });

@@ -28,13 +28,17 @@ export function validateYouTubeUrl(url: string): void {
   }
 }
 
+export function extractVideoId(url: string): string | null {
+  const videoIdMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
+  return videoIdMatch ? videoIdMatch[1] : null;
+}
+
 export async function fetchTranscript(url: string): Promise<{ text: string; videoId: string }> {
   // Validate before the try/catch so 'Invalid YouTube URL' propagates directly to the caller.
   validateYouTubeUrl(url);
 
   try {
-    const videoIdMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
-    const videoId = videoIdMatch ? videoIdMatch[1] : null;
+    const videoId = extractVideoId(url);
 
     if (!videoId) {
       throw new Error('Invalid YouTube URL');

@@ -37,3 +37,6 @@ next-env.d.ts
 
 # User Data
 /data
+
+
+prod-ca-2021.crt
