@@ -32,7 +32,7 @@ export function getPool(): Pool {
       max: 10,
       connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
-      statement_timeout: 10000,
+      query_timeout: 10000,
     });
   }
   return poolInstance;

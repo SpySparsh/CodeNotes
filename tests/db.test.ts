@@ -47,4 +47,11 @@ describe('Database SSL Configuration (getDbSslConfig)', () => {
       'DATABASE_CA_CERT must be set in production to securely verify PostgreSQL TLS certificates.'
     );
   });
+
+  it('configures pg.Pool with query_timeout instead of statement_timeout', async () => {
+    const { getPool } = await import('@/lib/db');
+    const pool = getPool();
+    expect((pool.options as any).query_timeout).toBe(10000);
+    expect((pool.options as any).statement_timeout).toBeUndefined();
+  });
 });
