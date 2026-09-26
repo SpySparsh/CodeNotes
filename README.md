@@ -1,425 +1,519 @@
-# codenotes.ai
+# CodeNotes
 
-[![Next.js](https://img.shields.io/badge/Next.js-16.2.1-black?style=for-the-badge&logo=next.js)](https://nextjs.org/)
-[![React](https://img.shields.io/badge/React-19.2.4-blue?style=for-the-badge&logo=react)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
-[![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-v4-38B2AC?style=for-the-badge&logo=tailwind-css)](https://tailwindcss.com/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-8.20-336791?style=for-the-badge&logo=postgresql)](https://www.postgresql.org/)
-[![Gemini](https://img.shields.io/badge/Gemini_2.5_Flash-Google_AI-orange?style=for-the-badge&logo=google)](https://ai.google.dev/)
-
-> **Production Deployment:** `[INSERT LIVE PROD URL HERE]`  
-> **Repository:** `[INSERT REPOSITORY URL HERE]`
+CodeNotes is an AI-powered tool that converts YouTube programming tutorials into structured technical study notes. A user pastes a YouTube URL; the application fetches the video transcript and metadata in parallel, sends them to Google Gemini 2.5 Flash with a schema-enforced prompt, and persists the generated notes — overview, key concepts, inline-code-annotated detailed notes, and quick tips — to a PostgreSQL database. If transcript extraction fails, Gemini processes the video URL directly as a fallback. The application is deployed on Vercel with a Supabase PostgreSQL backend.
 
 ---
 
-## 1. Executive Summary & Core Objective
+## Features
 
-### What does this project do?
-**codenotes.ai** is an AI-powered educational assistant and technical study companion. It transforms video-based coding tutorials from YouTube into structured, interactive, and easily scannable technical study notes. Given a YouTube video URL, the application automatically extracts the video transcript and metadata, runs it through Google's Gemini 2.5 Flash model with a schema-enforced prompt, extracts inline code snippets and comparison tables, and persists the generated notes into a PostgreSQL database for persistent access in a user library.
-
-### Who is the end user?
-- **Software Engineers & Developers** learning new frameworks, libraries, or architectures from conference talks and tutorials without wanting to pause every 15 seconds to copy code.
-- **Computer Science Students & Bootcamp Learners** who need organized, structured notes, summaries, and syntax reference sheets for exam prep or reference.
-- **Technical Writers & Instructors** seeking to convert video walkthroughs and lectures into clean markdown summaries with contextual code blocks.
-
-### What core business problem does it solve?
-Video is one of the richest mediums for programming education, but it is notoriously low-bandwidth for reference and retention. Developers waste excessive time repeatedly pausing, rewinding, squinting at terminal windows, and manually transcribing code snippets into notes. Furthermore, videos are unsearchable and non-indexable for rapid lookup. **codenotes.ai** bridges the gap between passive video watching and active technical reference by automating code extraction, theoretical summaries, and architectural comparison tables into structured markdown.
+- YouTube URL → structured study notes in a single request
+- Parallel transcript and title fetching for reduced latency
+- Gemini direct-video fallback when captions are unavailable
+- Schema-enforced JSON output: overview, key concepts, detailed Markdown notes with inline code blocks and comparison tables, shorthands
+- Saved notes library with retrieval and deletion
+- Markdown and syntax-highlighted code rendering
+- Idempotent generation via `Idempotency-Key` header
+- Stale idempotency record recovery
+- Transactional note persistence and idempotency completion
+- Structured JSON logging with request/correlation IDs
+- Prometheus metrics endpoint
+- Health check endpoint with live database probe
+- PostgreSQL TLS certificate verification in production
 
 ---
 
-## 2. Tech Stack & Dependencies
+## Architecture
+
+```
+Browser
+  │
+  │  POST /api/generate  {url}
+  ▼
+Vercel / Next.js (Node.js runtime)
+  │
+  ├── transcript.ts ──► youtube-transcript pkg  ──► captions text
+  │                 ──► noembed.com             ──► video title
+  │                     (both run concurrently via Promise.all)
+  │
+  │   if transcript OK:
+  ├── gemini.ts ─────► Gemini 2.5 Flash (transcript + title)
+  │
+  │   if transcript FAILS:
+  ├── gemini.ts ─────► Gemini 2.5 Flash (video URL directly)
+  │
+  ├── db.ts ──────────► Supabase PostgreSQL
+  │                     BEGIN
+  │                       INSERT INTO notes
+  │                       UPDATE generation_idempotency (if key present)
+  │                     COMMIT
+  │
+  └── → { noteId }  →  Browser redirects to /notes/[id]
+```
+
+**Frontend** is a Next.js App Router application (React 19, Tailwind CSS v4). Pages are at `/` (URL input), `/library` (saved notes grid), and `/notes/[id]` (full note reader with Markdown and syntax highlighting).
+
+**Backend** is a set of Next.js Route Handlers running on the Node.js runtime. All database access goes through a `pg.Pool` connection pool. There is no separate API server.
+
+**AI** calls are synchronous within the request lifecycle. Generation is the dominant latency component; the application architecture is intentionally simple and synchronous.
+
+**Database** is PostgreSQL hosted on Supabase. Two tables: `notes` (primary storage) and `generation_idempotency` (in-flight deduplication). Schema is managed by a plain Node.js migration script.
+
+---
+
+## Application Flow
+
+1. Client submits a YouTube URL with a client-generated `Idempotency-Key` UUID.
+2. `POST /api/generate` validates that a URL is present in the request body.
+3. Idempotency check: attempt `INSERT INTO generation_idempotency ON CONFLICT DO NOTHING`.
+   - If the key already exists and status is `completed`, the existing `note_id` is returned immediately — no Gemini call is made.
+   - If status is `processing` and the record is younger than 120 seconds, a `409 Conflict` is returned.
+   - If status is `processing` and the record is older than 120 seconds (stale), an atomic `UPDATE ... WHERE COALESCE(updated_at, created_at) < $cutoff` reclaims it.
+4. Transcript fetch (`youtube-transcript`) and title fetch (`noembed.com`) run concurrently via `Promise.all`. Transcript fetch has a 15-second timeout; title fetch has a 4-second timeout.
+5. If transcript extraction succeeds, `generateNotes(transcript, title)` is called.
+6. If transcript extraction fails, `generateNotesFromVideoUrl(url, title)` is called — Gemini processes the YouTube URL directly. This path is slower.
+7. Gemini 2.5 Flash returns a schema-validated JSON object. Both paths use a 75-second timeout.
+8. A PostgreSQL transaction atomically inserts the note and updates the idempotency record to `completed`.
+9. `{ success: true, noteId }` is returned; the client navigates to `/notes/[id]`.
+10. If any step fails, the idempotency record is deleted so the client can retry.
+
+---
+
+## Tech Stack
 
 ### Frontend
-- **Framework:** [Next.js](https://nextjs.org/) `16.2.1` (App Router, React Server & Client Components)
-- **Core Library:** [React](https://react.dev/) `19.2.4` & [React DOM](https://react.dev/) `19.2.4`
-- **Styling & Design System:**
-  - [Tailwind CSS](https://tailwindcss.com/) `v4.0.0` (using `@tailwindcss/postcss` and CSS variables theme tokens)
-  - `tailwindcss-animate` for micro-interactions and transitions
-  - Custom glassmorphic typography and light/dark theme variables (`src/app/globals.css`)
-- **Iconography:** [Lucide React](https://lucide.dev/) `^0.475.0`
-- **Markdown & Code Rendering:**
-  - `react-markdown` (`^9.0.1`) with `remark-gfm` (`^4.0.0`) for table and GFM support
-  - `react-syntax-highlighter` (`^15.6.1`) with `prism` theme for syntax highlighting
-  - `rehype-highlight` (`^7.0.0`)
-- **State Management:**
-  - React Built-in Hooks (`useState`, `useEffect`, `useRouter`, `useParams`)
-  - Optimistic UI updates for immediate user feedback on card actions (e.g., deletion)
+| | |
+|---|---|
+| Framework | Next.js 16.3.3 (App Router) |
+| UI library | React 19.2.4 |
+| Styling | Tailwind CSS v4 |
+| Markdown rendering | react-markdown 9, remark-gfm 4 |
+| Syntax highlighting | react-syntax-highlighter 15 |
+| Icons | lucide-react 0.475 |
 
 ### Backend
-- **Language:** TypeScript (`^5.0.0`)
-- **Framework:** Next.js Route Handlers (`src/app/api/...`) running on Node.js runtime
-- **Runtime Environment:** Node.js (v20+ LTS recommended)
-- **Database Driver:** `pg` (`^8.20.0`) with `@types/pg` (`^8.20.0`) utilizing connection pooling (`pg.Pool`) and native SSL support (`rejectUnauthorized: false` for managed cloud DBs)
-- **Environment Management:** `dotenv` (`^17.3.1`)
-- **Crypto & ID Generation:** Native Node.js `crypto.randomUUID()` for RFC 4122 UUID primary keys
+| | |
+|---|---|
+| Runtime | Node.js via Next.js Route Handlers |
+| Language | TypeScript 5 |
+| Database driver | pg 8.20 (connection pool) |
 
-### Database & Storage
-- **Database Type:** [PostgreSQL](https://www.postgresql.org/) (Compatible with [Supabase](https://supabase.com/), [Neon](https://neon.tech/), AWS RDS, or local Postgres)
-- **ORM / Query Layer:** Direct parameterized SQL queries via `pg.Pool` (`src/lib/db.ts`) for zero-overhead, sub-millisecond query execution and native array handling (`TEXT[]`)
-- **Media Storage / CDN:** YouTube's native image CDN (`https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`) for zero-storage thumbnail serving
+### AI
+| | |
+|---|---|
+| Provider | Google Gemini |
+| Model | gemini-2.5-flash |
+| SDK | @google/generative-ai 0.24 |
+| Output format | Schema-enforced JSON (`responseMimeType: application/json`) |
 
-### Infrastructure / DevOps
-- **Bundler / Compiler:** Next.js Turbopack (`turbopack: { root: __dirname }` in `next.config.mjs`)
-- **Hosting / Platform:** [Vercel](https://vercel.com/) (Production-ready with SSL database parameters)
-- **Linting & Code Quality:** ESLint `^9.0.0` with `eslint-config-next` `16.2.1`
-- **CI/CD:** Automated builds and previews via Vercel GitHub integration
+### Database
+| | |
+|---|---|
+| Engine | PostgreSQL |
+| Host | Supabase |
 
-### Third-Party Services & APIs
-- **Google Gemini AI:** `@google/generative-ai` (`^0.24.0`) targeting `gemini-2.5-flash` with strict structured JSON schema generation (`responseMimeType: "application/json"`, `responseSchema: SchemaType.OBJECT`).
-- **YouTube Transcript Service:** `youtube-transcript` (`^1.2.1`) for direct caption stream extraction without requiring YouTube Data API v3 quotas or OAuth credentials.
-- **NoEmbed API:** `https://noembed.com/embed?url=${url}` for lightweight oEmbed video title discovery.
+### Infrastructure
+| | |
+|---|---|
+| Deployment | Vercel |
+| Bundler (dev) | Next.js Turbopack |
+
+### Testing / Quality
+| | |
+|---|---|
+| Test framework | Vitest 5 |
+| Linter | ESLint 9 with eslint-config-next |
+| Type checker | TypeScript (`tsc --noEmit`) |
+
+### Observability
+| | |
+|---|---|
+| Logging | Custom structured JSON logger |
+| Metrics | prom-client 15 (`/api/metrics`) |
+| Local monitoring stack | Prometheus + Grafana via Docker Compose |
+
+### CI/CD
+| | |
+|---|---|
+| Platform | GitHub Actions |
+| Trigger | Push / PR to `main` |
+| Pipeline | test → lint → typecheck → build |
 
 ---
 
-## 3. High-Level Architecture & Project Structure
-
-### Component Communication & Data Flow
+## Project Structure
 
 ```
-[ User Browser ]
-       │
-       ▼ (1. Paste YouTube URL & Submit)
-[ Next.js Client Page: / ] (UrlInput.tsx)
-       │
-       ▼ (2. POST /api/generate { url })
-[ API Route Handler: /api/generate ]
-       │
-       ├───► [ 3. transcript.ts: fetchTranscript(url) ]
-       │          └─► Calls `youtube-transcript` -> Extracts captions text & video ID
-       │
-       ├───► [ 4. transcript.ts: extractVideoTitle(url) ]
-       │          └─► Calls `noembed.com` -> Retrieves clean title
-       │
-       ├───► [ 5. gemini.ts: generateNotes(text, title) ]
-       │          └─► Dispatches prompt to Gemini 2.5 Flash with strict JSON Schema
-       │          └─► Returns: { overview, keyConcepts, detailedNotes, shorthands }
-       │
-       ├───► [ 6. db.ts: query(INSERT INTO notes ...) ]
-       │          └─► Persists to PostgreSQL via `pg.Pool`
-       │
-       ▼ (7. Return { success: true, noteId })
-[ Client Redirects to /notes/[id] ]
-       │
-       ▼ (8. GET /api/notes/[id])
-[ View Rendered Note ] (Markdown, Syntax Highlighted Code, Quick Tips)
-```
-
-### Directory Map
-
-```
-unstuckstudy/
-├── .env.example              # Template for required environment variables
-├── .env.local                # Local environment secrets (ignored by Git)
-├── .gitignore                # Git ignore configuration
-├── next.config.mjs           # Next.js configuration (Turbopack root config)
-├── package.json              # Project dependencies and operational scripts
-├── postcss.config.mjs        # PostCSS configuration for Tailwind CSS v4
-├── tsconfig.json             # TypeScript compiler settings & alias mapping (@/*)
+.
+├── .env.example                      # Environment variable template
+├── .github/workflows/ci.yml          # GitHub Actions CI pipeline
+├── docker-compose.prometheus.yml     # Local Prometheus + Grafana stack
+├── next.config.mjs                   # Next.js / Turbopack configuration
+├── prometheus/
+│   ├── prometheus.yml                # Scrape config (targets localhost:3000)
+│   └── rules/                        # Alerting rules
+├── grafana/                          # Grafana provisioning (datasources, dashboards)
 ├── scripts/
-│   └── migrate-json-to-pg.js # Migration utility script for creating tables & importing JSON data
-├── src/
-│   ├── app/                  # Next.js App Router (pages and API endpoints)
-│   │   ├── api/
-│   │   │   ├── generate/     # POST: Core AI pipeline orchestrator
-│   │   │   │   └── route.ts
-│   │   │   └── notes/        # REST endpoints for notes collection & items
-│   │   │       ├── route.ts  # GET: Retrieve all notes sorted by created_at DESC
-│   │   │       └── [id]/
-│   │   │           └── route.ts # GET: Single note by ID; DELETE: Delete note by ID
-│   │   ├── globals.css       # Tailwind v4 directives, custom styling, animations
-│   │   ├── layout.tsx        # Root HTML wrapper with Navbar and global fonts
-│   │   ├── page.tsx          # Landing / Hero page with YouTube URL input
-│   │   ├── library/          # User notes library
-│   │   │   └── page.tsx      # Grid view of all saved study notes
-│   │   └── notes/[id]/       # Note detail reader
-│   │       └── page.tsx      # Comprehensive note page with Markdown & CodeBlock renderer
-│   ├── components/           # Reusable React UI components
-│   │   ├── CodeBlock.tsx     # Syntax highlighter with copy-to-clipboard functionality
-│   │   ├── LoadingState.tsx  # Dynamic multi-ring spinner with status descriptions
-│   │   ├── Navbar.tsx        # Top navigation header with active routing links
-│   │   ├── NoteCard.tsx      # Library item card with thumbnail, preview & delete action
-│   │   └── UrlInput.tsx      # YouTube input form with validation & submission state
-│   └── lib/                  # Server-side business logic and utilities
-│       ├── db.ts             # PostgreSQL pool setup, query wrapper, and Note interface
-│       ├── gemini.ts         # Google Generative AI client, prompt engineering, and schema
-│       └── transcript.ts     # YouTube transcript extractor and oEmbed metadata parser
+│   ├── migrate.js                    # Schema migration (idempotent, runs in a transaction)
+│   └── seed-from-json.js             # Optional local data seeding from JSON
+├── tests/
+│   ├── setup.ts
+│   ├── generate.test.ts              # Full generation pipeline, idempotency, fallback
+│   ├── health.test.ts
+│   ├── metrics.test.ts
+│   ├── notes.test.ts
+│   ├── notes-id.test.ts
+│   ├── transcript.test.ts            # URL validation, timeout, title fallback
+│   └── db.test.ts                    # SSL config, pool settings
+└── src/
+    ├── app/
+    │   ├── page.tsx                  # Landing page / URL input
+    │   ├── library/page.tsx          # Saved notes grid
+    │   ├── notes/[id]/page.tsx       # Full note reader
+    │   └── api/
+    │       ├── generate/route.ts     # Core generation pipeline
+    │       ├── notes/route.ts        # GET /api/notes
+    │       ├── notes/[id]/route.ts   # GET + DELETE /api/notes/[id]
+    │       ├── health/route.ts       # GET /api/health
+    │       └── metrics/route.ts      # GET /api/metrics (Prometheus)
+    ├── components/
+    │   ├── UrlInput.tsx              # URL form, client-side idempotency key generation
+    │   ├── CodeBlock.tsx             # Syntax-highlighted code with copy
+    │   ├── NoteCard.tsx              # Library card with optimistic delete
+    │   ├── Navbar.tsx
+    │   └── LoadingState.tsx
+    └── lib/
+        ├── db.ts                     # pg.Pool, SSL config, withTransaction helper
+        ├── gemini.ts                 # generateNotes, generateNotesFromVideoUrl, timeout
+        ├── transcript.ts             # fetchTranscript, extractVideoTitle, validateYouTubeUrl
+        ├── logger.ts                 # Structured JSON logger
+        ├── metrics.ts                # prom-client registry, counters, histograms
+        └── request-context.ts        # Request ID extraction / generation
 ```
 
 ---
 
-## 4. Environment Variables & Configuration
+## API Reference
 
-Create a `.env.local` file in the root directory by copying the provided `.env.example`:
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/generate` | Generate notes from a YouTube URL |
+| `GET` | `/api/notes` | List all saved notes (up to 200, newest first) |
+| `GET` | `/api/notes/[id]` | Retrieve a single note by UUID |
+| `DELETE` | `/api/notes/[id]` | Delete a note by UUID |
+| `GET` | `/api/health` | Health check — probes database with `SELECT 1` |
+| `GET` | `/api/metrics` | Prometheus metrics (text/plain exposition format) |
+
+**`POST /api/generate`**
+
+- Request body: `{ "url": "https://www.youtube.com/watch?v=..." }`
+- Optional request header: `Idempotency-Key: <uuid>`
+- On success: `200 { success: true, noteId: "<uuid>" }`
+- If key is already `completed`: `200` with the original `noteId`, no generation performed
+- If key is `processing` (< 120s old): `409 { success: false, error: "Generation already in progress" }`
+- Missing URL: `400 { error: "YouTube URL is required" }`
+- All responses include `x-request-id` header
+
+**`GET /api/notes`**
+
+Returns projected fields only (`id`, `video_id`, `video_title`, `thumbnail_url`, `overview`, `created_at`). Full note content is not included in the list response. Result is capped at 200 rows.
+
+**`GET /api/health`**
+
+- `200 { status: "healthy", database: "connected", timestamp }` when database responds
+- `503 { status: "unhealthy", database: "disconnected", timestamp }` on database failure
+
+---
+
+## Database
+
+### Tables
+
+**`notes`** — primary storage for generated study notes.
+
+```
+id              UUID PRIMARY KEY
+video_id        VARCHAR(255) NOT NULL      -- 11-char YouTube video ID
+video_title     TEXT NOT NULL              -- fetched via noembed.com
+video_url       TEXT NOT NULL              -- original URL submitted by user
+thumbnail_url   TEXT                       -- YouTube CDN maxresdefault.jpg
+overview        TEXT
+key_concepts    TEXT[]
+detailed_notes  TEXT                       -- Markdown with inline code and tables
+shorthands      TEXT[]
+created_at      TIMESTAMPTZ DEFAULT NOW()
+```
+
+Index: `idx_notes_created_at ON notes(created_at DESC)` — supports the library list query.
+
+**`generation_idempotency`** — tracks in-flight and completed generation requests.
+
+```
+key         VARCHAR(64) PRIMARY KEY        -- client-supplied UUID
+status      VARCHAR(20) NOT NULL           -- 'processing' | 'completed'
+note_id     UUID REFERENCES notes(id) ON DELETE SET NULL
+created_at  TIMESTAMPTZ DEFAULT NOW()
+updated_at  TIMESTAMPTZ DEFAULT NOW()
+```
+
+Index: `idx_generation_idempotency_created_at ON generation_idempotency(created_at)` — supports stale record queries.
+
+Note and idempotency completion are written inside a single PostgreSQL transaction, so a partial write is not possible.
+
+### Migration
+
+Schema migration is idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`) and runs in a single transaction.
 
 ```bash
+npm run db:migrate        # reads DATABASE_URL from .env.local
+npm run db:seed           # optional: seed from local JSON file
+```
+
+The migration script (`scripts/migrate.js`) mirrors the SSL policy of `src/lib/db.ts`: no SSL in development, full TLS certificate verification in production.
+
+---
+
+## Reliability
+
+### Timeouts
+
+| Operation | Timeout | Mechanism |
+|---|---|---|
+| Transcript fetch | 15 s | `Promise.race` against a `setTimeout` rejection |
+| Title fetch (noembed) | 4 s | `AbortSignal.timeout(4000)` on `fetch` |
+| Gemini inference | 75 s | SDK-level `timeout` option |
+| PostgreSQL query | 10 s | `query_timeout: 10000` on `pg.Pool` |
+| PostgreSQL connection | 5 s | `connectionTimeoutMillis: 5000` on `pg.Pool` |
+
+### Idempotency
+
+The client generates a UUID per submission and sends it as `Idempotency-Key`. The server attempts `INSERT INTO generation_idempotency ON CONFLICT DO NOTHING`:
+
+- Lock acquired (new key): generation proceeds normally.
+- Key exists and `completed`: original `noteId` is returned without calling Gemini.
+- Key exists and `processing` (fresh): `409` is returned.
+- Key exists and `processing` (stale, > 120 s): an atomic conditional `UPDATE` attempts to reclaim the record. If another concurrent request wins the reclaim race, the losing request re-reads state and either replays the completed result or returns `409`.
+
+On any generation failure, the idempotency record is deleted so the client can retry with the same or a new key.
+
+### Transactions
+
+Note insertion and idempotency update run inside a single PostgreSQL transaction via `withTransaction`. Both succeed or both roll back.
+
+### Failure handling
+
+- Transcript failures are caught and logged at `warn` level; generation falls back to Gemini direct-video processing automatically.
+- All error responses return sanitized client messages — internal error details are logged server-side but never returned to the client.
+- Three error messages are surfaced to the client verbatim: `"YouTube URL is required"`, `"Invalid YouTube URL"`, and the Gemini timeout message. All other errors return a generic message.
+
+---
+
+## Observability
+
+### Structured logging
+
+All log entries are emitted as single-line JSON to stdout/stderr. Every entry includes `timestamp`, `level`, `event`, and where applicable `requestId`, `durationMs`, `method`, `path`, `status`, and `videoId`.
+
+### Request IDs
+
+`getRequestId` reads `x-request-id` from the incoming request header. If absent, a UUID is generated. The ID is propagated to all log entries for that request and returned in the `x-request-id` response header.
+
+### Metrics
+
+Prometheus metrics are exposed at `GET /api/metrics` using a custom `prom-client` registry. Default Node.js process metrics are intentionally excluded to avoid cardinality noise. Registered metrics:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `http_requests_total` | Counter | `method`, `route`, `status` |
+| `http_request_duration_seconds` | Histogram | `method`, `route` |
+| `generate_stage_duration_seconds` | Histogram | `stage` |
+
+`stage` values: `transcript_fetch`, `title_fetch`, `gemini_inference`, `db_insert`.
+
+Route labels use static templates (e.g. `/api/notes/[id]`) — no UUIDs or dynamic values appear in metric labels.
+
+### Health checks
+
+`GET /api/health` executes `SELECT 1` against the database. Returns `200` on success, `503` on failure. The database connectivity state is included in the response body and logged.
+
+### Generation timing
+
+Each generation request logs per-stage durations: `transcriptFetchMs`, `titleFetchMs`, `geminiInferenceMs`, `dbInsertMs`, and `fallbackDurationMs` when the direct-video path is used.
+
+### Local monitoring
+
+A Docker Compose file (`docker-compose.prometheus.yml`) runs Prometheus (scraping `host.docker.internal:3000/api/metrics` every 15 s) and Grafana (with provisioned dashboards) locally for observability validation. This stack is not deployed to Vercel production. There is no production metrics collection backend configured in this repository.
+
+---
+
+## Security
+
+- **Secrets** — `GEMINI_API_KEY`, `DATABASE_URL`, and `DATABASE_CA_CERT` are read from environment variables. `.env.local` is blocked by `.gitignore`. `DATABASE_CA_CERT` must never be set as a `NEXT_PUBLIC_*` variable.
+- **URL validation** — `validateYouTubeUrl` parses the URL and checks the hostname against an allowlist (`youtube.com`, `www.youtube.com`, `youtu.be`) before any network request is made.
+- **Parameterized SQL** — all database queries use positional parameters (`$1`, `$2`, …) via `pg`. No string interpolation.
+- **PostgreSQL TLS** — in production (`NODE_ENV=production`), the pool is configured with `ssl: { ca: DATABASE_CA_CERT, rejectUnauthorized: true }`. `rejectUnauthorized: false` is explicitly avoided. In development and test environments, SSL is disabled.
+- **Sanitized errors** — internal error details (stack traces, database errors, raw Gemini output) are logged server-side and never returned to the client.
+- **Logging hygiene** — `requestId`, `videoId`, and `durationMs` are logged; no user-submitted content (URLs, transcripts) appears in log fields.
+- **No authentication** — the application is currently unauthenticated. All notes are globally accessible.
+
+---
+
+## Performance
+
+The main latency driver is Gemini inference. Optimizations applied:
+
+- **Parallel fetching** — transcript extraction (`youtube-transcript`) and title fetching (`noembed.com`) run concurrently via `Promise.all`, eliminating the serial wait between them.
+- **Database query projection** — `GET /api/notes` selects only the columns needed for the library view (`id`, `video_id`, `video_title`, `thumbnail_url`, `overview`, `created_at`), avoiding transfer of `detailed_notes` and array fields for the list endpoint.
+- **Bounded result size** — the notes list is capped at 200 rows as an explicit safety limit while pagination is not implemented.
+- **Index on `created_at`** — `idx_notes_created_at` on `notes(created_at DESC)` supports the `ORDER BY created_at DESC LIMIT $1` query used by the library endpoint.
+- **Per-stage timing** — every generation request logs `transcriptFetchMs`, `titleFetchMs`, `geminiInferenceMs`, and `dbInsertMs` to surface bottlenecks.
+
+Gemini inference remains the dominant component of end-to-end latency regardless of optimization.
+
+---
+
+## Testing & Quality
+
+Tests are written with **Vitest 5** and run in the Node.js environment. All external dependencies (database, Gemini SDK, `youtube-transcript`, `fetch`) are mocked.
+
+Test files in `tests/`:
+
+| File | Coverage area |
+|---|---|
+| `generate.test.ts` | Full generation pipeline, transcript fallback, direct-video fallback, idempotency states (new key, completed replay, concurrent 409, stale reclaim, concurrent reclaim race, failure cleanup), error sanitization, parallel fetch concurrency |
+| `transcript.test.ts` | `validateYouTubeUrl` allowlist/blocklist, `fetchTranscript` timeout behavior, `extractVideoTitle` fallback and timeout |
+| `notes.test.ts` | `GET /api/notes` success and database failure |
+| `notes-id.test.ts` | `GET /api/notes/[id]` (found, 404, 500), `DELETE /api/notes/[id]` (success, 500) |
+| `health.test.ts` | `GET /api/health` — 200/503, `x-request-id` propagation, no internal error leakage |
+| `metrics.test.ts` | Counter and histogram recording, `/api/metrics` content type and cache headers, absence of default Node.js metrics, no high-cardinality labels |
+| `db.test.ts` | SSL config per environment, `query_timeout` configuration |
+
+### Commands
+
+```bash
+npm test               # vitest run (all tests, no watch)
+npm run test:watch     # vitest interactive watch mode
+npm run lint           # ESLint
+npx tsc --noEmit       # TypeScript type check
+npm run build          # Next.js production build
+```
+
+### CI pipeline
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request to `main`:
+
+1. Install dependencies (`npm ci --legacy-peer-deps`)
+2. `npm test`
+3. `npm run lint`
+4. `npx tsc --noEmit`
+5. `npm run build`
+
+---
+
+## Local Development
+
+### Prerequisites
+
+- Node.js 20
+- PostgreSQL (local or cloud — Supabase free tier is sufficient)
+- Google Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
+
+### Setup
+
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Configure environment
 cp .env.example .env.local
 ```
 
-### Required Configuration Keys
+Edit `.env.local`:
 
-| Variable | Type | Description | Example / Fallback |
-| :--- | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | String | Google AI Studio Gemini API Key | `AIzaSy...` |
-| `DATABASE_URL` | String | PostgreSQL Connection URI with credentials | `postgresql://user:password@host:port/database?sslmode=require` |
+```env
+DATABASE_URL=postgresql://user:password@localhost:5432/codenotes
+GEMINI_API_KEY=...
 
-> **Security Notice:** Never commit `.env.local` to version control. The repository's `.gitignore` explicitly blocks `.env*.local`.
-
----
-
-## 5. Database Schema & Data Models
-
-The database uses PostgreSQL with a single primary table named `notes`.
-
-### DDL (Data Definition Language)
-
-```sql
-CREATE TABLE IF NOT EXISTS notes (
-  id UUID PRIMARY KEY,
-  video_id VARCHAR(255) NOT NULL,
-  video_title TEXT NOT NULL,
-  video_url TEXT NOT NULL,
-  thumbnail_url TEXT,
-  overview TEXT,
-  key_concepts TEXT[],
-  detailed_notes TEXT,
-  shorthands TEXT[],
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+# Production only — Supabase root CA certificate (PEM string).
+# Leave blank for local development.
+DATABASE_CA_CERT=
 ```
 
-### TypeScript Data Interface (`src/lib/db.ts`)
+`NODE_ENV` is set automatically by Next.js. Do not set it manually.
 
-```typescript
-export interface Note {
-  id: string;
-  videoId: string;
-  videoTitle: string;
-  videoUrl: string;
-  thumbnailUrl?: string;
-  overview: string;
-  keyConcepts: string[];
-  detailedNotes: string;
-  shorthands: string[];
-  createdAt?: string;
-}
+```bash
+# 3. Run schema migration
+npm run db:migrate
+
+# 4. (Optional) Seed local data
+npm run db:seed
+
+# 5. Start development server
+npm run dev
 ```
 
-### Field Descriptions
-- `id` (`UUID`): Primary key generated via `crypto.randomUUID()`.
-- `video_id` (`VARCHAR(255)`): Extracted 11-character YouTube video identifier.
-- `video_title` (`TEXT`): Human-readable title fetched via NoEmbed API.
-- `video_url` (`TEXT`): Full canonical YouTube URL submitted by the user.
-- `thumbnail_url` (`TEXT`): YouTube CDN URL (`maxresdefault.jpg`) for video preview.
-- `overview` (`TEXT`): 2–3 sentence executive summary generated by Gemini.
-- `key_concepts` (`TEXT[]`): Array of strings summarizing major topical concepts.
-- `detailed_notes` (`TEXT`): Comprehensive markdown content containing inline code blocks (```` ```language ````) and markdown comparison tables.
-- `shorthands` (`TEXT[]`): Array of quick tips, gotchas, or best-practice pointers.
-- `created_at` (`TIMESTAMPTZ`): Record insertion timestamp with time zone.
+Application is available at `http://localhost:3000`.
+
+### Local observability stack (optional)
+
+```bash
+docker compose -f docker-compose.prometheus.yml up -d
+```
+
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3001`
+
+Prometheus scrapes `/api/metrics` on the running Next.js dev server every 15 seconds.
 
 ---
 
-## 6. API Reference
+## Deployment
 
-All API routes are located in `src/app/api/` and follow Next.js App Router conventions.
+```
+GitHub
+  │  push to main
+  ▼
+GitHub Actions CI
+  │  test → lint → typecheck → build
+  ▼
+Vercel
+  │  automatic deployment on CI pass
+  ▼
+Next.js (Node.js runtime)
+  │
+  ├── Supabase PostgreSQL  (DATABASE_URL + DATABASE_CA_CERT)
+  └── Google Gemini API    (GEMINI_API_KEY)
+```
 
-### 1. Generate Study Notes
-- **Endpoint:** `POST /api/generate`
-- **Description:** Consumes a YouTube URL, retrieves transcript, prompts Gemini 2.5 Flash, saves to DB, and returns the generated note ID.
-- **Request Headers:** `Content-Type: application/json`
-- **Request Body:**
-  ```json
-  {
-    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-  }
-  ```
-- **Responses:**
-  - `200 OK`:
-    ```json
-    {
-      "success": true,
-      "noteId": "3b61fa1c-1c52-475a-a384-1845fd7fcece"
-    }
-    ```
-  - `400 Bad Request`: `{"error": "YouTube URL is required"}`
-  - `500 Internal Server Error`: `{"error": "Failed to fetch video transcript..."}`
+Required environment variables in Vercel project settings:
 
----
+| Variable | Notes |
+|---|---|
+| `DATABASE_URL` | Supabase connection string with `?sslmode=require` |
+| `GEMINI_API_KEY` | Google AI Studio key |
+| `DATABASE_CA_CERT` | Supabase root CA certificate (PEM). Required — application will not start without it in production. |
 
-### 2. List All Notes
-- **Endpoint:** `GET /api/notes`
-- **Description:** Returns all saved notes sorted chronologically descending (`created_at DESC`).
-- **Response:**
-  - `200 OK`:
-    ```json
-    {
-      "success": true,
-      "notes": [
-        {
-          "id": "3b61fa1c-1c52-475a-a384-1845fd7fcece",
-          "videoId": "dQw4w9WgXcQ",
-          "videoTitle": "Advanced TypeScript Patterns",
-          "videoUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-          "thumbnailUrl": "https://img.youtube.com/vi/dQw4w9WgXcQ/maxresdefault.jpg",
-          "overview": "An exhaustive breakdown of conditional types and mapped types.",
-          "keyConcepts": ["Conditional Types", "Template Literal Types"],
-          "detailedNotes": "## 1. Conditional Types...",
-          "shorthands": ["Use infer for unwrapping Promise types"],
-          "createdAt": "2026-03-28T19:30:00.000Z"
-        }
-      ]
-    }
-    ```
+Run `npm run db:migrate` once against the production database before the first deployment (or after any schema change).
 
 ---
 
-### 3. Get Note By ID
-- **Endpoint:** `GET /api/notes/[id]`
-- **Description:** Retrieves full note data by UUID.
-- **URL Parameters:** `id` (UUID string)
-- **Responses:**
-  - `200 OK`: `{"success": true, "note": { ... }}`
-  - `404 Not Found`: `{"error": "Note not found"}`
-  - `500 Internal Server Error`: `{"error": "Failed to fetch the note"}`
+## Known Limitations
+
+- **No authentication** — notes are globally accessible. There is no per-user isolation.
+- **No rate limiting** — the API has no public rate limiting.
+- **Transcript extraction is external-dependent** — the `youtube-transcript` library depends on YouTube's caption delivery. Videos without captions trigger the Gemini direct-video fallback.
+- **Direct-video fallback is slower** — Gemini processes the video URL natively, which adds latency compared to the transcript path.
+- **Synchronous generation** — the request blocks until Gemini completes. Very long videos risk hitting the 75-second Gemini timeout or Vercel's function timeout.
+- **No production metrics backend** — the `/api/metrics` Prometheus endpoint exists, but there is no production scraper configured. The Prometheus/Grafana stack is local-only.
+- **Notes list is unpaginated** — `GET /api/notes` returns at most 200 notes. No cursor or offset pagination is implemented.
 
 ---
 
-### 4. Delete Note By ID
-- **Endpoint:** `DELETE /api/notes/[id]`
-- **Description:** Deletes a note by its UUID.
-- **URL Parameters:** `id` (UUID string)
-- **Responses:**
-  - `200 OK`: `{"success": true}`
-  - `500 Internal Server Error`: `{"error": "Failed to delete the note"}`
+## Future Improvements
 
----
-
-## 7. Core AI Pipeline & Prompt Engineering
-
-The AI generation engine resides in [`src/lib/gemini.ts`](src/lib/gemini.ts).
-
-### Model Configuration
-- **Model:** `gemini-2.5-flash`
-- **Output Format:** Strict JSON Schema (`responseMimeType: "application/json"`)
-- **Schema Validation:** Configured via `@google/generative-ai` `SchemaType.OBJECT` enforcing:
-  - `overview`: `STRING`
-  - `keyConcepts`: `ARRAY` of `STRING`
-  - `detailedNotes`: `STRING` (containing markdown, inline code fences, and comparison tables)
-  - `shorthands`: `ARRAY` of `STRING`
-
-### Prompt Architectural Constraints
-The prompt explicitly enforces three strict rules on the LLM:
-1. **Structure First:** Overview $\rightarrow$ Key Concepts $\rightarrow$ Detailed Topics $\rightarrow$ Comparison Tables $\rightarrow$ Shorthands.
-2. **Contextual Code Mapping:** Code snippets must **never** be lumped at the end of the document. Whenever a theoretical block discusses an implementation, the accurate code block must be embedded inline using standard markdown fences (e.g. ```` ```typescript ````).
-3. **Comparison Tables:** Whenever alternative solutions, patterns, or tools are contrasted (e.g., `let` vs `const`, SQL vs NoSQL, Server vs Client components), the model must construct a clean Markdown comparison table.
-
----
-
-## 8. Local Setup & Getting Started
-
-### Prerequisites
-- **Node.js:** v20.x or higher installed
-- **Package Manager:** `npm` (v10+), `pnpm`, or `yarn`
-- **PostgreSQL Database:** Running locally on port `5432` or accessible via cloud provider (e.g. Supabase, Neon)
-- **Google Gemini API Key:** Accessible from [Google AI Studio](https://aistudio.google.com/)
-
-### Step-by-Step Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone [INSERT REPOSITORY URL HERE]
-   cd unstuckstudy
-   ```
-
-2. **Install project dependencies:**
-   ```bash
-   npm install
-   ```
-
-3. **Configure Environment Variables:**
-   ```bash
-   cp .env.example .env.local
-   ```
-   Edit `.env.local` and provide your actual credentials:
-   ```env
-   GEMINI_API_KEY=your_gemini_api_key_here
-   DATABASE_URL=postgresql://postgres:your_password@localhost:5432/codenotes
-   ```
-
-4. **Initialize Database Schema:**
-   Run the migration script to verify connectivity and create the `notes` table:
-   ```bash
-   node scripts/migrate-json-to-pg.js
-   ```
-
-5. **Start Development Server:**
-   ```bash
-   npm run dev
-   ```
-
-6. **Open in Browser:**
-   Navigate to [http://localhost:3000](http://localhost:3000).
-
----
-
-## 9. Database Migrations & Legacy Data
-
-The project includes an automated database initialization script at [`scripts/migrate-json-to-pg.js`](scripts/migrate-json-to-pg.js):
-
-- **Automatic Schema Creation:** Runs `CREATE TABLE IF NOT EXISTS notes (...)` with all necessary column types and constraints.
-- **Legacy Migration Support:** Checks for the presence of `data/codenotes.json`. If an existing JSON dataset exists from previous versions of the app, it iterates through notes and imports them into Postgres without creating duplicate primary keys.
-- **Execution:**
-  ```bash
-  node scripts/migrate-json-to-pg.js
-  ```
-
----
-
-## 10. Deployment & Hosting (Vercel & Supabase)
-
-The application is architected for zero-configuration deployment on **Vercel** combined with a **Supabase** or **Neon** PostgreSQL database.
-
-### 1. PostgreSQL (Supabase / Neon)
-1. Create a project on [Supabase](https://supabase.com).
-2. Copy the Connection String URI from **Project Settings $\rightarrow$ Database $\rightarrow$ Connection string (URI)**.
-3. Ensure SSL connection is permitted (the connection pool in `src/lib/db.ts` is configured with `ssl: { rejectUnauthorized: false }` for cloud compatibility).
-
-### 2. Vercel Deployment
-1. Import the repository into your Vercel Dashboard.
-2. Under **Project Settings $\rightarrow$ Environment Variables**, configure:
-   - `GEMINI_API_KEY`: Your Google AI Studio API key.
-   - `DATABASE_URL`: Your Supabase/Neon PostgreSQL connection URI.
-3. Click **Deploy**. Vercel will run `npm run build` using Next.js Turbopack.
-
----
-
-## 11. Known Caveats, Edge Cases & Troubleshooting
-
-### 1. YouTube Videos Without Captions
-- **Behavior:** If a video does not have user-submitted or auto-generated English captions enabled, `youtube-transcript` throws an error.
-- **Handling:** The API catches this error in `src/lib/transcript.ts` and returns a descriptive error: `"Failed to fetch video transcript. The video might not have captions enabled."`
-- **Mitigation:** Advise users to test with videos having closed captioning (CC) enabled.
-
-### 2. PostgreSQL Connection Pooling on Serverless
-- **Behavior:** Serverless edge or lambda functions can spawn high numbers of transient database connections.
-- **Mitigation:** The application leverages `pg.Pool`. When scaling to high concurrency on Vercel, connect via a connection pooler like **Supabase Transaction Pooler (port 6543)** or **Prisma Accelerate / PgBouncer**.
-
-### 3. Large Transcripts / Context Limits
-- **Behavior:** Very long videos (e.g. 5+ hour streams) have massive transcript text lengths.
-- **Mitigation:** Gemini 2.5 Flash supports a 1M+ token context window, comfortably handling extended transcripts without truncation.
-
----
-
-## 12. Future Roadmap
-
-- [ ] **User Authentication:** Support user logins via Supabase Auth / NextAuth / Clerk to isolate notes per user account.
-- [ ] **Export Options:** One-click export to Markdown (`.md`), PDF, and Notion.
-- [ ] **Timestamp Deep-Linking:** Automatically link generated code blocks and section headers back to the exact YouTube timestamp (`?t=123s`).
-- [ ] **Multi-Language Caption Support:** Allow translation and note generation from non-English video transcripts.
-- [ ] **Full-Text Search:** Implement PostgreSQL `tsvector` / `tsquery` full-text search across all saved notes in the library.
-
----
-
-## 13. License & Authors
-
-- **Author:** Sparsh Sharma (`spyspring30@gmail.com`)
-- **License:** MIT License (or private repository as specified by project owner)
+- User authentication and per-user note isolation
+- Rate limiting and abuse protection
+- Asynchronous generation (queue-based) to decouple response time from Gemini latency
+- Full-text search across saved notes
+- Export to Markdown or PDF
+- Timestamp-linked notes tied to video playback position
+- Production metrics collection backend
