@@ -40,6 +40,7 @@ export function getPool(): Pool {
 
 export interface Note {
   id: string;
+  userId?: string;
   videoId: string;
   videoTitle: string;
   videoUrl: string;
@@ -60,11 +61,51 @@ export async function query(text: string, params?: any[]) {
   return res;
 }
 
-export async function withTransaction<T>(callback: (client: { query: (text: string, params?: any[]) => Promise<any> }) => Promise<T>): Promise<T> {
+export async function withTransaction<T>(
+  callback: (client: { query: (text: string, params?: any[]) => Promise<any> }) => Promise<T>
+): Promise<T> {
   const pool = getPool();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      logger.error('db_rollback_failed', { errorMessage: (rollbackError as any)?.message });
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function withUserTransaction<T>(
+  userId: string,
+  callback: (client: { query: (text: string, params?: any[]) => Promise<any> }) => Promise<T>
+): Promise<T> {
+  const pool = getPool();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Set transaction-local JWT claims so auth.uid() and auth.jwt() resolve to the authenticated user
+    await client.query('SELECT set_config($1, $2, true)', ['request.jwt.claim.sub', userId]);
+    await client.query('SELECT set_config($1, $2, true)', [
+      'request.jwt.claims',
+      JSON.stringify({ sub: userId, role: 'authenticated' }),
+    ]);
+
+    // Switch role transaction-locally when authenticated role exists
+    try {
+      await client.query('SET LOCAL ROLE authenticated');
+    } catch (roleErr: any) {
+      logger.warn('db_set_local_role_skipped', { errorMessage: roleErr?.message });
+    }
+
     const result = await callback(client);
     await client.query('COMMIT');
     return result;

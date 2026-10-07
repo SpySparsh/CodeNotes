@@ -1,323 +1,335 @@
 import { NextResponse } from 'next/server';
-import { fetchTranscript, extractVideoTitle, extractVideoId } from '@/lib/transcript';
-import { generateNotes, generateNotesFromVideoUrl, GeneratedNotes } from '@/lib/gemini';
-import { query, withTransaction } from '@/lib/db';
+import crypto from 'crypto';
+import { extractVideoId, validateYouTubeUrl } from '@/lib/transcript';
+import { query } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
-import { recordHttpRequest, recordGenerateStageDuration } from '@/lib/metrics';
-import crypto from 'crypto';
+import { recordHttpRequest } from '@/lib/metrics';
+import { requireUser, UnauthorizedError } from '@/lib/auth';
+import { inngest, generateDeterministicEventId } from '@/inngest/client';
+import { generateUrlSchema } from '@/lib/validations/generate';
 
 export const STALE_IDEMPOTENCY_THRESHOLD_MS = 120000;
 
 export async function POST(request: Request) {
   const startTime = performance.now();
   const requestId = getRequestId(request);
-  const idempotencyKey = request.headers.get('Idempotency-Key')?.trim() || null;
+  let authenticatedUserId: string | null = null;
 
   try {
-    const { url } = await request.json();
+    const user = await requireUser();
+    authenticatedUserId = user.id;
 
-    if (!url) {
+    const body = await request.json().catch(() => ({}));
+    const parseResult = generateUrlSchema.safeParse(body);
+
+    if (!parseResult.success) {
       const durationMs = performance.now() - startTime;
       recordHttpRequest('POST', '/api/generate', 400, durationMs / 1000);
       logger.warn('generate_request_validation_failed', {
         requestId,
+        userId: authenticatedUserId,
         method: 'POST',
         path: '/api/generate',
         status: 400,
         durationMs,
-        reason: 'Missing YouTube URL',
+        errors: parseResult.error.flatten(),
       });
       return NextResponse.json(
-        { error: 'YouTube URL is required' },
+        { error: parseResult.error.issues[0]?.message || 'YouTube URL is required' },
         { status: 400, headers: { 'x-request-id': requestId } }
       );
     }
 
-    if (idempotencyKey) {
-      const acquireResult = await query(
-        `INSERT INTO generation_idempotency (key, status)
-         VALUES ($1, 'processing')
-         ON CONFLICT (key) DO NOTHING
-         RETURNING key`,
-        [idempotencyKey]
+    const { url } = parseResult.data;
+
+    try {
+      validateYouTubeUrl(url);
+    } catch {
+      const durationMs = performance.now() - startTime;
+      recordHttpRequest('POST', '/api/generate', 400, durationMs / 1000);
+      return NextResponse.json(
+        { error: 'Invalid YouTube URL' },
+        { status: 400, headers: { 'x-request-id': requestId } }
       );
-
-      if (acquireResult.rows.length > 0) {
-        logger.info('generation_idempotency_acquired', {
-          requestId,
-          method: 'POST',
-          path: '/api/generate',
-        });
-      } else {
-        const existingRecord = await query(
-          `SELECT status, note_id, created_at, updated_at
-           FROM generation_idempotency
-           WHERE key = $1`,
-          [idempotencyKey]
-        );
-
-        if (existingRecord.rows.length > 0) {
-          const row = existingRecord.rows[0];
-
-          if (row.status === 'completed') {
-            const durationMs = performance.now() - startTime;
-            recordHttpRequest('POST', '/api/generate', 200, durationMs / 1000);
-            logger.info('generation_idempotency_replayed', {
-              requestId,
-              method: 'POST',
-              path: '/api/generate',
-              status: 200,
-              durationMs,
-              noteId: row.note_id,
-            });
-            return NextResponse.json(
-              { success: true, noteId: row.note_id },
-              { headers: { 'x-request-id': requestId } }
-            );
-          }
-
-          if (row.status === 'processing') {
-            const lastUpdatedTime = new Date(row.updated_at || row.created_at).getTime();
-            const ageMs = Date.now() - lastUpdatedTime;
-
-            if (ageMs > STALE_IDEMPOTENCY_THRESHOLD_MS) {
-              const cutoffDate = new Date(Date.now() - STALE_IDEMPOTENCY_THRESHOLD_MS);
-
-              const reclaimResult = await query(
-                `UPDATE generation_idempotency
-                 SET status = 'processing', updated_at = CURRENT_TIMESTAMP
-                 WHERE key = $1 AND status = 'processing' AND COALESCE(updated_at, created_at) < $2
-                 RETURNING key`,
-                [idempotencyKey, cutoffDate]
-              );
-
-              if (reclaimResult.rows.length > 0) {
-                logger.warn('generation_idempotency_stale_reclaimed', {
-                  requestId,
-                  method: 'POST',
-                  path: '/api/generate',
-                  staleAgeMs: ageMs,
-                });
-              } else {
-                // Lost the atomic reclaim race: re-read state
-                const rereadRecord = await query(
-                  `SELECT status, note_id FROM generation_idempotency WHERE key = $1`,
-                  [idempotencyKey]
-                );
-
-                if (rereadRecord.rows.length > 0 && rereadRecord.rows[0].status === 'completed') {
-                  const durationMs = performance.now() - startTime;
-                  recordHttpRequest('POST', '/api/generate', 200, durationMs / 1000);
-                  logger.info('generation_idempotency_replayed', {
-                    requestId,
-                    method: 'POST',
-                    path: '/api/generate',
-                    status: 200,
-                    durationMs,
-                    noteId: rereadRecord.rows[0].note_id,
-                  });
-                  return NextResponse.json(
-                    { success: true, noteId: rereadRecord.rows[0].note_id },
-                    { headers: { 'x-request-id': requestId } }
-                  );
-                }
-
-                const durationMs = performance.now() - startTime;
-                recordHttpRequest('POST', '/api/generate', 409, durationMs / 1000);
-                logger.warn('generation_idempotency_in_progress', {
-                  requestId,
-                  method: 'POST',
-                  path: '/api/generate',
-                  status: 409,
-                  durationMs,
-                });
-                return NextResponse.json(
-                  { success: false, error: 'Generation already in progress' },
-                  { status: 409, headers: { 'x-request-id': requestId } }
-                );
-              }
-            } else {
-              const durationMs = performance.now() - startTime;
-              recordHttpRequest('POST', '/api/generate', 409, durationMs / 1000);
-              logger.warn('generation_idempotency_in_progress', {
-                requestId,
-                method: 'POST',
-                path: '/api/generate',
-                status: 409,
-                durationMs,
-              });
-              return NextResponse.json(
-                { success: false, error: 'Generation already in progress' },
-                { status: 409, headers: { 'x-request-id': requestId } }
-              );
-            }
-          }
-        }
-      }
     }
 
-    // 1 & 2. Concurrently fetch transcript and video title
-    let transcriptDurationMs = 0;
-    let titleDurationMs = 0;
-    let fallbackDurationMs = 0;
-    let generationMethod: 'transcript' | 'direct_video' = 'transcript';
-
-    const transcriptPromise = (async () => {
-      const t0 = performance.now();
-      try {
-        const res = await fetchTranscript(url);
-        transcriptDurationMs = performance.now() - t0;
-        recordGenerateStageDuration('transcript_fetch', transcriptDurationMs / 1000);
-        return res;
-      } catch (err: any) {
-        transcriptDurationMs = performance.now() - t0;
-        logger.warn('transcript_fetch_failed', {
-          requestId,
-          durationMs: transcriptDurationMs,
-          errorMessage: err.message,
-        });
-        return null;
-      }
-    })();
-
-    const titlePromise = (async () => {
-      const t0 = performance.now();
-      const res = await extractVideoTitle(url);
-      titleDurationMs = performance.now() - t0;
-      recordGenerateStageDuration('title_fetch', titleDurationMs / 1000);
-      return res;
-    })();
-
-    const [transcriptResult, videoTitle] = await Promise.all([
-      transcriptPromise,
-      titlePromise,
-    ]);
-
-    const videoId = transcriptResult?.videoId || extractVideoId(url);
+    const videoId = extractVideoId(url);
     if (!videoId) {
-      throw new Error('Invalid YouTube URL');
+      const durationMs = performance.now() - startTime;
+      recordHttpRequest('POST', '/api/generate', 400, durationMs / 1000);
+      return NextResponse.json(
+        { error: 'Invalid YouTube URL' },
+        { status: 400, headers: { 'x-request-id': requestId } }
+      );
     }
 
-    // 3. Generate notes using Gemini (transcript if available, fallback to direct video analysis)
-    const t0Gemini = performance.now();
-    let aiNotes: GeneratedNotes;
-    let geminiDurationMs = 0;
+    const clientProvidedKey = request.headers.get('Idempotency-Key')?.trim();
+    const idempotencyKey =
+      clientProvidedKey ||
+      crypto.createHash('sha256').update(`${authenticatedUserId}:${videoId}`).digest('hex');
 
-    if (transcriptResult) {
-      aiNotes = await generateNotes(transcriptResult.text, videoTitle);
-      geminiDurationMs = performance.now() - t0Gemini;
-      recordGenerateStageDuration('gemini_inference', geminiDurationMs / 1000);
-    } else {
-      generationMethod = 'direct_video';
-      logger.info('direct_video_fallback_started', {
-        requestId,
-        videoId,
-      });
+    const eventId = generateDeterministicEventId(authenticatedUserId, idempotencyKey);
 
-      const t0Fallback = performance.now();
-      aiNotes = await generateNotesFromVideoUrl(url, videoTitle);
-      fallbackDurationMs = performance.now() - t0Fallback;
-      geminiDurationMs = fallbackDurationMs;
-      recordGenerateStageDuration('gemini_inference', fallbackDurationMs / 1000);
-
-      logger.info('direct_video_fallback_completed', {
-        requestId,
-        videoId,
-        durationMs: fallbackDurationMs,
-      });
-    }
-
-    // 4. Save to DB atomically using a PostgreSQL transaction
-    const noteId = crypto.randomUUID();
-    const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
-
-    const insertQuery = `
-      INSERT INTO notes (id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING *;
-    `;
-
-    const t0Db = performance.now();
-
-    await withTransaction(async (client) => {
-      await client.query(insertQuery, [
-        noteId,
-        videoId,
-        videoTitle,
-        url,
-        thumbnailUrl,
-        aiNotes.overview,
-        aiNotes.keyConcepts,
-        aiNotes.detailedNotes,
-        aiNotes.shorthands
-      ]);
-
-      if (idempotencyKey) {
-        await client.query(
-          `UPDATE generation_idempotency
-           SET status = 'completed',
-               note_id = $2,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE key = $1`,
-          [idempotencyKey, noteId]
-        );
-      }
-    });
-
-    const dbDurationMs = performance.now() - t0Db;
-    recordGenerateStageDuration('db_insert', dbDurationMs / 1000);
-
-    const totalDurationMs = performance.now() - startTime;
-    recordHttpRequest('POST', '/api/generate', 200, totalDurationMs / 1000);
-
-    logger.info('generate_request_completed', {
-      requestId,
-      method: 'POST',
-      path: '/api/generate',
-      status: 200,
-      durationMs: totalDurationMs,
-      videoId,
-      generationMethod,
-      timings: {
-        transcriptFetchMs: Math.round(transcriptDurationMs * 100) / 100,
-        titleFetchMs: Math.round(titleDurationMs * 100) / 100,
-        geminiInferenceMs: Math.round(geminiDurationMs * 100) / 100,
-        ...(fallbackDurationMs ? { fallbackDurationMs: Math.round(fallbackDurationMs * 100) / 100 } : {}),
-        dbInsertMs: Math.round(dbDurationMs * 100) / 100,
-      },
-    });
-
-    return NextResponse.json(
-      { success: true, noteId },
-      { headers: { 'x-request-id': requestId } }
+    // Check existing idempotency state
+    const existing = await query(
+      `SELECT status, video_id, video_url, note_id, error_message, error_code, created_at, updated_at
+       FROM generation_idempotency
+       WHERE user_id = $1 AND key = $2`,
+      [authenticatedUserId, idempotencyKey]
     );
-  } catch (error: any) {
-    if (idempotencyKey) {
-      try {
-        await query(
-          `DELETE FROM generation_idempotency WHERE key = $1 AND status != 'completed'`,
-          [idempotencyKey]
+
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+
+      // Mismatch check: verify same idempotency key is not reused for a different video
+      if (row.video_id && row.video_id !== videoId) {
+        const durationMs = performance.now() - startTime;
+        recordHttpRequest('POST', '/api/generate', 422, durationMs / 1000);
+        logger.warn('generation_idempotency_payload_mismatch', {
+          requestId,
+          userId: authenticatedUserId,
+          idempotencyKey,
+          existingVideoId: row.video_id,
+          requestedVideoId: videoId,
+        });
+        return NextResponse.json(
+          {
+            error: 'Idempotency key already used for a different video',
+            code: 'IDEMPOTENCY_KEY_PAYLOAD_MISMATCH',
+          },
+          { status: 422, headers: { 'x-request-id': requestId } }
         );
-        logger.info('generation_idempotency_failed', {
-          requestId,
-          method: 'POST',
-          path: '/api/generate',
-        });
-      } catch (cleanupErr: any) {
-        logger.error('generation_idempotency_cleanup_error', {
-          requestId,
-          method: 'POST',
-          path: '/api/generate',
-          errorMessage: cleanupErr.message,
-        });
       }
+
+      // 1. If completed: return cached noteId directly
+      if (row.status === 'completed' && row.note_id) {
+        const durationMs = performance.now() - startTime;
+        recordHttpRequest('POST', '/api/generate', 200, durationMs / 1000);
+        logger.info('generation_idempotency_replayed', {
+          requestId,
+          userId: authenticatedUserId,
+          method: 'POST',
+          path: '/api/generate',
+          status: 200,
+          durationMs,
+          noteId: row.note_id,
+        });
+        return NextResponse.json(
+          {
+            success: true,
+            status: 'completed',
+            noteId: row.note_id,
+            cached: true,
+          },
+          { status: 200, headers: { 'x-request-id': requestId } }
+        );
+      }
+
+      // 2. If already pending or processing
+      if (row.status === 'pending' || row.status === 'processing') {
+        const lastUpdated = new Date(row.updated_at || row.created_at).getTime();
+        const ageMs = Date.now() - lastUpdated;
+
+        if (ageMs > STALE_IDEMPOTENCY_THRESHOLD_MS) {
+          // Reclaim stale job and re-send event to Inngest
+          await query(
+            `UPDATE generation_idempotency
+             SET status = 'pending',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = $1 AND key = $2`,
+            [authenticatedUserId, idempotencyKey]
+          );
+
+          try {
+            await inngest.send({
+              name: 'notes/generate.requested',
+              id: eventId,
+              data: {
+                userId: authenticatedUserId,
+                idempotencyKey,
+                videoId,
+                videoUrl: url,
+              },
+            });
+          } catch (sendErr: any) {
+            logger.warn('generation_stale_requeue_deferred', {
+              eventId,
+              userId: authenticatedUserId,
+              errorMessage: sendErr.message,
+            });
+          }
+
+          const durationMs = performance.now() - startTime;
+          recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+          logger.warn('generation_idempotency_stale_requeued', {
+            requestId,
+            userId: authenticatedUserId,
+            eventId,
+            ageMs,
+          });
+
+          return NextResponse.json(
+            {
+              success: true,
+              status: 'pending',
+              jobId: eventId,
+              idempotencyKey,
+              message: 'Stale generation recovered and queued',
+            },
+            { status: 202, headers: { 'x-request-id': requestId } }
+          );
+        }
+
+        // Fresh pending/processing job in flight: return existing job info
+        const durationMs = performance.now() - startTime;
+        recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+        logger.info('generation_idempotency_in_progress', {
+          requestId,
+          userId: authenticatedUserId,
+          jobId: eventId,
+          status: row.status,
+        });
+
+        return NextResponse.json(
+          {
+            success: true,
+            status: row.status,
+            jobId: eventId,
+            idempotencyKey,
+            message: 'Generation already in progress',
+          },
+          { status: 202, headers: { 'x-request-id': requestId } }
+        );
+      }
+
+      // 3. If failed: allow re-triggering by updating status to pending
+      if (row.status === 'failed') {
+        await query(
+          `UPDATE generation_idempotency
+           SET status = 'pending',
+               video_id = $3,
+               video_url = $4,
+               error_message = NULL,
+               error_code = NULL,
+               attempts = 0,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = $1 AND key = $2`,
+          [authenticatedUserId, idempotencyKey, videoId, url]
+        );
+
+        try {
+          await inngest.send({
+            name: 'notes/generate.requested',
+            id: eventId,
+            data: {
+              userId: authenticatedUserId,
+              idempotencyKey,
+              videoId,
+              videoUrl: url,
+            },
+          });
+        } catch (sendErr: any) {
+          logger.warn('generation_retry_enqueue_deferred', {
+            eventId,
+            userId: authenticatedUserId,
+            errorMessage: sendErr.message,
+          });
+        }
+
+        const durationMs = performance.now() - startTime;
+        recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+        return NextResponse.json(
+          {
+            success: true,
+            status: 'pending',
+            jobId: eventId,
+            idempotencyKey,
+          },
+          { status: 202, headers: { 'x-request-id': requestId } }
+        );
+      }
+    }
+
+    // 4. New generation request: insert pending row then dispatch Inngest event
+    await query(
+      `INSERT INTO generation_idempotency (user_id, key, status, video_id, video_url, created_at, updated_at)
+       VALUES ($1, $2, 'pending', $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id, key) DO UPDATE
+       SET updated_at = CURRENT_TIMESTAMP
+       WHERE generation_idempotency.status != 'completed'`,
+      [authenticatedUserId, idempotencyKey, videoId, url]
+    );
+
+    try {
+      await inngest.send({
+        name: 'notes/generate.requested',
+        id: eventId,
+        data: {
+          userId: authenticatedUserId,
+          idempotencyKey,
+          videoId,
+          videoUrl: url,
+        },
+      });
+    } catch (inngestErr: any) {
+      // Retain the durable PostgreSQL pending record. Do NOT delete it.
+      // The background Inngest cron reconciler ensures crash-safe recovery.
+      logger.error('generation_inngest_send_deferred', {
+        requestId,
+        userId: authenticatedUserId,
+        idempotencyKey,
+        errorMessage: inngestErr.message,
+      });
     }
 
     const durationMs = performance.now() - startTime;
+    recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+
+    logger.info('generation_job_queued', {
+      requestId,
+      userId: authenticatedUserId,
+      method: 'POST',
+      path: '/api/generate',
+      status: 202,
+      durationMs,
+      videoId,
+      jobId: eventId,
+      idempotencyKey,
+    });
+
+    return NextResponse.json(
+      {
+        success: true,
+        status: 'pending',
+        jobId: eventId,
+        idempotencyKey,
+      },
+      { status: 202, headers: { 'x-request-id': requestId } }
+    );
+  } catch (error: any) {
+    const durationMs = performance.now() - startTime;
+
+    if (error instanceof UnauthorizedError || error.name === 'UnauthorizedError') {
+      recordHttpRequest('POST', '/api/generate', 401, durationMs / 1000);
+      logger.warn('generate_request_unauthorized', {
+        requestId,
+        method: 'POST',
+        path: '/api/generate',
+        status: 401,
+        durationMs,
+      });
+
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401, headers: { 'x-request-id': requestId } }
+      );
+    }
+
     recordHttpRequest('POST', '/api/generate', 500, durationMs / 1000);
     logger.error('generate_request_failed', {
       requestId,
+      userId: authenticatedUserId || undefined,
       method: 'POST',
       path: '/api/generate',
       status: 500,
@@ -326,18 +338,8 @@ export async function POST(request: Request) {
       errorStack: error.stack,
     });
 
-    let clientErrorMessage = 'Something went wrong while generating your notes. Please try again.';
-
-    if (error.message?.includes('AI generation timed out')) {
-      clientErrorMessage = 'Note generation timed out. Please try again with a shorter video.';
-    } else if (error.message?.includes('Failed to fetch video transcript')) {
-      clientErrorMessage = error.message;
-    } else if (error.message?.includes('Invalid YouTube URL')) {
-      clientErrorMessage = error.message;
-    }
-
     return NextResponse.json(
-      { error: clientErrorMessage },
+      { error: error.message || 'Failed to process generation request' },
       { status: 500, headers: { 'x-request-id': requestId } }
     );
   }

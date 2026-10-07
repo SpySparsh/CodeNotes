@@ -1,10 +1,15 @@
-import { Registry, Counter, Histogram } from 'prom-client';
+import { Registry, Counter, Histogram, Gauge } from 'prom-client';
 
 interface MetricsRegistryHolder {
   registry: Registry;
   httpRequestsTotal: Counter<string>;
   httpRequestDurationSeconds: Histogram<string>;
   generateStageDurationSeconds: Histogram<string>;
+  queueJobsEnqueuedTotal: Counter<string>;
+  queueJobDurationSeconds: Histogram<string>;
+  queueActiveJobsGauge: Gauge<string>;
+  queueJobFailuresTotal: Counter<string>;
+  queueJobRetriesTotal: Counter<string>;
 }
 
 declare global {
@@ -37,11 +42,52 @@ function initializeMetrics(): MetricsRegistryHolder {
     registers: [registry],
   });
 
+  const queueJobsEnqueuedTotal = new Counter({
+    name: 'codenotes_queue_jobs_enqueued_total',
+    help: 'Total number of generation jobs enqueued in BullMQ',
+    labelNames: ['queue'] as const,
+    registers: [registry],
+  });
+
+  const queueJobDurationSeconds = new Histogram({
+    name: 'codenotes_queue_job_duration_seconds',
+    help: 'End-to-end execution time for BullMQ generation jobs in seconds',
+    labelNames: ['queue', 'status'] as const,
+    buckets: [1, 5, 10, 20, 30, 60, 90, 120],
+    registers: [registry],
+  });
+
+  const queueActiveJobsGauge = new Gauge({
+    name: 'codenotes_queue_active_jobs',
+    help: 'Number of currently active jobs in BullMQ worker',
+    labelNames: ['queue'] as const,
+    registers: [registry],
+  });
+
+  const queueJobFailuresTotal = new Counter({
+    name: 'codenotes_queue_job_failures_total',
+    help: 'Total number of failed BullMQ generation jobs',
+    labelNames: ['queue', 'error_code'] as const,
+    registers: [registry],
+  });
+
+  const queueJobRetriesTotal = new Counter({
+    name: 'codenotes_queue_job_retries_total',
+    help: 'Total number of BullMQ job retries',
+    labelNames: ['queue'] as const,
+    registers: [registry],
+  });
+
   return {
     registry,
     httpRequestsTotal,
     httpRequestDurationSeconds,
     generateStageDurationSeconds,
+    queueJobsEnqueuedTotal,
+    queueJobDurationSeconds,
+    queueActiveJobsGauge,
+    queueJobFailuresTotal,
+    queueJobRetriesTotal,
   };
 }
 
@@ -56,6 +102,11 @@ export const registry = holder.registry;
 export const httpRequestsTotal = holder.httpRequestsTotal;
 export const httpRequestDurationSeconds = holder.httpRequestDurationSeconds;
 export const generateStageDurationSeconds = holder.generateStageDurationSeconds;
+export const queueJobsEnqueuedTotal = holder.queueJobsEnqueuedTotal;
+export const queueJobDurationSeconds = holder.queueJobDurationSeconds;
+export const queueActiveJobsGauge = holder.queueActiveJobsGauge;
+export const queueJobFailuresTotal = holder.queueJobFailuresTotal;
+export const queueJobRetriesTotal = holder.queueJobRetriesTotal;
 
 export type GenerateStage =
   | 'transcript_fetch'
@@ -78,4 +129,21 @@ export function recordGenerateStageDuration(
   durationSeconds: number
 ) {
   generateStageDurationSeconds.observe({ stage }, durationSeconds);
+}
+
+export function recordQueueJobEnqueued(queueName = 'note-generation') {
+  queueJobsEnqueuedTotal.inc({ queue: queueName });
+}
+
+export function recordQueueJobCompleted(queueName: string, durationSeconds: number) {
+  queueJobDurationSeconds.observe({ queue: queueName, status: 'completed' }, durationSeconds);
+}
+
+export function recordQueueJobFailed(queueName: string, durationSeconds: number, errorCode = 'UNKNOWN') {
+  queueJobDurationSeconds.observe({ queue: queueName, status: 'failed' }, durationSeconds);
+  queueJobFailuresTotal.inc({ queue: queueName, error_code: errorCode });
+}
+
+export function recordQueueJobRetry(queueName = 'note-generation') {
+  queueJobRetriesTotal.inc({ queue: queueName });
 }

@@ -1,4 +1,22 @@
-export default function LoadingState() {
+interface LoadingStateProps {
+  status?: string;
+  message?: string;
+}
+
+export default function LoadingState({ status, message }: LoadingStateProps = {}) {
+  const displayTitle =
+    status === 'pending'
+      ? 'Queued in Background'
+      : status === 'processing'
+      ? 'Analyzing Video & Generating Study Notes'
+      : 'Generating Study Notes';
+
+  const displayMessage =
+    message ||
+    (status === 'pending'
+      ? 'Your generation job has been enqueued. Our background worker will pick it up in a moment.'
+      : 'Our AI is analyzing the video, extracting key concepts, and formatting code blocks. This usually takes 15-30 seconds.');
+
   return (
     <div className="w-full max-w-3xl mx-auto mt-16 p-8 rounded-2xl border border-border/50 bg-card/20 backdrop-blur-md shadow-2xl flex flex-col items-center justify-center min-h-[400px]">
       <div className="relative w-24 h-24 mb-8">
@@ -7,10 +25,10 @@ export default function LoadingState() {
         <div className="absolute inset-4 rounded-full border-b-2 border-indigo-500 animate-spin" style={{ animationDuration: '1s' }}></div>
       </div>
       <h3 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-purple-400 mb-4 text-center">
-        Analyzing Transcript & Extracting Code
+        {displayTitle}
       </h3>
       <p className="text-muted-foreground text-center max-w-md">
-        Our AI is watching the video, taking detailed notes, and formatting all the code blocks for you. This usually takes 10-20 seconds.
+        {displayMessage}
       </p>
       
       <div className="mt-12 w-full max-w-md space-y-4 opacity-50">

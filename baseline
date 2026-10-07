@@ -1,0 +1,27 @@
+BASELINE
+
+Application:
+✓ starts
+
+Database:
+✓ connects
+
+Generate:
+✓ works
+
+Get note:
+✓ works
+
+List notes:
+✓ works
+
+Delete:
+✓ works
+
+Known failures:
+- ...
+
+Environment:
+Node:
+Postgres:
+Next:
