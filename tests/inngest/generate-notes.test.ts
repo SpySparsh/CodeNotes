@@ -22,12 +22,26 @@ vi.mock('@/lib/transcript', () => ({
       throw new Error('Invalid YouTube URL');
     }
   }),
+  acquireTranscript: vi.fn(),
   fetchTranscript: vi.fn(),
   extractVideoTitle: vi.fn(),
   extractVideoId: vi.fn((url: string) => {
     const match = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
     return match ? match[1] : null;
   }),
+  canonicalizeYouTubeUrl: vi.fn((url: string) => url),
+  TranscriptError: class TranscriptError extends Error {
+    readonly code: string;
+    readonly isRetryable: boolean;
+    readonly provider?: string;
+    constructor(code: string, message: string, isRetryable = false, provider?: string) {
+      super(message);
+      this.name = 'TranscriptError';
+      this.code = code;
+      this.isRetryable = isRetryable;
+      this.provider = provider;
+    }
+  },
 }));
 
 vi.mock('@/lib/gemini', () => ({
@@ -55,10 +69,38 @@ describe('Inngest Error Classification (classifyError)', () => {
   });
 
   it('classifies missing captions as unrecoverable non-retryable error', () => {
-    const error = new Error('Failed to fetch video transcript. The video might not have captions enabled.');
+    const error = new Error('Captions are disabled or unavailable for this video.');
     const result = classifyError(error);
     expect(result.isUnrecoverable).toBe(true);
-    expect(result.code).toBe('NO_TRANSCRIPT');
+    expect(result.code).toBe('TRANSCRIPT_UNAVAILABLE');
+  });
+
+  it('classifies TranscriptError TRANSCRIPT_UNAVAILABLE as unrecoverable', () => {
+    const error = new (transcript as any).TranscriptError('TRANSCRIPT_UNAVAILABLE', 'Captions unavailable', false);
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(true);
+    expect(result.code).toBe('TRANSCRIPT_UNAVAILABLE');
+  });
+
+  it('classifies TranscriptError TRANSCRIPT_PROVIDER_AUTH_ERROR as unrecoverable', () => {
+    const error = new (transcript as any).TranscriptError('TRANSCRIPT_PROVIDER_AUTH_ERROR', 'Invalid API key', false);
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(true);
+    expect(result.code).toBe('TRANSCRIPT_PROVIDER_AUTH_ERROR');
+  });
+
+  it('classifies TranscriptError TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED as unrecoverable', () => {
+    const error = new (transcript as any).TranscriptError('TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED', 'Monthly quota exceeded', false);
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(true);
+    expect(result.code).toBe('TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED');
+  });
+
+  it('classifies TranscriptError TRANSCRIPT_PROVIDER_RATE_LIMITED as retryable', () => {
+    const error = new (transcript as any).TranscriptError('TRANSCRIPT_PROVIDER_RATE_LIMITED', 'Rate limited', true);
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(false);
+    expect(result.code).toBe('TRANSCRIPT_PROVIDER_RATE_LIMITED');
   });
 
   it('classifies AI malformed JSON as unrecoverable error', () => {
@@ -133,16 +175,15 @@ describe('Inngest generateNotesFunction', () => {
 
   it('has correct function configuration metadata', () => {
     expect(generateNotesFunction).toBeDefined();
-    // Verify trigger event or options
     const fnOpts = (generateNotesFunction as any).opts;
     expect(fnOpts.id).toBe('generate-notes');
     expect(fnOpts.retries).toBe(2);
   });
 
-  it('executes full 4-step generation and persists notes under withUserTransaction', async () => {
+  it('executes full 4-step generation using acquireTranscript and persists notes under withUserTransaction', async () => {
     const { step, executedSteps } = createMockStep();
 
-    const mockTranscript = 'Transcript text for Inngest tutorial';
+    const mockTranscript = 'Transcript text for Supadata / Inngest tutorial';
     const mockTitle = 'Inngest Tutorial Title';
     const mockAiNotes = {
       overview: 'Great Inngest overview',
@@ -161,10 +202,11 @@ describe('Inngest generateNotesFunction', () => {
       rowCount: 1,
     } as any);
 
-    // Step 2: Transcript & title
-    vi.mocked(transcript.fetchTranscript).mockResolvedValueOnce({
+    // Step 2: Transcript & title via acquireTranscript
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
       text: mockTranscript,
       videoId: mockVideoId,
+      provider: 'supadata',
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(mockTitle);
 
@@ -200,6 +242,7 @@ describe('Inngest generateNotesFunction', () => {
 
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
     expect(gemini.generateNotes).toHaveBeenCalledWith(mockTranscript, mockTitle);
+    expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
   });
 
   it('skips remaining steps if claim detects job is already completed', async () => {
@@ -218,7 +261,7 @@ describe('Inngest generateNotesFunction', () => {
     expect(result.noteId).toBe(existingNoteId);
     expect(executedSteps).toEqual(['claim-generation-processing']);
 
-    expect(transcript.fetchTranscript).not.toHaveBeenCalled();
+    expect(transcript.acquireTranscript).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
     expect(db.withUserTransaction).not.toHaveBeenCalled();
   });
@@ -239,19 +282,13 @@ describe('Inngest generateNotesFunction', () => {
     expect(result.reason).toContain('Active lease held');
     expect(executedSteps).toEqual(['claim-generation-processing']);
 
-    expect(transcript.fetchTranscript).not.toHaveBeenCalled();
+    expect(transcript.acquireTranscript).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
   });
 
-  it('falls back to generateNotesFromVideoUrl when captions are unavailable', async () => {
+  it('fails cleanly with NonRetriableError when transcript is unavailable without calling direct video fallback', async () => {
     const { step } = createMockStep();
     const mockTitle = 'Video Without Captions';
-    const mockAiNotes = {
-      overview: 'Direct video overview',
-      keyConcepts: ['Direct Concept 1'],
-      detailedNotes: '# Direct Video Notes',
-      shorthands: ['Direct Shorthand 1'],
-    };
 
     // Step 1
     vi.mocked(db.query).mockResolvedValueOnce({
@@ -263,35 +300,18 @@ describe('Inngest generateNotesFunction', () => {
       rowCount: 1,
     } as any);
 
-    // Step 2: Transcript fails, title succeeds
-    vi.mocked(transcript.fetchTranscript).mockRejectedValueOnce(
-      new Error('Failed to fetch video transcript. Captions disabled.')
+    // Step 2: Transcript fails with domain error
+    vi.mocked(transcript.acquireTranscript).mockRejectedValueOnce(
+      new (transcript as any).TranscriptError('TRANSCRIPT_UNAVAILABLE', 'Captions are disabled or unavailable for this video.', false)
     );
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(mockTitle);
 
-    // Step 3: Direct video inference
-    vi.mocked(gemini.generateNotesFromVideoUrl).mockResolvedValueOnce(mockAiNotes);
-
-    // Step 4: withUserTransaction
-    vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [{ status: 'processing', note_id: null }],
-      rowCount: 1,
-    } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [],
-      rowCount: 1,
-    } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [],
-      rowCount: 1,
-    } as any);
-
     const fnHandler = (generateNotesFunction as any).fn;
-    const result = await fnHandler({ event: mockEvent, step });
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
 
-    expect(result.success).toBe(true);
+    // Verify direct video fallback is NEVER called
+    expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
-    expect(gemini.generateNotesFromVideoUrl).toHaveBeenCalledWith(mockVideoUrl, mockTitle);
   });
 
   it('throws NonRetriableError on payload mismatch', async () => {

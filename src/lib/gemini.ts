@@ -122,6 +122,10 @@ ${transcript}
   }
 }
 
+/**
+ * @deprecated Direct video ingestion is removed from the active generation pipeline.
+ * Use acquireTranscript() -> generateNotes(transcript, title) instead.
+ */
 export async function generateNotesFromVideoUrl(videoUrl: string, videoTitle: string): Promise<GeneratedNotes> {
   if (!apiKey || apiKey === 'your_api_key_here') {
     throw new Error('Gemini API key is missing or invalid. Please check .env.local');

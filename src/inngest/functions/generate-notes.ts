@@ -1,8 +1,14 @@
 import { NonRetriableError } from 'inngest';
 import crypto from 'crypto';
 import { inngest } from '../client';
-import { fetchTranscript, extractVideoTitle, extractVideoId, validateYouTubeUrl } from '@/lib/transcript';
-import { generateNotes, generateNotesFromVideoUrl, GeneratedNotes } from '@/lib/gemini';
+import {
+  acquireTranscript,
+  extractVideoTitle,
+  extractVideoId,
+  validateYouTubeUrl,
+  TranscriptError,
+} from '@/lib/transcript';
+import { generateNotes, GeneratedNotes } from '@/lib/gemini';
 import { query, withUserTransaction } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import { recordQueueJobCompleted, recordQueueJobFailed } from '@/lib/metrics';
@@ -12,6 +18,14 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
     return {
       isUnrecoverable: true,
       code: 'NON_RETRIABLE_ERROR',
+      message: error.message,
+    };
+  }
+
+  if (error instanceof TranscriptError) {
+    return {
+      isUnrecoverable: !error.isRetryable,
+      code: error.code,
       message: error.message,
     };
   }
@@ -36,15 +50,17 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
   }
 
   if (
-    msg.includes('Failed to fetch video transcript') &&
-    !msg.includes('timed out') &&
-    !msg.includes('ETIMEDOUT')
+    msg.includes('Failed to fetch video transcript') ||
+    msg.includes('Captions are disabled or unavailable') ||
+    msg.includes('Transcript unavailable')
   ) {
-    return {
-      isUnrecoverable: true,
-      code: 'NO_TRANSCRIPT',
-      message: 'Captions are disabled or unavailable for this video.',
-    };
+    if (!msg.includes('timed out') && !msg.includes('ETIMEDOUT')) {
+      return {
+        isUnrecoverable: true,
+        code: 'TRANSCRIPT_UNAVAILABLE',
+        message: 'Captions are disabled or unavailable for this video.',
+      };
+    }
   }
 
   if (msg.includes('AI returned malformed data')) {
@@ -55,7 +71,7 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
     };
   }
 
-  if (msg.includes('API key is missing')) {
+  if (msg.includes('API key is missing') || msg.includes('SUPADATA_API_KEY is not configured')) {
     return {
       isUnrecoverable: true,
       code: 'CONFIG_ERROR',
@@ -63,8 +79,17 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
     };
   }
 
+  // Quota exhausted - non-retryable
+  if (msg.includes('monthly quota exceeded') || msg.includes('quota exceeded')) {
+    return {
+      isUnrecoverable: true,
+      code: 'TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED',
+      message: 'Transcript provider quota exceeded.',
+    };
+  }
+
   // Rate limit / Quota errors - retryable
-  if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('rate limit')) {
     return {
       isUnrecoverable: false,
       code: 'RATE_LIMITED',
@@ -229,7 +254,12 @@ export const generateNotesFunction = inngest.createFunction(
     }
 
     // Step 2: Fetch Transcript and Video Title (Outside DB transaction)
-    const mediaData = await step.run('fetch-transcript-and-title', async () => {
+    const mediaData = await step.run('fetch-transcript-and-title', async (): Promise<{
+      resolvedVideoId: string;
+      videoTitle: string;
+      transcriptText: string;
+      transcriptProvider: string;
+    }> => {
       try {
         validateYouTubeUrl(videoUrl);
       } catch (err: any) {
@@ -241,51 +271,45 @@ export const generateNotesFunction = inngest.createFunction(
         throw new NonRetriableError('Invalid YouTube URL: could not extract video ID');
       }
 
-      let transcriptResult: { text: string; videoId: string } | null = null;
+      let transcriptResult: { text: string; videoId: string; provider: string };
       let videoTitle = 'Unknown Video';
 
-      const transcriptPromise = (async () => {
-        try {
-          return await fetchTranscript(videoUrl);
-        } catch (err: any) {
-          logger.warn('inngest_transcript_fetch_failed', {
-            userId,
-            videoId: resolvedVideoId,
-            errorMessage: err.message,
-          });
-          return null;
+      try {
+        const [transRes, titleRes] = await Promise.all([
+          acquireTranscript(videoUrl),
+          extractVideoTitle(videoUrl).catch(() => 'Unknown Video'),
+        ]);
+        transcriptResult = transRes;
+        videoTitle = titleRes;
+      } catch (err: any) {
+        const classification = classifyError(err);
+        if (classification.isUnrecoverable) {
+          throw new NonRetriableError(classification.message);
         }
-      })();
+        throw err;
+      }
 
-      const titlePromise = extractVideoTitle(videoUrl).catch(() => 'Unknown Video');
-
-      const [transRes, titleRes] = await Promise.all([transcriptPromise, titlePromise]);
-      transcriptResult = transRes;
-      videoTitle = titleRes;
+      if (!transcriptResult || !transcriptResult.text || transcriptResult.text.trim().length === 0) {
+        throw new NonRetriableError('Captions are disabled or unavailable for this video.');
+      }
 
       return {
-        resolvedVideoId,
+        resolvedVideoId: transcriptResult.videoId || resolvedVideoId,
         videoTitle,
-        transcriptText: transcriptResult ? transcriptResult.text : null,
+        transcriptText: transcriptResult.text,
+        transcriptProvider: transcriptResult.provider,
       };
     });
 
     // Step 3: AI Generation with Gemini (Outside DB transaction)
     const generatedNotes = await step.run('generate-ai-notes', async () => {
       let aiNotes: GeneratedNotes;
-      let generationMethod: 'transcript' | 'direct_video' = 'transcript';
 
       try {
-        if (mediaData.transcriptText) {
-          aiNotes = await generateNotes(mediaData.transcriptText, mediaData.videoTitle);
-        } else {
-          generationMethod = 'direct_video';
-          logger.info('inngest_direct_video_fallback_started', {
-            userId,
-            videoId: mediaData.resolvedVideoId,
-          });
-          aiNotes = await generateNotesFromVideoUrl(videoUrl, mediaData.videoTitle);
+        if (!mediaData.transcriptText) {
+          throw new NonRetriableError('Transcript text is required for AI note generation.');
         }
+        aiNotes = await generateNotes(mediaData.transcriptText, mediaData.videoTitle);
       } catch (err: any) {
         const classification = classifyError(err);
         if (classification.isUnrecoverable) {
@@ -300,7 +324,8 @@ export const generateNotesFunction = inngest.createFunction(
 
       return {
         aiNotes,
-        generationMethod,
+        generationMethod: 'transcript' as const,
+        transcriptProvider: mediaData.transcriptProvider,
       };
     });
 
@@ -359,6 +384,7 @@ export const generateNotesFunction = inngest.createFunction(
         idempotencyKey,
         noteId,
         generationMethod: generatedNotes.generationMethod,
+        transcriptProvider: generatedNotes.transcriptProvider,
         durationSeconds,
       });
 
