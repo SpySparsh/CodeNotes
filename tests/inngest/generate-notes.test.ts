@@ -207,6 +207,7 @@ describe('Inngest generateNotesFunction', () => {
       text: mockTranscript,
       videoId: mockVideoId,
       provider: 'supadata',
+      cached: false,
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(mockTitle);
 
@@ -243,6 +244,69 @@ describe('Inngest generateNotesFunction', () => {
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
     expect(gemini.generateNotes).toHaveBeenCalledWith(mockTranscript, mockTitle);
     expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
+  });
+
+  it('supports shared cached transcript reuse across different users while isolating user notes under RLS', async () => {
+    const userA = 'user-uuid-aaaa-1111';
+    const userB = 'user-uuid-bbbb-2222';
+    const cachedTranscript = 'Shared cached transcript across users';
+    const sharedTitle = 'Shared Video Title';
+    const mockAiNotes = {
+      overview: 'Shared overview',
+      keyConcepts: ['Concept 1'],
+      detailedNotes: '# Detailed Notes',
+      shorthands: ['Shorthand 1'],
+    };
+
+    // User A Generation (Cache Miss -> Acquired)
+    const { step: stepA } = createMockStep();
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'pending', note_id: null, lease_until: null }] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: cachedTranscript,
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
+    vi.mocked(gemini.generateNotes).mockResolvedValueOnce(mockAiNotes);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    const resA = await fnHandler({
+      event: { name: 'notes/generate.requested', data: { userId: userA, idempotencyKey: 'key-a', videoId: mockVideoId, videoUrl: mockVideoUrl } },
+      step: stepA,
+    });
+
+    expect(resA.success).toBe(true);
+    expect(db.withUserTransaction).toHaveBeenCalledWith(userA, expect.any(Function));
+
+    // User B Generation (Cache Hit -> Reused cached transcript)
+    const { step: stepB } = createMockStep();
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'pending', note_id: null, lease_until: null }] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: cachedTranscript,
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: true,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
+    vi.mocked(gemini.generateNotes).mockResolvedValueOnce(mockAiNotes);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+
+    const resB = await fnHandler({
+      event: { name: 'notes/generate.requested', data: { userId: userB, idempotencyKey: 'key-b', videoId: mockVideoId, videoUrl: mockVideoUrl } },
+      step: stepB,
+    });
+
+    expect(resB.success).toBe(true);
+    expect(db.withUserTransaction).toHaveBeenCalledWith(userB, expect.any(Function));
+    expect(resA.noteId).not.toEqual(resB.noteId);
   });
 
   it('skips remaining steps if claim detects job is already completed', async () => {

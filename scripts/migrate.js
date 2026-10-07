@@ -230,7 +230,20 @@ async function migrate() {
       END $$;
     `);
 
-    // Step 3 — indexes
+    // Step 3 — youtube_transcripts table (Shared/Global Transcript Cache)
+    console.log('[migrate] Ensuring table: youtube_transcripts');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS youtube_transcripts (
+        video_id        VARCHAR(32)              PRIMARY KEY,
+        transcript_text TEXT                     NOT NULL,
+        language        VARCHAR(16),
+        provider        VARCHAR(32)              NOT NULL,
+        created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Step 4 — indexes
     console.log('[migrate] Creating indexes');
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_notes_user_id_created_at

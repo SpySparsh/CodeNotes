@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { query } from '@/lib/db';
 import { TranscriptError, TranscriptResult } from './types';
 import { canonicalizeYouTubeUrl, extractVideoId, validateYouTubeUrl } from './canonicalize';
 import { fetchSupadataTranscript } from './supadata';
@@ -7,11 +8,16 @@ import { fetchYouTubeTranscriptScraper } from './youtube-transcript';
 export const TRANSCRIPT_TIMEOUT_MS = 15000;
 
 /**
- * High-level transcript acquisition service implementing the provider hierarchy:
- * 1. SUPADATA_API_KEY validation: If missing, raises a clear non-retriable error (no silent fallback).
- * 2. Supadata (Primary provider)
- * 3. youtube-transcript (One fallback attempt on Supadata runtime/transient failures)
- * 4. Terminal TRANSCRIPT_UNAVAILABLE domain failure if both providers fail.
+ * High-level transcript acquisition service implementing:
+ * 1. Global PostgreSQL transcript cache lookup (fail-open on read error).
+ * 2. On Cache Hit: returns cached transcript immediately without calling external providers.
+ * 3. On Cache Miss:
+ *    a. SUPADATA_API_KEY validation (fail fast with non-retriable auth error if missing).
+ *    b. Supadata (Primary provider).
+ *    c. youtube-transcript (One fallback attempt on Supadata runtime/transient failures).
+ *    d. Terminal TRANSCRIPT_UNAVAILABLE domain failure if both providers fail.
+ * 4. On Successful Provider Acquisition: writes transcript to youtube_transcripts cache with
+ *    ON CONFLICT (video_id) DO NOTHING (fail-open on write error).
  *
  * Never exposes API keys or transcript text to logs.
  */
@@ -24,7 +30,42 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
     throw new TranscriptError('INVALID_URL', 'Invalid YouTube video URL', false);
   }
 
-  // 1. SUPADATA_API_KEY validation: fail fast with non-retriable auth error if missing
+  // 1. Shared Cache Lookup (Fail-open)
+  try {
+    const cacheRes = await query(
+      `SELECT transcript_text, language, provider
+       FROM youtube_transcripts
+       WHERE video_id = $1`,
+      [videoId]
+    );
+
+    if (cacheRes.rows.length > 0) {
+      const cachedRow = cacheRes.rows[0];
+      logger.info('transcript_cache_hit', {
+        videoId,
+        provider: cachedRow.provider,
+        textLength: cachedRow.transcript_text.length,
+      });
+
+      return {
+        text: cachedRow.transcript_text,
+        videoId,
+        provider: cachedRow.provider as any,
+        language: cachedRow.language || undefined,
+        cached: true,
+      };
+    }
+
+    logger.info('transcript_cache_miss', { videoId });
+  } catch (cacheReadErr: any) {
+    logger.warn('transcript_cache_read_error', {
+      videoId,
+      errorMessage: cacheReadErr.message,
+    });
+    // Fail-open: continue to provider acquisition
+  }
+
+  // 2. SUPADATA_API_KEY validation: fail fast with non-retriable auth error if missing
   if (!process.env.SUPADATA_API_KEY || process.env.SUPADATA_API_KEY.trim() === '') {
     logger.error('transcript_supadata_key_missing', { videoId });
     throw new TranscriptError(
@@ -40,8 +81,9 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
   });
 
   let primaryError: TranscriptError | Error | null = null;
+  let acquiredResult: { text: string; videoId: string; provider: 'supadata' | 'youtube-transcript' } | null = null;
 
-  // 2. Primary Provider: Supadata
+  // 3. Primary Provider: Supadata
   try {
     const result = await fetchSupadataTranscript(canonicalUrl);
     logger.info('transcript_acquisition_success', {
@@ -49,7 +91,7 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
       provider: 'supadata',
       textLength: result.text.length,
     });
-    return {
+    acquiredResult = {
       text: result.text,
       videoId,
       provider: 'supadata',
@@ -76,42 +118,72 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
     });
   }
 
-  // 3. Fallback Attempt: youtube-transcript
-  try {
-    const result = await fetchYouTubeTranscriptScraper(canonicalUrl);
-    logger.info('transcript_acquisition_success', {
-      videoId,
-      provider: 'youtube-transcript',
-      textLength: result.text.length,
-    });
-    return {
-      text: result.text,
-      videoId,
-      provider: 'youtube-transcript',
-    };
-  } catch (secondaryErr: any) {
-    const secondaryCode =
-      secondaryErr instanceof TranscriptError ? secondaryErr.code : 'TRANSCRIPT_UNAVAILABLE';
+  // 4. Fallback Attempt: youtube-transcript
+  if (!acquiredResult) {
+    try {
+      const result = await fetchYouTubeTranscriptScraper(canonicalUrl);
+      logger.info('transcript_acquisition_success', {
+        videoId,
+        provider: 'youtube-transcript',
+        textLength: result.text.length,
+      });
+      acquiredResult = {
+        text: result.text,
+        videoId,
+        provider: 'youtube-transcript',
+      };
+    } catch (secondaryErr: any) {
+      const secondaryCode =
+        secondaryErr instanceof TranscriptError ? secondaryErr.code : 'TRANSCRIPT_UNAVAILABLE';
 
-    logger.error('transcript_acquisition_failed', {
-      videoId,
-      primaryErrorCode: primaryError instanceof TranscriptError ? primaryError.code : undefined,
-      secondaryErrorCode: secondaryCode,
-      secondaryErrorMessage: secondaryErr.message,
-    });
+      logger.error('transcript_acquisition_failed', {
+        videoId,
+        primaryErrorCode: primaryError instanceof TranscriptError ? primaryError.code : undefined,
+        secondaryErrorCode: secondaryCode,
+        secondaryErrorMessage: secondaryErr.message,
+      });
 
-    // If Supadata failed with quota exhaustion and fallback also failed, do not retry
-    if (primaryError instanceof TranscriptError && primaryError.code === 'TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED') {
-      throw primaryError;
+      // If Supadata failed with quota exhaustion and fallback also failed, do not retry
+      if (primaryError instanceof TranscriptError && primaryError.code === 'TRANSCRIPT_PROVIDER_QUOTA_EXCEEDED') {
+        throw primaryError;
+      }
+
+      // Both providers failed: throw clean non-retriable TRANSCRIPT_UNAVAILABLE
+      throw new TranscriptError(
+        'TRANSCRIPT_UNAVAILABLE',
+        'Captions are disabled or unavailable for this video.',
+        false
+      );
     }
-
-    // Both providers failed: throw clean non-retriable TRANSCRIPT_UNAVAILABLE
-    throw new TranscriptError(
-      'TRANSCRIPT_UNAVAILABLE',
-      'Captions are disabled or unavailable for this video.',
-      false
-    );
   }
+
+  // 5. Shared Cache Write (Fail-open)
+  try {
+    await query(
+      `INSERT INTO youtube_transcripts (
+         video_id,
+         transcript_text,
+         language,
+         provider
+       )
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (video_id) DO NOTHING`,
+      [videoId, acquiredResult.text, null, acquiredResult.provider]
+    );
+  } catch (cacheWriteErr: any) {
+    logger.warn('transcript_cache_write_error', {
+      videoId,
+      errorMessage: cacheWriteErr.message,
+    });
+    // Fail-open: do not fail generation since transcript was successfully obtained
+  }
+
+  return {
+    text: acquiredResult.text,
+    videoId: acquiredResult.videoId,
+    provider: acquiredResult.provider,
+    cached: false,
+  };
 }
 
 /**

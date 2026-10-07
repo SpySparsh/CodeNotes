@@ -32,6 +32,8 @@ export interface TranscriptResult {
   text: string;
   videoId: string;
   provider: TranscriptProviderName;
+  language?: string | null;
+  cached?: boolean;
 }
 
 export interface VideoMetadata {

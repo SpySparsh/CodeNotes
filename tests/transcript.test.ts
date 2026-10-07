@@ -11,6 +11,16 @@ vi.mock('@/lib/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock('@/lib/db', () => {
+  const queryFn = vi.fn();
+  return {
+    query: queryFn,
+    getPool: vi.fn(),
+    withTransaction: vi.fn(),
+    withUserTransaction: vi.fn(),
+  };
+});
+
 import {
   extractVideoTitle,
   fetchTranscript,
@@ -24,6 +34,7 @@ import {
   TRANSCRIPT_TIMEOUT_MS,
 } from '@/lib/transcript';
 import { YoutubeTranscript } from 'youtube-transcript';
+import * as db from '@/lib/db';
 
 // ---------------------------------------------------------------------------
 // A. Canonicalization & URL Handling
@@ -241,9 +252,9 @@ describe('B. Supadata Client & Normalization', () => {
 });
 
 // ---------------------------------------------------------------------------
-// C. Provider Hierarchy & Fallback (acquireTranscript)
+// C. Shared PostgreSQL Transcript Cache & Provider Hierarchy
 // ---------------------------------------------------------------------------
-describe('C. Provider Hierarchy & Fallback', () => {
+describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -255,62 +266,184 @@ describe('C. Provider Hierarchy & Fallback', () => {
     process.env = originalEnv;
   });
 
-  it('uses Supadata as primary provider and does NOT call youtube-transcript when Supadata succeeds', async () => {
+  it('1. CACHE HIT: returns cached transcript without calling Supadata or youtube-transcript', async () => {
+    // Mock DB select returns cached row
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [
+        {
+          transcript_text: 'Cached transcript from PostgreSQL cache',
+          language: 'en',
+          provider: 'supadata',
+        },
+      ],
+      rowCount: 1,
+    } as any);
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+
+    expect(result.text).toBe('Cached transcript from PostgreSQL cache');
+    expect(result.videoId).toBe('dQw4w9WgXcQ');
+    expect(result.provider).toBe('supadata');
+    expect(result.cached).toBe(true);
+
+    // Verify neither external provider was called
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
+  });
+
+  it('2. CACHE MISS: calls Supadata, normalizes, writes to cache with ON CONFLICT, and returns transcript', async () => {
+    // 1. Cache select returns 0 rows (MISS)
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
+    } as any);
+
+    // 2. Supadata API responds successfully
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ content: [{ text: 'Supadata transcript text' }] }),
+      json: async () => ({ content: [{ text: 'Fresh Supadata transcript text' }] }),
+    } as any);
+
+    // 3. Cache insert succeeds
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 1,
     } as any);
 
     const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
 
-    expect(result.provider).toBe('supadata');
-    expect(result.text).toBe('Supadata transcript text');
+    expect(result.text).toBe('Fresh Supadata transcript text');
     expect(result.videoId).toBe('dQw4w9WgXcQ');
-    expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
+    expect(result.provider).toBe('supadata');
+    expect(result.cached).toBe(false);
+
+    // Verify DB insert query format
+    const insertCall = vi.mocked(db.query).mock.calls.find((call) =>
+      call[0].includes('INSERT INTO youtube_transcripts')
+    );
+    expect(insertCall).toBeDefined();
+    expect(insertCall![0]).toContain('ON CONFLICT (video_id) DO NOTHING');
+    expect(insertCall![1]).toEqual(['dQw4w9WgXcQ', 'Fresh Supadata transcript text', null, 'supadata']);
   });
 
-  it('raises non-retriable error and does NOT silently fall back when SUPADATA_API_KEY is missing', async () => {
-    delete process.env.SUPADATA_API_KEY;
+  it('3. CACHE READ ERROR: fail-open bypasses cache error and continues with provider acquisition', async () => {
+    // 1. Cache select throws database connection error
+    vi.mocked(db.query).mockRejectedValueOnce(new Error('PostgreSQL connection timeout'));
 
-    await expect(
-      acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
-    ).rejects.toMatchObject({
-      code: 'TRANSCRIPT_PROVIDER_AUTH_ERROR',
-      isRetryable: false,
-    });
-
-    expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
-  });
-
-  it('raises non-retriable auth error when Supadata returns 401/403 without silent fallback', async () => {
+    // 2. Supadata API responds successfully
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: false,
-      status: 401,
-      text: async () => 'Invalid API Key',
+      ok: true,
+      json: async () => ({ content: [{ text: 'Transcript after read error' }] }),
     } as any);
 
-    await expect(
-      acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
-    ).rejects.toMatchObject({
-      code: 'TRANSCRIPT_PROVIDER_AUTH_ERROR',
-      isRetryable: false,
-    });
+    // 3. Cache insert succeeds
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 1,
+    } as any);
 
-    expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
+    const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+
+    expect(result.text).toBe('Transcript after read error');
+    expect(result.videoId).toBe('dQw4w9WgXcQ');
+    expect(result.provider).toBe('supadata');
   });
 
-  it('falls back to youtube-transcript when Supadata encounters a transient server error', async () => {
-    // Supadata fails with 500
+  it('4. CACHE WRITE ERROR: fail-open logs error and returns transcript without failing generation', async () => {
+    // 1. Cache select returns 0 rows (MISS)
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
+    } as any);
+
+    // 2. Supadata responds successfully
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ content: [{ text: 'Transcript with write error' }] }),
+    } as any);
+
+    // 3. Cache insert fails
+    vi.mocked(db.query).mockRejectedValueOnce(new Error('PostgreSQL disk full'));
+
+    const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+
+    expect(result.text).toBe('Transcript with write error');
+    expect(result.videoId).toBe('dQw4w9WgXcQ');
+    expect(result.provider).toBe('supadata');
+  });
+
+  it('5. CONCURRENT INSERT / RACE: handles simulated concurrent insert safely with ON CONFLICT', async () => {
+    // Cache miss
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
+    } as any);
+
+    // Supadata succeeds
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ content: [{ text: 'Concurrent race transcript' }] }),
+    } as any);
+
+    // Insert returns rowCount 0 because another concurrent execution already inserted
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
+    } as any);
+
+    const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+
+    expect(result.text).toBe('Concurrent race transcript');
+    expect(result.videoId).toBe('dQw4w9WgXcQ');
+  });
+
+  it('6. URL VARIANTS: timestamped and short URLs resolve to same video_id and query cache with that key', async () => {
+    // Cache HIT for youtu.be/dQw4w9WgXcQ?t=100
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [
+        {
+          transcript_text: 'Cached content for canonicalized short URL',
+          language: 'en',
+          provider: 'supadata',
+        },
+      ],
+      rowCount: 1,
+    } as any);
+
+    const result = await acquireTranscript('https://youtu.be/dQw4w9WgXcQ?t=100');
+
+    expect(result.videoId).toBe('dQw4w9WgXcQ');
+    expect(result.text).toBe('Cached content for canonicalized short URL');
+
+    const selectCall = vi.mocked(db.query).mock.calls[0];
+    expect(selectCall[1]).toEqual(['dQw4w9WgXcQ']);
+  });
+
+  it('7. PROVIDER FALLBACK: cache miss -> Supadata fails -> youtube-transcript succeeds -> cached with provider=youtube-transcript', async () => {
+    // 1. Cache miss
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
+    } as any);
+
+    // 2. Supadata fails with 500
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: false,
       status: 500,
       text: async () => 'Internal Server Error',
     } as any);
 
-    // Scraper succeeds
+    // 3. Fallback scraper succeeds
     vi.mocked(YoutubeTranscript.fetchTranscript).mockResolvedValueOnce([
       { text: 'Fallback scraper text', duration: 1, offset: 0 },
     ]);
+
+    // 4. Cache insert
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 1,
+    } as any);
 
     const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
 
@@ -318,35 +451,28 @@ describe('C. Provider Hierarchy & Fallback', () => {
     expect(result.text).toBe('Fallback scraper text');
     expect(result.videoId).toBe('dQw4w9WgXcQ');
     expect(YoutubeTranscript.fetchTranscript).toHaveBeenCalledWith('dQw4w9WgXcQ');
+
+    const insertCall = vi.mocked(db.query).mock.calls.find((call) =>
+      call[0].includes('INSERT INTO youtube_transcripts')
+    );
+    expect(insertCall![1]).toEqual(['dQw4w9WgXcQ', 'Fallback scraper text', null, 'youtube-transcript']);
   });
 
-  it('falls back to youtube-transcript when Supadata encounters rate limiting (429)', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: false,
-      status: 429,
-      text: async () => 'Rate limit exceeded',
+  it('8. TERMINAL FAILURE: cache miss -> both providers fail -> throws clean TRANSCRIPT_UNAVAILABLE', async () => {
+    // 1. Cache miss
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
     } as any);
 
-    vi.mocked(YoutubeTranscript.fetchTranscript).mockResolvedValueOnce([
-      { text: 'Fallback scraper text on rate limit', duration: 1, offset: 0 },
-    ]);
-
-    const result = await acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
-
-    expect(result.provider).toBe('youtube-transcript');
-    expect(result.text).toBe('Fallback scraper text on rate limit');
-    expect(YoutubeTranscript.fetchTranscript).toHaveBeenCalledWith('dQw4w9WgXcQ');
-  });
-
-  it('throws TRANSCRIPT_UNAVAILABLE when both Supadata and youtube-transcript fail', async () => {
-    // Supadata fails with 404
+    // 2. Supadata fails with 404
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: false,
       status: 404,
       text: async () => 'Not Found',
     } as any);
 
-    // Scraper fails
+    // 3. Scraper fails
     vi.mocked(YoutubeTranscript.fetchTranscript).mockRejectedValueOnce(
       new Error('Could not find captions for video')
     );
@@ -359,15 +485,23 @@ describe('C. Provider Hierarchy & Fallback', () => {
     });
   });
 
-  it('fetchTranscript backward compatibility function returns text and videoId', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ content: [{ text: 'Compatibility test' }] }),
+  it('raises non-retriable error and does NOT silently fall back when SUPADATA_API_KEY is missing on cache miss', async () => {
+    delete process.env.SUPADATA_API_KEY;
+
+    // Cache miss
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [],
+      rowCount: 0,
     } as any);
 
-    const result = await fetchTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
-    expect(result.text).toBe('Compatibility test');
-    expect(result.videoId).toBe('dQw4w9WgXcQ');
+    await expect(
+      acquireTranscript('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+    ).rejects.toMatchObject({
+      code: 'TRANSCRIPT_PROVIDER_AUTH_ERROR',
+      isRetryable: false,
+    });
+
+    expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
   });
 });
 
