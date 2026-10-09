@@ -1,7 +1,11 @@
 import { test, expect } from '@playwright/test';
-import { loginViaUi, MOCK_NOTES, MOCK_NOTE_ID_1 } from './helpers';
+import { authenticateTestUser, MOCK_NOTES, MOCK_NOTE_ID_1 } from './helpers';
 
 test.describe('Study Library & Note Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await authenticateTestUser(page);
+  });
+
   test('should render empty library state when no notes exist', async ({ page }) => {
     await page.route(/\/api\/notes/, async (route) => {
       await route.fulfill({
@@ -16,7 +20,6 @@ test.describe('Study Library & Note Management', () => {
       });
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
 
     await expect(page.getByRole('heading', { level: 1, name: /Your Study Library/i })).toBeVisible();
@@ -38,7 +41,6 @@ test.describe('Study Library & Note Management', () => {
       });
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
 
     await expect(page.getByRole('heading', { level: 1, name: /Your Study Library/i })).toBeVisible();
@@ -72,7 +74,6 @@ test.describe('Study Library & Note Management', () => {
       });
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
     await expect(page.getByText('Mastering React 19 Server Components')).toBeVisible();
 
@@ -112,7 +113,6 @@ test.describe('Study Library & Note Management', () => {
       });
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
     await expect(page.getByText('Mastering React 19 Server Components')).toBeVisible();
 
@@ -153,7 +153,6 @@ test.describe('Study Library & Note Management', () => {
       }
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
     await expect(page.getByText('Mastering React 19 Server Components')).toBeVisible();
 
@@ -193,7 +192,6 @@ test.describe('Study Library & Note Management', () => {
       }
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
     await expect(page.getByText('Mastering React 19 Server Components')).toBeVisible();
 
@@ -243,7 +241,6 @@ test.describe('Study Library & Note Management', () => {
       }
     });
 
-    await loginViaUi(page);
     await page.goto('/library');
 
     await expect(page.getByRole('heading', { level: 3, name: /Failed to load library/i })).toBeVisible();

@@ -1,10 +1,10 @@
 import { test, expect } from '@playwright/test';
-import { loginViaUi, MOCK_NOTES, MOCK_NOTE_ID_1 } from './helpers';
+import { authenticateTestUser, MOCK_NOTES, MOCK_NOTE_ID_1 } from './helpers';
 
 test.describe('Note Generation Flow', () => {
   test.beforeEach(async ({ page }) => {
     // Authenticate user before testing generation flow
-    await loginViaUi(page);
+    await authenticateTestUser(page);
     // Navigate back to the home page where the generation input resides
     await page.goto('/');
   });
