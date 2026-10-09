@@ -10,6 +10,7 @@ interface MetricsRegistryHolder {
   queueActiveJobsGauge: Gauge<string>;
   queueJobFailuresTotal: Counter<string>;
   queueJobRetriesTotal: Counter<string>;
+  rateLimitRejectionsTotal: Counter<string>;
 }
 
 declare global {
@@ -78,6 +79,13 @@ function initializeMetrics(): MetricsRegistryHolder {
     registers: [registry],
   });
 
+  const rateLimitRejectionsTotal = new Counter({
+    name: 'codenotes_rate_limit_rejections_total',
+    help: 'Total number of rate limit rejections',
+    labelNames: ['endpoint'] as const,
+    registers: [registry],
+  });
+
   return {
     registry,
     httpRequestsTotal,
@@ -88,6 +96,7 @@ function initializeMetrics(): MetricsRegistryHolder {
     queueActiveJobsGauge,
     queueJobFailuresTotal,
     queueJobRetriesTotal,
+    rateLimitRejectionsTotal,
   };
 }
 
@@ -107,6 +116,7 @@ export const queueJobDurationSeconds = holder.queueJobDurationSeconds;
 export const queueActiveJobsGauge = holder.queueActiveJobsGauge;
 export const queueJobFailuresTotal = holder.queueJobFailuresTotal;
 export const queueJobRetriesTotal = holder.queueJobRetriesTotal;
+export const rateLimitRejectionsTotal = holder.rateLimitRejectionsTotal;
 
 export type GenerateStage =
   | 'transcript_fetch'
@@ -146,4 +156,8 @@ export function recordQueueJobFailed(queueName: string, durationSeconds: number,
 
 export function recordQueueJobRetry(queueName = 'note-generation') {
   queueJobRetriesTotal.inc({ queue: queueName });
+}
+
+export function recordRateLimitRejection(endpoint = '/api/generate') {
+  rateLimitRejectionsTotal.inc({ endpoint });
 }

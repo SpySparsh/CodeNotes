@@ -4,10 +4,11 @@ import { extractVideoId, validateYouTubeUrl } from '@/lib/transcript';
 import { query } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
-import { recordHttpRequest } from '@/lib/metrics';
+import { recordHttpRequest, recordRateLimitRejection } from '@/lib/metrics';
 import { requireUser, UnauthorizedError } from '@/lib/auth';
 import { inngest, generateDeterministicEventId } from '@/inngest/client';
 import { generateUrlSchema } from '@/lib/validations/generate';
+import { checkRateLimit } from '@/lib/rate-limit';
 
 export const STALE_IDEMPOTENCY_THRESHOLD_MS = 120000;
 
@@ -61,6 +62,39 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: 'Invalid YouTube URL' },
         { status: 400, headers: { 'x-request-id': requestId } }
+      );
+    }
+
+    // Rate limiting: 5 generation requests per user per 60-second window
+    const rateLimit = await checkRateLimit({
+      key: `generate:${authenticatedUserId}`,
+      limit: 5,
+      windowSeconds: 60,
+    });
+
+    if (!rateLimit.allowed) {
+      const durationMs = performance.now() - startTime;
+      recordHttpRequest('POST', '/api/generate', 429, durationMs / 1000);
+      recordRateLimitRejection('/api/generate');
+      logger.warn('generate_request_rate_limited', {
+        requestId,
+        userId: authenticatedUserId,
+        method: 'POST',
+        path: '/api/generate',
+        status: 429,
+        durationMs,
+        resetSeconds: rateLimit.resetSeconds,
+      });
+
+      return NextResponse.json(
+        { error: 'Too many generation requests. Please try again later.' },
+        {
+          status: 429,
+          headers: {
+            'x-request-id': requestId,
+            'Retry-After': rateLimit.resetSeconds.toString(),
+          },
+        }
       );
     }
 

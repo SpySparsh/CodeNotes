@@ -16,6 +16,16 @@ vi.mock('@/lib/db', () => ({
   query: vi.fn(),
 }));
 
+vi.mock('@/lib/rate-limit', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({
+    allowed: true,
+    limit: 5,
+    remaining: 4,
+    resetSeconds: 60,
+    currentCount: 1,
+  }),
+}));
+
 vi.mock('@/lib/auth', () => ({
   requireUser: vi.fn(),
   UnauthorizedError: class UnauthorizedError extends Error {

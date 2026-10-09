@@ -243,7 +243,19 @@ async function migrate() {
       )
     `);
 
-    // Step 4 — indexes
+    // Step 4 — rate_limit_buckets table (Infrastructure Rate-Limiting)
+    console.log('[migrate] Ensuring table: rate_limit_buckets');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+        key             VARCHAR(255)             NOT NULL,
+        window_start    TIMESTAMP WITH TIME ZONE NOT NULL,
+        count           INTEGER                  NOT NULL DEFAULT 1,
+        expires_at      TIMESTAMP WITH TIME ZONE NOT NULL,
+        PRIMARY KEY (key, window_start)
+      )
+    `);
+
+    // Step 5 — indexes
     console.log('[migrate] Creating indexes');
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_notes_user_id_created_at
@@ -259,6 +271,9 @@ async function migrate() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_generation_idempotency_user_created
         ON generation_idempotency(user_id, created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_expires_at
+        ON rate_limit_buckets(expires_at);
     `);
 
     // Step 4 — Enable and Force RLS

@@ -9,6 +9,10 @@
     "lint": "eslint src",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test e2e/auth.spec.ts e2e/generate.spec.ts e2e/library.spec.ts",
+    "test:e2e:auth-smoke": "playwright test e2e/auth-smoke.spec.ts",
+    "test:e2e:all": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "inngest:dev": "npx inngest-cli@latest dev -u http://localhost:3000/api/inngest",
     "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/seed-from-json.js"
@@ -46,6 +50,7 @@
     "zustand": "^5.0.15"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",

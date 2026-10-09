@@ -3,6 +3,7 @@ import {
   registry,
   recordHttpRequest,
   recordGenerateStageDuration,
+  recordRateLimitRejection,
 } from '@/lib/metrics';
 import { GET as getMetrics } from '@/app/api/metrics/route';
 
@@ -35,6 +36,16 @@ describe('Prometheus Metrics Layer', () => {
     expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="title_fetch"} 1');
     expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="gemini_inference"} 1');
     expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="db_insert"} 1');
+  });
+
+  it('records codenotes_rate_limit_rejections_total with low-cardinality endpoint label', async () => {
+    recordRateLimitRejection('/api/generate');
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_rate_limit_rejections_total');
+    expect(metricsText).toContain('# TYPE codenotes_rate_limit_rejections_total counter');
+    expect(metricsText).toContain('codenotes_rate_limit_rejections_total{endpoint="/api/generate"} 1');
   });
 
   it('/api/metrics endpoint returns successfully with Prometheus content type', async () => {
