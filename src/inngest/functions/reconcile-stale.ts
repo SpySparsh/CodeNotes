@@ -1,6 +1,7 @@
 import { inngest, generateDeterministicEventId } from '../client';
 import { query } from '@/lib/db';
 import { logger } from '@/lib/logger';
+import { recordReconciliationRun, recordStaleJobsRecovered } from '@/lib/metrics';
 
 export interface ReconciliationResult {
   scanned: number;
@@ -35,6 +36,7 @@ export const reconcileStaleGenerationsFunction = inngest.createFunction(
         result.scanned = staleRecords.rows.length;
 
         if (result.scanned === 0) {
+          recordReconciliationRun('success');
           return result;
         }
 
@@ -61,6 +63,7 @@ export const reconcileStaleGenerationsFunction = inngest.createFunction(
             );
 
             result.reDispatched++;
+            recordStaleJobsRecovered(1);
             logger.info('inngest_reconciliation_event_redispatched', {
               eventId,
               userId: row.user_id,
@@ -76,8 +79,11 @@ export const reconcileStaleGenerationsFunction = inngest.createFunction(
             });
           }
         }
+
+        recordReconciliationRun(result.errors > 0 ? 'error' : 'success');
       } catch (scanErr: any) {
         result.errors++;
+        recordReconciliationRun('error');
         logger.error('inngest_reconciliation_scan_failed', {
           errorMessage: scanErr.message,
         });

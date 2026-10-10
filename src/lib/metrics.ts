@@ -1,15 +1,18 @@
-import { Registry, Counter, Histogram, Gauge } from 'prom-client';
+import { Registry, Counter, Histogram } from 'prom-client';
+
+export type GenerationJobStatus = 'started' | 'completed' | 'failed' | 'replayed';
+export type GenerationStage = 'claim' | 'transcript_fetch' | 'gemini_inference' | 'db_persist';
+export type ReconciliationStatus = 'success' | 'error';
 
 interface MetricsRegistryHolder {
   registry: Registry;
   httpRequestsTotal: Counter<string>;
   httpRequestDurationSeconds: Histogram<string>;
-  generateStageDurationSeconds: Histogram<string>;
-  queueJobsEnqueuedTotal: Counter<string>;
-  queueJobDurationSeconds: Histogram<string>;
-  queueActiveJobsGauge: Gauge<string>;
-  queueJobFailuresTotal: Counter<string>;
-  queueJobRetriesTotal: Counter<string>;
+  generationJobsTotal: Counter<string>;
+  generationStageDurationSeconds: Histogram<string>;
+  generationDurationSeconds: Histogram<string>;
+  reconciliationRunsTotal: Counter<string>;
+  staleJobsRecoveredTotal: Counter<string>;
   rateLimitRejectionsTotal: Counter<string>;
 }
 
@@ -35,47 +38,39 @@ function initializeMetrics(): MetricsRegistryHolder {
     registers: [registry],
   });
 
-  const generateStageDurationSeconds = new Histogram({
-    name: 'generate_stage_duration_seconds',
-    help: 'Duration of generate pipeline stages in seconds',
+  const generationJobsTotal = new Counter({
+    name: 'codenotes_generation_jobs_total',
+    help: 'Total number of generation jobs across lifecycle states',
+    labelNames: ['status'] as const,
+    registers: [registry],
+  });
+
+  const generationStageDurationSeconds = new Histogram({
+    name: 'codenotes_generation_stage_duration_seconds',
+    help: 'Duration of individual Inngest generation durable steps in seconds',
     labelNames: ['stage'] as const,
-    buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
+    buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90],
     registers: [registry],
   });
 
-  const queueJobsEnqueuedTotal = new Counter({
-    name: 'codenotes_queue_jobs_enqueued_total',
-    help: 'Total number of generation jobs enqueued in BullMQ',
-    labelNames: ['queue'] as const,
+  const generationDurationSeconds = new Histogram({
+    name: 'codenotes_generation_duration_seconds',
+    help: 'End-to-end execution duration for note generation jobs in seconds',
+    labelNames: ['status'] as const,
+    buckets: [1, 5, 10, 20, 30, 60, 90, 120, 180],
     registers: [registry],
   });
 
-  const queueJobDurationSeconds = new Histogram({
-    name: 'codenotes_queue_job_duration_seconds',
-    help: 'End-to-end execution time for BullMQ generation jobs in seconds',
-    labelNames: ['queue', 'status'] as const,
-    buckets: [1, 5, 10, 20, 30, 60, 90, 120],
+  const reconciliationRunsTotal = new Counter({
+    name: 'codenotes_reconciliation_runs_total',
+    help: 'Total number of stale generation reconciliation cron runs',
+    labelNames: ['status'] as const,
     registers: [registry],
   });
 
-  const queueActiveJobsGauge = new Gauge({
-    name: 'codenotes_queue_active_jobs',
-    help: 'Number of currently active jobs in BullMQ worker',
-    labelNames: ['queue'] as const,
-    registers: [registry],
-  });
-
-  const queueJobFailuresTotal = new Counter({
-    name: 'codenotes_queue_job_failures_total',
-    help: 'Total number of failed BullMQ generation jobs',
-    labelNames: ['queue', 'error_code'] as const,
-    registers: [registry],
-  });
-
-  const queueJobRetriesTotal = new Counter({
-    name: 'codenotes_queue_job_retries_total',
-    help: 'Total number of BullMQ job retries',
-    labelNames: ['queue'] as const,
+  const staleJobsRecoveredTotal = new Counter({
+    name: 'codenotes_stale_jobs_recovered_total',
+    help: 'Total number of stale generation jobs recovered and re-dispatched to Inngest',
     registers: [registry],
   });
 
@@ -90,12 +85,11 @@ function initializeMetrics(): MetricsRegistryHolder {
     registry,
     httpRequestsTotal,
     httpRequestDurationSeconds,
-    generateStageDurationSeconds,
-    queueJobsEnqueuedTotal,
-    queueJobDurationSeconds,
-    queueActiveJobsGauge,
-    queueJobFailuresTotal,
-    queueJobRetriesTotal,
+    generationJobsTotal,
+    generationStageDurationSeconds,
+    generationDurationSeconds,
+    reconciliationRunsTotal,
+    staleJobsRecoveredTotal,
     rateLimitRejectionsTotal,
   };
 }
@@ -110,19 +104,12 @@ if (process.env.NODE_ENV !== 'production') {
 export const registry = holder.registry;
 export const httpRequestsTotal = holder.httpRequestsTotal;
 export const httpRequestDurationSeconds = holder.httpRequestDurationSeconds;
-export const generateStageDurationSeconds = holder.generateStageDurationSeconds;
-export const queueJobsEnqueuedTotal = holder.queueJobsEnqueuedTotal;
-export const queueJobDurationSeconds = holder.queueJobDurationSeconds;
-export const queueActiveJobsGauge = holder.queueActiveJobsGauge;
-export const queueJobFailuresTotal = holder.queueJobFailuresTotal;
-export const queueJobRetriesTotal = holder.queueJobRetriesTotal;
+export const generationJobsTotal = holder.generationJobsTotal;
+export const generationStageDurationSeconds = holder.generationStageDurationSeconds;
+export const generationDurationSeconds = holder.generationDurationSeconds;
+export const reconciliationRunsTotal = holder.reconciliationRunsTotal;
+export const staleJobsRecoveredTotal = holder.staleJobsRecoveredTotal;
 export const rateLimitRejectionsTotal = holder.rateLimitRejectionsTotal;
-
-export type GenerateStage =
-  | 'transcript_fetch'
-  | 'title_fetch'
-  | 'gemini_inference'
-  | 'db_insert';
 
 export function recordHttpRequest(
   method: string,
@@ -134,28 +121,30 @@ export function recordHttpRequest(
   httpRequestDurationSeconds.observe({ method, route }, durationSeconds);
 }
 
-export function recordGenerateStageDuration(
-  stage: GenerateStage,
+export function recordGenerationJob(status: GenerationJobStatus) {
+  generationJobsTotal.inc({ status });
+}
+
+export function recordGenerationStageDuration(
+  stage: GenerationStage,
   durationSeconds: number
 ) {
-  generateStageDurationSeconds.observe({ stage }, durationSeconds);
+  generationStageDurationSeconds.observe({ stage }, durationSeconds);
 }
 
-export function recordQueueJobEnqueued(queueName = 'note-generation') {
-  queueJobsEnqueuedTotal.inc({ queue: queueName });
+export function recordGenerationDuration(
+  status: 'completed' | 'failed',
+  durationSeconds: number
+) {
+  generationDurationSeconds.observe({ status }, durationSeconds);
 }
 
-export function recordQueueJobCompleted(queueName: string, durationSeconds: number) {
-  queueJobDurationSeconds.observe({ queue: queueName, status: 'completed' }, durationSeconds);
+export function recordReconciliationRun(status: ReconciliationStatus) {
+  reconciliationRunsTotal.inc({ status });
 }
 
-export function recordQueueJobFailed(queueName: string, durationSeconds: number, errorCode = 'UNKNOWN') {
-  queueJobDurationSeconds.observe({ queue: queueName, status: 'failed' }, durationSeconds);
-  queueJobFailuresTotal.inc({ queue: queueName, error_code: errorCode });
-}
-
-export function recordQueueJobRetry(queueName = 'note-generation') {
-  queueJobRetriesTotal.inc({ queue: queueName });
+export function recordStaleJobsRecovered(count = 1) {
+  staleJobsRecoveredTotal.inc(count);
 }
 
 export function recordRateLimitRejection(endpoint = '/api/generate') {

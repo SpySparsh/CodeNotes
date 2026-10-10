@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { reconcileStaleGenerationsFunction } from '@/inngest/functions/reconcile-stale';
 import { inngest, generateDeterministicEventId } from '@/inngest/client';
 import * as db from '@/lib/db';
+import { registry } from '@/lib/metrics';
 
 vi.mock('@/lib/db', () => ({
   query: vi.fn(),
@@ -34,6 +35,7 @@ describe('Inngest Reconcile Stale Generations Cron Function', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    registry.resetMetrics();
   });
 
   it('is configured with a 5-minute cron schedule', () => {
@@ -42,7 +44,7 @@ describe('Inngest Reconcile Stale Generations Cron Function', () => {
     expect(fnTrigger?.cron).toBe('*/5 * * * *');
   });
 
-  it('scans stale pending DB records and re-dispatches missing Inngest events', async () => {
+  it('scans stale pending DB records and re-dispatches missing Inngest events with metrics', async () => {
     const staleRecords = [
       {
         user_id: mockUserId,
@@ -87,9 +89,13 @@ describe('Inngest Reconcile Stale Generations Cron Function', () => {
         videoUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
       },
     });
+
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total{status="success"} 1');
+    expect(metricsText).toContain('codenotes_stale_jobs_recovered_total 1');
   });
 
-  it('handles empty stale records list cleanly', async () => {
+  it('handles empty stale records list cleanly and records success without incrementing recovery counter', async () => {
     vi.mocked(db.query).mockResolvedValueOnce({
       rows: [],
       rowCount: 0,
@@ -103,5 +109,24 @@ describe('Inngest Reconcile Stale Generations Cron Function', () => {
     expect(result.reDispatched).toBe(0);
     expect(result.errors).toBe(0);
     expect(inngest.send).not.toHaveBeenCalled();
+
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total{status="success"} 1');
+    expect(metricsText).toContain('codenotes_stale_jobs_recovered_total 0');
+  });
+
+  it('records error metric when database scan query fails', async () => {
+    vi.mocked(db.query).mockRejectedValueOnce(new Error('DB Connection Failure'));
+
+    const { step } = createMockStep();
+    const fnHandler = (reconcileStaleGenerationsFunction as any).fn;
+    const result = await fnHandler({ step });
+
+    expect(result.scanned).toBe(0);
+    expect(result.errors).toBe(1);
+
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total{status="error"} 1');
+    expect(metricsText).toContain('codenotes_stale_jobs_recovered_total 0');
   });
 });

@@ -4,7 +4,7 @@ import { extractVideoId, validateYouTubeUrl } from '@/lib/transcript';
 import { query } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
-import { recordHttpRequest, recordRateLimitRejection } from '@/lib/metrics';
+import { recordHttpRequest, recordRateLimitRejection, recordGenerationJob } from '@/lib/metrics';
 import { requireUser, UnauthorizedError } from '@/lib/auth';
 import { inngest, generateDeterministicEventId } from '@/inngest/client';
 import { generateUrlSchema } from '@/lib/validations/generate';
@@ -140,6 +140,7 @@ export async function POST(request: Request) {
       if (row.status === 'completed' && row.note_id) {
         const durationMs = performance.now() - startTime;
         recordHttpRequest('POST', '/api/generate', 200, durationMs / 1000);
+        recordGenerationJob('replayed');
         logger.info('generation_idempotency_replayed', {
           requestId,
           userId: authenticatedUserId,
@@ -196,6 +197,7 @@ export async function POST(request: Request) {
 
           const durationMs = performance.now() - startTime;
           recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+          recordGenerationJob('started');
           logger.warn('generation_idempotency_stale_requeued', {
             requestId,
             userId: authenticatedUserId,
@@ -273,6 +275,7 @@ export async function POST(request: Request) {
 
         const durationMs = performance.now() - startTime;
         recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+        recordGenerationJob('started');
         return NextResponse.json(
           {
             success: true,
@@ -319,6 +322,7 @@ export async function POST(request: Request) {
 
     const durationMs = performance.now() - startTime;
     recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
+    recordGenerationJob('started');
 
     logger.info('generation_job_queued', {
       requestId,

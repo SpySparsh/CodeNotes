@@ -2,7 +2,11 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   registry,
   recordHttpRequest,
-  recordGenerateStageDuration,
+  recordGenerationJob,
+  recordGenerationStageDuration,
+  recordGenerationDuration,
+  recordReconciliationRun,
+  recordStaleJobsRecovered,
   recordRateLimitRejection,
 } from '@/lib/metrics';
 import { GET as getMetrics } from '@/app/api/metrics/route';
@@ -24,18 +28,65 @@ describe('Prometheus Metrics Layer', () => {
     expect(metricsText).toContain('http_request_duration_seconds_bucket{le="0.05",method="GET",route="/api/notes"} 1');
   });
 
-  it('records generate_stage_duration_seconds across all valid stages', async () => {
-    recordGenerateStageDuration('transcript_fetch', 0.25);
-    recordGenerateStageDuration('title_fetch', 0.1);
-    recordGenerateStageDuration('gemini_inference', 1.5);
-    recordGenerateStageDuration('db_insert', 0.03);
+  it('records codenotes_generation_jobs_total across all valid lifecycle statuses', async () => {
+    recordGenerationJob('started');
+    recordGenerationJob('completed');
+    recordGenerationJob('failed');
+    recordGenerationJob('replayed');
 
     const metricsText = await registry.metrics();
 
-    expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="transcript_fetch"} 1');
-    expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="title_fetch"} 1');
-    expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="gemini_inference"} 1');
-    expect(metricsText).toContain('generate_stage_duration_seconds_count{stage="db_insert"} 1');
+    expect(metricsText).toContain('# HELP codenotes_generation_jobs_total');
+    expect(metricsText).toContain('# TYPE codenotes_generation_jobs_total counter');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="started"} 1');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="completed"} 1');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="failed"} 1');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="replayed"} 1');
+  });
+
+  it('records codenotes_generation_stage_duration_seconds across all 4 stages', async () => {
+    recordGenerationStageDuration('claim', 0.05);
+    recordGenerationStageDuration('transcript_fetch', 0.25);
+    recordGenerationStageDuration('gemini_inference', 1.5);
+    recordGenerationStageDuration('db_persist', 0.03);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_generation_stage_duration_seconds');
+    expect(metricsText).toContain('# TYPE codenotes_generation_stage_duration_seconds histogram');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="claim"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="transcript_fetch"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="gemini_inference"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="db_persist"} 1');
+  });
+
+  it('records codenotes_generation_duration_seconds for completed and failed statuses', async () => {
+    recordGenerationDuration('completed', 12.4);
+    recordGenerationDuration('failed', 4.1);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_generation_duration_seconds');
+    expect(metricsText).toContain('# TYPE codenotes_generation_duration_seconds histogram');
+    expect(metricsText).toContain('codenotes_generation_duration_seconds_count{status="completed"} 1');
+    expect(metricsText).toContain('codenotes_generation_duration_seconds_count{status="failed"} 1');
+  });
+
+  it('records codenotes_reconciliation_runs_total and codenotes_stale_jobs_recovered_total', async () => {
+    recordReconciliationRun('success');
+    recordReconciliationRun('error');
+    recordStaleJobsRecovered(3);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_reconciliation_runs_total');
+    expect(metricsText).toContain('# TYPE codenotes_reconciliation_runs_total counter');
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total{status="success"} 1');
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total{status="error"} 1');
+
+    expect(metricsText).toContain('# HELP codenotes_stale_jobs_recovered_total');
+    expect(metricsText).toContain('# TYPE codenotes_stale_jobs_recovered_total counter');
+    expect(metricsText).toContain('codenotes_stale_jobs_recovered_total 3');
   });
 
   it('records codenotes_rate_limit_rejections_total with low-cardinality endpoint label', async () => {
@@ -50,6 +101,7 @@ describe('Prometheus Metrics Layer', () => {
 
   it('/api/metrics endpoint returns successfully with Prometheus content type', async () => {
     recordHttpRequest('GET', '/api/health', 200, 0.005);
+    recordGenerationJob('started');
 
     const response = await getMetrics();
 
@@ -61,23 +113,35 @@ describe('Prometheus Metrics Layer', () => {
     expect(body).toContain('# HELP http_requests_total');
     expect(body).toContain('# TYPE http_requests_total counter');
     expect(body).toContain('http_requests_total{method="GET",route="/api/health",status="200"} 1');
+    expect(body).toContain('codenotes_generation_jobs_total{status="started"} 1');
   });
 
-  it('contains ONLY approved metric names and does not leak default node metrics or unapproved metrics', async () => {
+  it('contains ONLY approved metric names and does not leak default node metrics or legacy bullmq metrics', async () => {
     recordHttpRequest('GET', '/api/notes', 200, 0.01);
-    recordGenerateStageDuration('db_insert', 0.02);
+    recordGenerationStageDuration('db_persist', 0.02);
+    recordGenerationJob('started');
 
     const metricsText = await registry.metrics();
 
     // Approved metric names
     expect(metricsText).toContain('http_requests_total');
     expect(metricsText).toContain('http_request_duration_seconds');
-    expect(metricsText).toContain('generate_stage_duration_seconds');
+    expect(metricsText).toContain('codenotes_generation_jobs_total');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds');
+    expect(metricsText).toContain('codenotes_generation_duration_seconds');
+    expect(metricsText).toContain('codenotes_reconciliation_runs_total');
+    expect(metricsText).toContain('codenotes_stale_jobs_recovered_total');
+    expect(metricsText).toContain('codenotes_rate_limit_rejections_total');
 
-    // Forbidden metrics
+    // Forbidden / Legacy metrics
     expect(metricsText).not.toContain('process_cpu_seconds_total');
     expect(metricsText).not.toContain('nodejs_eventloop_lag_seconds');
     expect(metricsText).not.toContain('db_queries_total');
+    expect(metricsText).not.toContain('codenotes_queue_waiting_jobs');
+    expect(metricsText).not.toContain('codenotes_queue_active_jobs');
+    expect(metricsText).not.toContain('codenotes_queue_completed_jobs_total');
+    expect(metricsText).not.toContain('codenotes_queue_failed_jobs_total');
+    expect(metricsText).not.toContain('generate_stage_duration_seconds');
   });
 
   it('does NOT expose high-cardinality identifiers, sensitive query contents, or raw dynamic URLs', async () => {

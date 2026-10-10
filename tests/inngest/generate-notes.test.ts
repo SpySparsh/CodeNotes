@@ -15,6 +15,7 @@ import {
 import * as transcript from '@/lib/transcript';
 import * as gemini from '@/lib/gemini';
 import * as db from '@/lib/db';
+import { registry } from '@/lib/metrics';
 
 vi.mock('@/lib/transcript', () => ({
   validateYouTubeUrl: vi.fn((url: string) => {
@@ -171,6 +172,7 @@ describe('Inngest generateNotesFunction', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    registry.resetMetrics();
   });
 
   it('has correct function configuration metadata', () => {
@@ -244,6 +246,190 @@ describe('Inngest generateNotesFunction', () => {
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
     expect(gemini.generateNotes).toHaveBeenCalledWith(mockTranscript, mockTitle);
     expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
+  });
+
+  it('instruments all 4 actual stage callbacks and records end-to-end completion metrics upon success', async () => {
+    const { step } = createMockStep();
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null, created_at: new Date(Date.now() - 5000).toISOString() }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript text',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Test Title');
+
+    vi.mocked(gemini.generateNotes).mockResolvedValueOnce({
+      overview: 'Overview',
+      keyConcepts: ['Concept'],
+      detailedNotes: 'Notes',
+      shorthands: ['Short'],
+    });
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null, created_at: new Date(Date.now() - 5000).toISOString() }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await fnHandler({ event: mockEvent, step });
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="claim"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="transcript_fetch"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="gemini_inference"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="db_persist"} 1');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="completed"} 1');
+    expect(metricsText).toContain('codenotes_generation_duration_seconds_count{status="completed"} 1');
+  });
+
+  it('records duration for the failing stage callback and skips downstream stages on error', async () => {
+    const { step } = createMockStep();
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    vi.mocked(transcript.acquireTranscript).mockRejectedValueOnce(
+      new (transcript as any).TranscriptError('TRANSCRIPT_UNAVAILABLE', 'Captions disabled', false)
+    );
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Title');
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="claim"} 1');
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="transcript_fetch"} 1');
+    expect(metricsText).not.toContain('stage="gemini_inference"');
+    expect(metricsText).not.toContain('stage="db_persist"');
+    expect(metricsText).not.toContain('codenotes_generation_jobs_total{status="completed"}');
+  });
+
+  it('does NOT observe stage durations for memoized/skipped steps during Inngest function replay', async () => {
+    // Simulate Inngest memoized replay: steps 1, 2, 3 return cached values without running the callback fn
+    const memoizedStep = {
+      run: vi.fn(async (stepId: string, fn: () => Promise<any>) => {
+        if (stepId === 'claim-generation-processing') {
+          return { claimed: true, noteId: null };
+        }
+        if (stepId === 'fetch-transcript-and-title') {
+          return {
+            resolvedVideoId: mockVideoId,
+            videoTitle: 'Memoized Title',
+            transcriptText: 'Memoized Transcript',
+            transcriptProvider: 'supadata',
+          };
+        }
+        if (stepId === 'generate-ai-notes') {
+          return {
+            aiNotes: {
+              overview: 'Memoized Overview',
+              keyConcepts: ['Memoized Concept'],
+              detailedNotes: 'Memoized Notes',
+              shorthands: ['Memoized Short'],
+            },
+            generationMethod: 'transcript',
+            transcriptProvider: 'supadata',
+          };
+        }
+        // Only step 4 executes the actual callback
+        return await fn();
+      }),
+    };
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null, created_at: new Date(Date.now() - 3000).toISOString() }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await fnHandler({ event: mockEvent, step: memoizedStep });
+
+    const metricsText = await registry.metrics();
+
+    // Memoized steps did NOT run their inner callback, so their stage timers were NOT invoked
+    expect(metricsText).not.toContain('stage="claim"');
+    expect(metricsText).not.toContain('stage="transcript_fetch"');
+    expect(metricsText).not.toContain('stage="gemini_inference"');
+
+    // Only persist-notes actually ran and recorded
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="db_persist"} 1');
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="completed"} 1');
+  });
+
+  it('records separate duration observations for genuinely repeated step attempts', async () => {
+    const { step } = createMockStep();
+
+    // Attempt 1: Step 1 succeeds, Step 2 fails with retryable error
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+    vi.mocked(transcript.acquireTranscript).mockRejectedValueOnce(
+      new (transcript as any).TranscriptError('TRANSCRIPT_PROVIDER_RATE_LIMITED', 'Rate limited', true)
+    );
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow();
+
+    // Attempt 2: Re-run with step 1 memoized and step 2 retried (callback executed)
+    const retryStep = {
+      run: vi.fn(async (stepId: string, fn: () => Promise<any>) => {
+        if (stepId === 'claim-generation-processing') {
+          return { claimed: true, noteId: null };
+        }
+        return await fn();
+      }),
+    };
+
+    vi.mocked(transcript.acquireTranscript).mockRejectedValueOnce(
+      new (transcript as any).TranscriptError('TRANSCRIPT_PROVIDER_RATE_LIMITED', 'Rate limited again', true)
+    );
+
+    await expect(fnHandler({ event: mockEvent, step: retryStep })).rejects.toThrow();
+
+    const metricsText = await registry.metrics();
+
+    // transcript_fetch was executed twice across the two attempts
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="transcript_fetch"} 2');
+    // claim was executed only on attempt 1 (memoized on attempt 2)
+    expect(metricsText).toContain('codenotes_generation_stage_duration_seconds_count{stage="claim"} 1');
+  });
+
+  it('records generation failure and duration metrics in onFailure handler', async () => {
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ created_at: new Date(Date.now() - 7000).toISOString() }],
+      rowCount: 1,
+    } as any);
+
+    const onFailureHandler = (generateNotesFunction as any).opts.onFailure;
+    expect(onFailureHandler).toBeDefined();
+
+    await onFailureHandler({
+      event: { data: { event: mockEvent } },
+      error: new Error('Invalid YouTube URL'),
+    });
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('codenotes_generation_jobs_total{status="failed"} 1');
+    expect(metricsText).toContain('codenotes_generation_duration_seconds_count{status="failed"} 1');
   });
 
   it('supports shared cached transcript reuse across different users while isolating user notes under RLS', async () => {

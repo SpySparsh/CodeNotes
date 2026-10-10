@@ -11,7 +11,11 @@ import {
 import { generateNotes, GeneratedNotes } from '@/lib/gemini';
 import { query, withUserTransaction } from '@/lib/db';
 import { logger } from '@/lib/logger';
-import { recordQueueJobCompleted, recordQueueJobFailed } from '@/lib/metrics';
+import {
+  recordGenerationJob,
+  recordGenerationStageDuration,
+  recordGenerationDuration,
+} from '@/lib/metrics';
 
 export function classifyError(error: any): { isUnrecoverable: boolean; code: string; message: string } {
   if (error instanceof NonRetriableError) {
@@ -142,18 +146,24 @@ export const generateNotesFunction = inngest.createFunction(
         errorMessage: classification.message,
       });
 
+      let createdAtDate: Date | null = null;
+
       if (userId && idempotencyKey) {
         try {
-          await query(
+          const updateRes = await query(
             `UPDATE generation_idempotency
              SET status = 'failed',
                  error_message = $3,
                  error_code = $4,
                  lease_until = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE user_id = $1 AND key = $2`,
+             WHERE user_id = $1 AND key = $2
+             RETURNING created_at`,
             [userId, idempotencyKey, classification.message, classification.code]
           );
+          if (updateRes.rows.length > 0 && updateRes.rows[0].created_at) {
+            createdAtDate = new Date(updateRes.rows[0].created_at);
+          }
         } catch (dbErr: any) {
           logger.error('inngest_failed_to_update_failure_state', {
             userId,
@@ -163,11 +173,14 @@ export const generateNotesFunction = inngest.createFunction(
         }
       }
 
-      recordQueueJobFailed('note-generation', 0, classification.code);
+      recordGenerationJob('failed');
+      if (createdAtDate) {
+        const durationSeconds = Math.max(0, (Date.now() - createdAtDate.getTime()) / 1000);
+        recordGenerationDuration('failed', durationSeconds);
+      }
     },
   },
   async ({ event, step }) => {
-    const startTime = performance.now();
     const { userId, idempotencyKey, videoId, videoUrl } = event.data as any;
 
     logger.info('inngest_generation_function_started', {
@@ -186,67 +199,72 @@ export const generateNotesFunction = inngest.createFunction(
       videoId?: string;
       videoUrl?: string;
     }> => {
-      const existing = await query(
-        `SELECT status, video_id, note_id, lease_until FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
-        [userId, idempotencyKey]
-      );
+      const stageStart = performance.now();
+      try {
+        const existing = await query(
+          `SELECT status, video_id, note_id, lease_until FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
+          [userId, idempotencyKey]
+        );
 
-      if (existing.rows.length === 0) {
-        logger.warn('inngest_missing_idempotency_record', { userId, idempotencyKey, videoId });
-        throw new NonRetriableError('Idempotency record not found in database');
+        if (existing.rows.length === 0) {
+          logger.warn('inngest_missing_idempotency_record', { userId, idempotencyKey, videoId });
+          throw new NonRetriableError('Idempotency record not found in database');
+        }
+
+        const record = existing.rows[0];
+
+        // Payload mismatch validation
+        if (record.video_id && videoId && record.video_id !== videoId) {
+          logger.error('inngest_payload_mismatch', {
+            userId,
+            idempotencyKey,
+            existingVideoId: record.video_id,
+            requestedVideoId: videoId,
+          });
+          throw new NonRetriableError('Idempotency key payload mismatch: video ID mismatch');
+        }
+
+        // If already completed, skip duplicate work
+        if (record.status === 'completed' && record.note_id) {
+          logger.info('inngest_job_already_completed', {
+            userId,
+            idempotencyKey,
+            noteId: record.note_id,
+          });
+          return { claimed: false, skipped: true, noteId: record.note_id };
+        }
+
+        // Check lease: if already processing with active future lease, skip
+        if (
+          record.status === 'processing' &&
+          record.lease_until &&
+          new Date(record.lease_until).getTime() > Date.now()
+        ) {
+          logger.info('inngest_active_lease_held', {
+            userId,
+            idempotencyKey,
+            leaseUntil: record.lease_until,
+          });
+          return { claimed: false, skipped: true, reason: 'Active lease held by another execution' };
+        }
+
+        // Claim lease for 15 minutes
+        await query(
+          `UPDATE generation_idempotency
+           SET status = 'processing',
+               video_id = COALESCE(video_id, $3),
+               video_url = COALESCE(video_url, $4),
+               attempts = COALESCE(attempts, 0) + 1,
+               lease_until = NOW() + INTERVAL '15 minutes',
+               updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = $1 AND key = $2`,
+          [userId, idempotencyKey, videoId, videoUrl]
+        );
+
+        return { claimed: true, skipped: false, videoId, videoUrl };
+      } finally {
+        recordGenerationStageDuration('claim', (performance.now() - stageStart) / 1000);
       }
-
-      const record = existing.rows[0];
-
-      // Payload mismatch validation
-      if (record.video_id && videoId && record.video_id !== videoId) {
-        logger.error('inngest_payload_mismatch', {
-          userId,
-          idempotencyKey,
-          existingVideoId: record.video_id,
-          requestedVideoId: videoId,
-        });
-        throw new NonRetriableError('Idempotency key payload mismatch: video ID mismatch');
-      }
-
-      // If already completed, skip duplicate work
-      if (record.status === 'completed' && record.note_id) {
-        logger.info('inngest_job_already_completed', {
-          userId,
-          idempotencyKey,
-          noteId: record.note_id,
-        });
-        return { claimed: false, skipped: true, noteId: record.note_id };
-      }
-
-      // Check lease: if already processing with active future lease, skip
-      if (
-        record.status === 'processing' &&
-        record.lease_until &&
-        new Date(record.lease_until).getTime() > Date.now()
-      ) {
-        logger.info('inngest_active_lease_held', {
-          userId,
-          idempotencyKey,
-          leaseUntil: record.lease_until,
-        });
-        return { claimed: false, skipped: true, reason: 'Active lease held by another execution' };
-      }
-
-      // Claim lease for 15 minutes
-      await query(
-        `UPDATE generation_idempotency
-         SET status = 'processing',
-             video_id = COALESCE(video_id, $3),
-             video_url = COALESCE(video_url, $4),
-             attempts = COALESCE(attempts, 0) + 1,
-             lease_until = NOW() + INTERVAL '15 minutes',
-             updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = $1 AND key = $2`,
-        [userId, idempotencyKey, videoId, videoUrl]
-      );
-
-      return { claimed: true, skipped: false, videoId, videoUrl };
     });
 
     if (claimResult.skipped) {
@@ -260,135 +278,159 @@ export const generateNotesFunction = inngest.createFunction(
       transcriptText: string;
       transcriptProvider: string;
     }> => {
+      const stageStart = performance.now();
       try {
-        validateYouTubeUrl(videoUrl);
-      } catch (err: any) {
-        throw new NonRetriableError(err.message || 'Invalid YouTube URL');
-      }
-
-      const resolvedVideoId = videoId || extractVideoId(videoUrl);
-      if (!resolvedVideoId) {
-        throw new NonRetriableError('Invalid YouTube URL: could not extract video ID');
-      }
-
-      let transcriptResult: { text: string; videoId: string; provider: string };
-      let videoTitle = 'Unknown Video';
-
-      try {
-        const [transRes, titleRes] = await Promise.all([
-          acquireTranscript(videoUrl),
-          extractVideoTitle(videoUrl).catch(() => 'Unknown Video'),
-        ]);
-        transcriptResult = transRes;
-        videoTitle = titleRes;
-      } catch (err: any) {
-        const classification = classifyError(err);
-        if (classification.isUnrecoverable) {
-          throw new NonRetriableError(classification.message);
+        try {
+          validateYouTubeUrl(videoUrl);
+        } catch (err: any) {
+          throw new NonRetriableError(err.message || 'Invalid YouTube URL');
         }
-        throw err;
-      }
 
-      if (!transcriptResult || !transcriptResult.text || transcriptResult.text.trim().length === 0) {
-        throw new NonRetriableError('Captions are disabled or unavailable for this video.');
-      }
+        const resolvedVideoId = videoId || extractVideoId(videoUrl);
+        if (!resolvedVideoId) {
+          throw new NonRetriableError('Invalid YouTube URL: could not extract video ID');
+        }
 
-      return {
-        resolvedVideoId: transcriptResult.videoId || resolvedVideoId,
-        videoTitle,
-        transcriptText: transcriptResult.text,
-        transcriptProvider: transcriptResult.provider,
-      };
+        let transcriptResult: { text: string; videoId: string; provider: string };
+        let videoTitle = 'Unknown Video';
+
+        try {
+          const [transRes, titleRes] = await Promise.all([
+            acquireTranscript(videoUrl),
+            extractVideoTitle(videoUrl).catch(() => 'Unknown Video'),
+          ]);
+          transcriptResult = transRes;
+          videoTitle = titleRes;
+        } catch (err: any) {
+          const classification = classifyError(err);
+          if (classification.isUnrecoverable) {
+            throw new NonRetriableError(classification.message);
+          }
+          throw err;
+        }
+
+        if (!transcriptResult || !transcriptResult.text || transcriptResult.text.trim().length === 0) {
+          throw new NonRetriableError('Captions are disabled or unavailable for this video.');
+        }
+
+        return {
+          resolvedVideoId: transcriptResult.videoId || resolvedVideoId,
+          videoTitle,
+          transcriptText: transcriptResult.text,
+          transcriptProvider: transcriptResult.provider,
+        };
+      } finally {
+        recordGenerationStageDuration('transcript_fetch', (performance.now() - stageStart) / 1000);
+      }
     });
 
     // Step 3: AI Generation with Gemini (Outside DB transaction)
     const generatedNotes = await step.run('generate-ai-notes', async () => {
-      let aiNotes: GeneratedNotes;
-
+      const stageStart = performance.now();
       try {
-        if (!mediaData.transcriptText) {
-          throw new NonRetriableError('Transcript text is required for AI note generation.');
-        }
-        aiNotes = await generateNotes(mediaData.transcriptText, mediaData.videoTitle);
-      } catch (err: any) {
-        const classification = classifyError(err);
-        if (classification.isUnrecoverable) {
-          throw new NonRetriableError(classification.message);
-        }
-        throw err;
-      }
+        let aiNotes: GeneratedNotes;
 
-      if (!aiNotes || !aiNotes.overview) {
-        throw new NonRetriableError('AI returned malformed data.');
-      }
+        try {
+          if (!mediaData.transcriptText) {
+            throw new NonRetriableError('Transcript text is required for AI note generation.');
+          }
+          aiNotes = await generateNotes(mediaData.transcriptText, mediaData.videoTitle);
+        } catch (err: any) {
+          const classification = classifyError(err);
+          if (classification.isUnrecoverable) {
+            throw new NonRetriableError(classification.message);
+          }
+          throw err;
+        }
 
-      return {
-        aiNotes,
-        generationMethod: 'transcript' as const,
-        transcriptProvider: mediaData.transcriptProvider,
-      };
+        if (!aiNotes || !aiNotes.overview) {
+          throw new NonRetriableError('AI returned malformed data.');
+        }
+
+        return {
+          aiNotes,
+          generationMethod: 'transcript' as const,
+          transcriptProvider: mediaData.transcriptProvider,
+        };
+      } finally {
+        recordGenerationStageDuration('gemini_inference', (performance.now() - stageStart) / 1000);
+      }
     });
 
     // Step 4: Atomic Persistence in Database with User Transaction & RLS
     const persistResult = await step.run('persist-notes', async () => {
-      const noteId = crypto.randomUUID();
-      const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
+      const stageStart = performance.now();
+      try {
+        const noteId = crypto.randomUUID();
+        const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
 
-      await withUserTransaction(userId, async (client) => {
-        // Re-check status inside transaction with row lock to avoid race conditions
-        const checkRes = await client.query(
-          `SELECT status, note_id FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
-          [userId, idempotencyKey]
-        );
+        let createdAtEpochMs: number | null = null;
 
-        if (checkRes.rows.length > 0 && checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
-          return;
-        }
+        await withUserTransaction(userId, async (client) => {
+          // Re-check status inside transaction with row lock to avoid race conditions
+          const checkRes = await client.query(
+            `SELECT status, note_id, created_at FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
+            [userId, idempotencyKey]
+          );
 
-        await client.query(
-          `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-          [
-            noteId,
-            userId,
-            mediaData.resolvedVideoId,
-            mediaData.videoTitle,
-            videoUrl,
-            thumbnailUrl,
-            generatedNotes.aiNotes.overview,
-            generatedNotes.aiNotes.keyConcepts,
-            generatedNotes.aiNotes.detailedNotes,
-            generatedNotes.aiNotes.shorthands,
-          ]
-        );
+          if (checkRes.rows.length > 0) {
+            createdAtEpochMs = checkRes.rows[0].created_at ? new Date(checkRes.rows[0].created_at).getTime() : null;
+            if (checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
+              return;
+            }
+          }
 
-        await client.query(
-          `UPDATE generation_idempotency
-           SET status = 'completed',
-               note_id = $3,
-               error_message = NULL,
-               error_code = NULL,
-               lease_until = NULL,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE user_id = $1 AND key = $2`,
-          [userId, idempotencyKey, noteId]
-        );
-      });
+          await client.query(
+            `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [
+              noteId,
+              userId,
+              mediaData.resolvedVideoId,
+              mediaData.videoTitle,
+              videoUrl,
+              thumbnailUrl,
+              generatedNotes.aiNotes.overview,
+              generatedNotes.aiNotes.keyConcepts,
+              generatedNotes.aiNotes.detailedNotes,
+              generatedNotes.aiNotes.shorthands,
+            ]
+          );
 
-      const durationSeconds = (performance.now() - startTime) / 1000;
-      recordQueueJobCompleted('note-generation', durationSeconds);
+          await client.query(
+            `UPDATE generation_idempotency
+             SET status = 'completed',
+                 note_id = $3,
+                 error_message = NULL,
+                 error_code = NULL,
+                 lease_until = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = $1 AND key = $2`,
+            [userId, idempotencyKey, noteId]
+          );
+        });
 
-      logger.info('inngest_generation_completed_successfully', {
-        userId,
-        videoId: mediaData.resolvedVideoId,
-        idempotencyKey,
-        noteId,
-        generationMethod: generatedNotes.generationMethod,
-        transcriptProvider: generatedNotes.transcriptProvider,
-        durationSeconds,
-      });
+        recordGenerationJob('completed');
 
-      return { success: true, noteId };
+        const durationSeconds = typeof createdAtEpochMs === 'number'
+          ? Math.max(0, (Date.now() - (createdAtEpochMs as number)) / 1000)
+          : (performance.now() - stageStart) / 1000;
+        recordGenerationDuration('completed', durationSeconds);
+
+        logger.info('inngest_generation_completed_successfully', {
+          userId,
+          videoId: mediaData.resolvedVideoId,
+          idempotencyKey,
+          noteId,
+          generationMethod: generatedNotes.generationMethod,
+          transcriptProvider: generatedNotes.transcriptProvider,
+          durationSeconds,
+        });
+
+        return { success: true, noteId };
+      } finally {
+        recordGenerationStageDuration('db_persist', (performance.now() - stageStart) / 1000);
+      }
     });
 
     return persistResult;
