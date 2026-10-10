@@ -8,6 +8,10 @@ import {
   recordReconciliationRun,
   recordStaleJobsRecovered,
   recordRateLimitRejection,
+  recordTranscriptRequest,
+  recordTranscriptDuration,
+  recordAiRequest,
+  recordAiDuration,
 } from '@/lib/metrics';
 import { GET as getMetrics } from '@/app/api/metrics/route';
 
@@ -99,9 +103,57 @@ describe('Prometheus Metrics Layer', () => {
     expect(metricsText).toContain('codenotes_rate_limit_rejections_total{endpoint="/api/generate"} 1');
   });
 
+  it('records codenotes_transcript_requests_total and codenotes_transcript_duration_seconds', async () => {
+    recordTranscriptRequest('cache_hit', 'success');
+    recordTranscriptRequest('supadata', 'success');
+    recordTranscriptRequest('supadata', 'error');
+    recordTranscriptRequest('youtube_transcript_fallback', 'success');
+    recordTranscriptRequest('youtube_transcript_fallback', 'error');
+
+    recordTranscriptDuration('supadata', 0.85);
+    recordTranscriptDuration('youtube_transcript', 1.25);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_transcript_requests_total');
+    expect(metricsText).toContain('# TYPE codenotes_transcript_requests_total counter');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="cache_hit",status="success"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="supadata",status="success"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="supadata",status="error"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="youtube_transcript_fallback",status="success"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="youtube_transcript_fallback",status="error"} 1');
+
+    expect(metricsText).toContain('# HELP codenotes_transcript_duration_seconds');
+    expect(metricsText).toContain('# TYPE codenotes_transcript_duration_seconds histogram');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="supadata"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="youtube_transcript"} 1');
+  });
+
+  it('records codenotes_ai_requests_total and codenotes_ai_duration_seconds', async () => {
+    recordAiRequest('gemini-2.5-flash', 'success');
+    recordAiRequest('gemini-2.5-flash', 'error');
+    recordAiRequest('gemini-2.5-flash', 'malformed_output');
+
+    recordAiDuration('gemini-2.5-flash', 4.5);
+
+    const metricsText = await registry.metrics();
+
+    expect(metricsText).toContain('# HELP codenotes_ai_requests_total');
+    expect(metricsText).toContain('# TYPE codenotes_ai_requests_total counter');
+    expect(metricsText).toContain('codenotes_ai_requests_total{model="gemini-2.5-flash",status="success"} 1');
+    expect(metricsText).toContain('codenotes_ai_requests_total{model="gemini-2.5-flash",status="error"} 1');
+    expect(metricsText).toContain('codenotes_ai_requests_total{model="gemini-2.5-flash",status="malformed_output"} 1');
+
+    expect(metricsText).toContain('# HELP codenotes_ai_duration_seconds');
+    expect(metricsText).toContain('# TYPE codenotes_ai_duration_seconds histogram');
+    expect(metricsText).toContain('codenotes_ai_duration_seconds_count{model="gemini-2.5-flash"} 1');
+  });
+
   it('/api/metrics endpoint returns successfully with Prometheus content type', async () => {
     recordHttpRequest('GET', '/api/health', 200, 0.005);
     recordGenerationJob('started');
+    recordTranscriptRequest('cache_hit', 'success');
+    recordAiRequest('gemini-2.5-flash', 'success');
 
     const response = await getMetrics();
 
@@ -114,12 +166,16 @@ describe('Prometheus Metrics Layer', () => {
     expect(body).toContain('# TYPE http_requests_total counter');
     expect(body).toContain('http_requests_total{method="GET",route="/api/health",status="200"} 1');
     expect(body).toContain('codenotes_generation_jobs_total{status="started"} 1');
+    expect(body).toContain('codenotes_transcript_requests_total{source="cache_hit",status="success"} 1');
+    expect(body).toContain('codenotes_ai_requests_total{model="gemini-2.5-flash",status="success"} 1');
   });
 
   it('contains ONLY approved metric names and does not leak default node metrics or legacy bullmq metrics', async () => {
     recordHttpRequest('GET', '/api/notes', 200, 0.01);
     recordGenerationStageDuration('db_persist', 0.02);
     recordGenerationJob('started');
+    recordTranscriptRequest('supadata', 'success');
+    recordAiRequest('gemini-2.5-flash', 'success');
 
     const metricsText = await registry.metrics();
 
@@ -132,6 +188,10 @@ describe('Prometheus Metrics Layer', () => {
     expect(metricsText).toContain('codenotes_reconciliation_runs_total');
     expect(metricsText).toContain('codenotes_stale_jobs_recovered_total');
     expect(metricsText).toContain('codenotes_rate_limit_rejections_total');
+    expect(metricsText).toContain('codenotes_transcript_requests_total');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds');
+    expect(metricsText).toContain('codenotes_ai_requests_total');
+    expect(metricsText).toContain('codenotes_ai_duration_seconds');
 
     // Forbidden / Legacy metrics
     expect(metricsText).not.toContain('process_cpu_seconds_total');

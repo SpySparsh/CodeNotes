@@ -3,6 +3,9 @@ import { Registry, Counter, Histogram } from 'prom-client';
 export type GenerationJobStatus = 'started' | 'completed' | 'failed' | 'replayed';
 export type GenerationStage = 'claim' | 'transcript_fetch' | 'gemini_inference' | 'db_persist';
 export type ReconciliationStatus = 'success' | 'error';
+export type TranscriptSource = 'cache_hit' | 'supadata' | 'youtube_transcript_fallback';
+export type TranscriptProviderMetric = 'supadata' | 'youtube_transcript';
+export type AiRequestStatus = 'success' | 'error' | 'malformed_output';
 
 interface MetricsRegistryHolder {
   registry: Registry;
@@ -14,6 +17,10 @@ interface MetricsRegistryHolder {
   reconciliationRunsTotal: Counter<string>;
   staleJobsRecoveredTotal: Counter<string>;
   rateLimitRejectionsTotal: Counter<string>;
+  transcriptRequestsTotal: Counter<string>;
+  transcriptDurationSeconds: Histogram<string>;
+  aiRequestsTotal: Counter<string>;
+  aiDurationSeconds: Histogram<string>;
 }
 
 declare global {
@@ -81,6 +88,36 @@ function initializeMetrics(): MetricsRegistryHolder {
     registers: [registry],
   });
 
+  const transcriptRequestsTotal = new Counter({
+    name: 'codenotes_transcript_requests_total',
+    help: 'Total number of transcript acquisition attempts by source and status',
+    labelNames: ['source', 'status'] as const,
+    registers: [registry],
+  });
+
+  const transcriptDurationSeconds = new Histogram({
+    name: 'codenotes_transcript_duration_seconds',
+    help: 'Duration of external transcript provider calls in seconds',
+    labelNames: ['provider'] as const,
+    buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20],
+    registers: [registry],
+  });
+
+  const aiRequestsTotal = new Counter({
+    name: 'codenotes_ai_requests_total',
+    help: 'Total number of AI inference requests by model and outcome',
+    labelNames: ['model', 'status'] as const,
+    registers: [registry],
+  });
+
+  const aiDurationSeconds = new Histogram({
+    name: 'codenotes_ai_duration_seconds',
+    help: 'Duration of AI inference calls in seconds',
+    labelNames: ['model'] as const,
+    buckets: [0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 75, 90],
+    registers: [registry],
+  });
+
   return {
     registry,
     httpRequestsTotal,
@@ -91,6 +128,10 @@ function initializeMetrics(): MetricsRegistryHolder {
     reconciliationRunsTotal,
     staleJobsRecoveredTotal,
     rateLimitRejectionsTotal,
+    transcriptRequestsTotal,
+    transcriptDurationSeconds,
+    aiRequestsTotal,
+    aiDurationSeconds,
   };
 }
 
@@ -110,6 +151,10 @@ export const generationDurationSeconds = holder.generationDurationSeconds;
 export const reconciliationRunsTotal = holder.reconciliationRunsTotal;
 export const staleJobsRecoveredTotal = holder.staleJobsRecoveredTotal;
 export const rateLimitRejectionsTotal = holder.rateLimitRejectionsTotal;
+export const transcriptRequestsTotal = holder.transcriptRequestsTotal;
+export const transcriptDurationSeconds = holder.transcriptDurationSeconds;
+export const aiRequestsTotal = holder.aiRequestsTotal;
+export const aiDurationSeconds = holder.aiDurationSeconds;
 
 export function recordHttpRequest(
   method: string,
@@ -149,4 +194,32 @@ export function recordStaleJobsRecovered(count = 1) {
 
 export function recordRateLimitRejection(endpoint = '/api/generate') {
   rateLimitRejectionsTotal.inc({ endpoint });
+}
+
+export function recordTranscriptRequest(
+  source: TranscriptSource,
+  status: 'success' | 'error'
+) {
+  transcriptRequestsTotal.inc({ source, status });
+}
+
+export function recordTranscriptDuration(
+  provider: TranscriptProviderMetric,
+  durationSeconds: number
+) {
+  transcriptDurationSeconds.observe({ provider }, durationSeconds);
+}
+
+export function recordAiRequest(
+  model: string,
+  status: AiRequestStatus
+) {
+  aiRequestsTotal.inc({ model, status });
+}
+
+export function recordAiDuration(
+  model: string,
+  durationSeconds: number
+) {
+  aiDurationSeconds.observe({ model }, durationSeconds);
 }

@@ -35,6 +35,7 @@ import {
 } from '@/lib/transcript';
 import { YoutubeTranscript } from 'youtube-transcript';
 import * as db from '@/lib/db';
+import { registry } from '@/lib/metrics';
 
 // ---------------------------------------------------------------------------
 // A. Canonicalization & URL Handling
@@ -259,6 +260,7 @@ describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    registry.resetMetrics();
     process.env = { ...originalEnv, SUPADATA_API_KEY: 'test-supadata-key' };
   });
 
@@ -290,6 +292,11 @@ describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
     // Verify neither external provider was called
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(YoutubeTranscript.fetchTranscript).not.toHaveBeenCalled();
+
+    // Verify metrics: cache_hit recorded, no provider duration recorded
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="cache_hit",status="success"} 1');
+    expect(metricsText).not.toContain('codenotes_transcript_duration_seconds_count');
   });
 
   it('2. CACHE MISS: calls Supadata, normalizes, writes to cache with ON CONFLICT, and returns transcript', async () => {
@@ -325,6 +332,12 @@ describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
     expect(insertCall).toBeDefined();
     expect(insertCall![0]).toContain('ON CONFLICT (video_id) DO NOTHING');
     expect(insertCall![1]).toEqual(['dQw4w9WgXcQ', 'Fresh Supadata transcript text', null, 'supadata']);
+
+    // Verify metrics: supadata success and duration
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="supadata",status="success"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="supadata"} 1');
+    expect(metricsText).not.toContain('provider="youtube_transcript"');
   });
 
   it('3. CACHE READ ERROR: fail-open bypasses cache error and continues with provider acquisition', async () => {
@@ -456,6 +469,13 @@ describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
       call[0].includes('INSERT INTO youtube_transcripts')
     );
     expect(insertCall![1]).toEqual(['dQw4w9WgXcQ', 'Fallback scraper text', null, 'youtube-transcript']);
+
+    // Verify metrics: both supadata/error and youtube_transcript_fallback/success are recorded
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="supadata",status="error"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="youtube_transcript_fallback",status="success"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="supadata"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="youtube_transcript"} 1');
   });
 
   it('8. TERMINAL FAILURE: cache miss -> both providers fail -> throws clean TRANSCRIPT_UNAVAILABLE', async () => {
@@ -483,6 +503,13 @@ describe('C. Shared PostgreSQL Transcript Cache & Provider Hierarchy', () => {
       code: 'TRANSCRIPT_UNAVAILABLE',
       isRetryable: false,
     });
+
+    // Verify metrics: both primary failure and fallback failure recorded
+    const metricsText = await registry.metrics();
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="supadata",status="error"} 1');
+    expect(metricsText).toContain('codenotes_transcript_requests_total{source="youtube_transcript_fallback",status="error"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="supadata"} 1');
+    expect(metricsText).toContain('codenotes_transcript_duration_seconds_count{provider="youtube_transcript"} 1');
   });
 
   it('raises non-retriable error and does NOT silently fall back when SUPADATA_API_KEY is missing on cache miss', async () => {

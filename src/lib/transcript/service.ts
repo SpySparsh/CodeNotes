@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
 import { query } from '@/lib/db';
+import { recordTranscriptRequest, recordTranscriptDuration } from '@/lib/metrics';
 import { TranscriptError, TranscriptResult } from './types';
 import { canonicalizeYouTubeUrl, extractVideoId, validateYouTubeUrl } from './canonicalize';
 import { fetchSupadataTranscript } from './supadata';
@@ -41,6 +42,7 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
 
     if (cacheRes.rows.length > 0) {
       const cachedRow = cacheRes.rows[0];
+      recordTranscriptRequest('cache_hit', 'success');
       logger.info('transcript_cache_hit', {
         videoId,
         provider: cachedRow.provider,
@@ -84,8 +86,10 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
   let acquiredResult: { text: string; videoId: string; provider: 'supadata' | 'youtube-transcript' } | null = null;
 
   // 3. Primary Provider: Supadata
+  const supadataStart = performance.now();
   try {
     const result = await fetchSupadataTranscript(canonicalUrl);
+    recordTranscriptRequest('supadata', 'success');
     logger.info('transcript_acquisition_success', {
       videoId,
       provider: 'supadata',
@@ -97,6 +101,7 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
       provider: 'supadata',
     };
   } catch (err: any) {
+    recordTranscriptRequest('supadata', 'error');
     primaryError = err;
     const errorCode = err instanceof TranscriptError ? err.code : 'TRANSCRIPT_PROVIDER_UNAVAILABLE';
 
@@ -116,12 +121,16 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
       primaryErrorCode: errorCode,
       errorMessage: err.message,
     });
+  } finally {
+    recordTranscriptDuration('supadata', (performance.now() - supadataStart) / 1000);
   }
 
   // 4. Fallback Attempt: youtube-transcript
   if (!acquiredResult) {
+    const fallbackStart = performance.now();
     try {
       const result = await fetchYouTubeTranscriptScraper(canonicalUrl);
+      recordTranscriptRequest('youtube_transcript_fallback', 'success');
       logger.info('transcript_acquisition_success', {
         videoId,
         provider: 'youtube-transcript',
@@ -133,6 +142,7 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
         provider: 'youtube-transcript',
       };
     } catch (secondaryErr: any) {
+      recordTranscriptRequest('youtube_transcript_fallback', 'error');
       const secondaryCode =
         secondaryErr instanceof TranscriptError ? secondaryErr.code : 'TRANSCRIPT_UNAVAILABLE';
 
@@ -154,6 +164,8 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
         'Captions are disabled or unavailable for this video.',
         false
       );
+    } finally {
+      recordTranscriptDuration('youtube_transcript', (performance.now() - fallbackStart) / 1000);
     }
   }
 

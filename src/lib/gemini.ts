@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import { logger } from '@/lib/logger';
+import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
 const genAI = new GoogleGenerativeAI(apiKey);
@@ -12,6 +13,7 @@ export interface GeneratedNotes {
 }
 
 export const GEMINI_TIMEOUT_MS = 75000;
+export const GEMINI_MODEL = 'gemini-2.5-flash';
 
 export async function generateNotes(transcript: string, videoTitle: string): Promise<GeneratedNotes> {
   if (!apiKey || apiKey === 'your_api_key_here') {
@@ -20,7 +22,7 @@ export async function generateNotes(transcript: string, videoTitle: string): Pro
 
   const model = genAI.getGenerativeModel(
     {
-      model: 'gemini-2.5-flash',
+      model: GEMINI_MODEL,
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -85,27 +87,16 @@ ${transcript}
 ==================
 `;
 
+  const startTime = performance.now();
+  let rawText = '';
+
   try {
     const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    
-    let cleanedText = responseText;
-    // Just in case the model ignores the mimeType and wraps in markdown anyway
-    if (cleanedText.startsWith('```json')) {
-       cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
-    }
-    
-    try {
-      const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
-      return parsedData;
-    } catch (parseError) {
-      logger.error('gemini_json_parse_failed', {
-        errorMessage: String(parseError),
-        rawOutputPreview: cleanedText.slice(0, 200),
-      });
-      throw new Error('AI returned malformed data.');
-    }
+    rawText = result.response.text();
   } catch (error: any) {
+    recordAiRequest(GEMINI_MODEL, 'error');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+
     const isTimeout =
       error.name === 'AbortError' ||
       error.name === 'TimeoutError' ||
@@ -117,8 +108,27 @@ ${transcript}
       throw new Error(`AI generation timed out after ${GEMINI_TIMEOUT_MS / 1000} seconds.`);
     }
 
-    // Route handler (generate/route.ts) already logs this error with errorMessage + errorStack.
     throw new Error(error.message || 'Failed to generate notes using AI.');
+  }
+
+  let cleanedText = rawText;
+  if (cleanedText.startsWith('```json')) {
+    cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
+  }
+
+  try {
+    const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
+    recordAiRequest(GEMINI_MODEL, 'success');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+    return parsedData;
+  } catch (parseError) {
+    recordAiRequest(GEMINI_MODEL, 'malformed_output');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+    logger.error('gemini_json_parse_failed', {
+      errorMessage: String(parseError),
+      rawOutputPreview: cleanedText.slice(0, 200),
+    });
+    throw new Error('AI returned malformed data.');
   }
 }
 
@@ -133,7 +143,7 @@ export async function generateNotesFromVideoUrl(videoUrl: string, videoTitle: st
 
   const model = genAI.getGenerativeModel(
     {
-      model: 'gemini-2.5-flash',
+      model: GEMINI_MODEL,
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -193,6 +203,9 @@ Return the result strictly as a JSON object matching this schema:
 }
 `;
 
+  const startTime = performance.now();
+  let rawText = '';
+
   try {
     const result = await model.generateContent([
       {
@@ -203,24 +216,11 @@ Return the result strictly as a JSON object matching this schema:
       },
       prompt
     ]);
-    const responseText = result.response.text();
-
-    let cleanedText = responseText;
-    if (cleanedText.startsWith('```json')) {
-       cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
-    }
-
-    try {
-      const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
-      return parsedData;
-    } catch (parseError) {
-      logger.error('gemini_json_parse_failed', {
-        errorMessage: String(parseError),
-        rawOutputPreview: cleanedText.slice(0, 200),
-      });
-      throw new Error('AI returned malformed data.');
-    }
+    rawText = result.response.text();
   } catch (error: any) {
+    recordAiRequest(GEMINI_MODEL, 'error');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+
     const isTimeout =
       error.name === 'AbortError' ||
       error.name === 'TimeoutError' ||
@@ -233,5 +233,25 @@ Return the result strictly as a JSON object matching this schema:
     }
 
     throw new Error(error.message || 'Failed to generate notes using AI.');
+  }
+
+  let cleanedText = rawText;
+  if (cleanedText.startsWith('```json')) {
+    cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
+  }
+
+  try {
+    const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
+    recordAiRequest(GEMINI_MODEL, 'success');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+    return parsedData;
+  } catch (parseError) {
+    recordAiRequest(GEMINI_MODEL, 'malformed_output');
+    recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
+    logger.error('gemini_json_parse_failed', {
+      errorMessage: String(parseError),
+      rawOutputPreview: cleanedText.slice(0, 200),
+    });
+    throw new Error('AI returned malformed data.');
   }
 }
