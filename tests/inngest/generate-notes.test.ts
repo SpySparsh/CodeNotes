@@ -588,7 +588,7 @@ describe('Inngest generateNotesFunction', () => {
     await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
   });
 
-  it('onFailure handler updates generation_idempotency status to failed in DB', async () => {
+  it('onFailure handler updates generation_idempotency status to failed in DB and captures error in Sentry', async () => {
     vi.mocked(db.query).mockResolvedValueOnce({
       rows: [],
       rowCount: 1,

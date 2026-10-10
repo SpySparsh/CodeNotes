@@ -16,6 +16,7 @@ import {
   recordGenerationStageDuration,
   recordGenerationDuration,
 } from '@/lib/metrics';
+import * as Sentry from '@sentry/nextjs';
 
 export function classifyError(error: any): { isUnrecoverable: boolean; code: string; message: string } {
   if (error instanceof NonRetriableError) {
@@ -145,6 +146,19 @@ export const generateNotesFunction = inngest.createFunction(
         errorCode: classification.code,
         errorMessage: classification.message,
       });
+
+      try {
+        Sentry.withScope((scope) => {
+          scope.setTag('inngest.function', 'generate-notes');
+          scope.setTag('error.code', classification.code);
+          scope.setTag('error.unrecoverable', String(classification.isUnrecoverable));
+          const sentryError = error instanceof Error ? error : new Error(classification.message);
+          Sentry.captureException(sentryError);
+        });
+        await Sentry.flush(1500).catch(() => {});
+      } catch {
+        // Failsafe: Sentry reporting failure never interrupts generation recovery
+      }
 
       let createdAtDate: Date | null = null;
 
