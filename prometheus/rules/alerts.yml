@@ -1,33 +1,74 @@
-# NOTE: These are LOCAL LEARNING alerting rules for development/testing,
-# NOT production Service Level Objectives (SLOs).
-# They are sized for low-volume, bursty local traffic patterns.
+# NOTE: Alerting rules for CodeNotes local observability and service monitoring.
+# All rate/histogram expressions include explicit minimum-volume guards sized for
+# low-traffic development and testing, preventing false alarms during idle periods.
+#
+# Operational Context:
+# - Prometheus scrapes host.docker.internal:3000/api/metrics every 15s.
+# - Active health probing of /api/health is deferred to external uptime monitors in
+#   cloud/production deployments (e.g., UptimeRobot, BetterStack, AWS Synthetics).
+# - Local application reachability is actively monitored via Prometheus built-in 'up'.
 
 groups:
   - name: codenotes_alerts
     rules:
-      - alert: HighHttpErrorRate
-        expr: >-
-          (sum(rate(http_requests_total{status=~"[45].."}[2m])) or vector(0))
-          /
-          (sum(rate(http_requests_total[2m])) > 0)
-          > 0.10
+      - alert: ServiceUnreachable
+        expr: up{job="codenotes"} == 0
         for: 1m
         labels:
-          severity: warning
+          severity: critical
         annotations:
-          summary: "HTTP error rate exceeded 10% (local learning threshold)"
-          description: "Over 10% of HTTP requests returned 4xx or 5xx status codes over the last 2 minutes."
+          summary: "CodeNotes local instance unreachable"
+          description: "Prometheus failed to scrape /api/metrics from host.docker.internal:3000 for 1 minute."
 
-      - alert: HighGenerateLatency
+      - alert: HighHttp5xxErrorRate
         expr: >-
-          (
-            sum(rate(http_request_duration_seconds_sum{route="/api/generate"}[5m]))
-            /
-            sum(rate(http_request_duration_seconds_count{route="/api/generate"}[5m]))
-          ) > 60
+          (sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0))
+          /
+          (sum(rate(http_requests_total[5m])) >= (5 / 300))
+          > 0.05
         for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 5xx error rate exceeded 5% (min 5 requests in 5m)"
+          description: "Over 5% of HTTP requests returned 5xx server error status codes in the last 5 minutes (minimum volume: 5 requests)."
+
+      - alert: HighGenerationFailureRate
+        expr: >-
+          (sum(rate(codenotes_generation_jobs_total{status="failed"}[10m])) or vector(0))
+          /
+          (sum(rate(codenotes_generation_jobs_total{status=~"completed|failed"}[10m])) >= (2 / 600))
+          > 0.10
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Average /api/generate latency exceeded 60 seconds (local learning threshold)"
-          description: "Average duration of /api/generate exceeded 60 seconds over the last 5 minutes."
+          summary: "Note generation job failure rate exceeded 10% (min 2 jobs in 10m)"
+          description: "Over 10% of completed/failed note generation jobs encountered terminal failures in the last 10 minutes (minimum volume: 2 jobs)."
+
+      - alert: HighGeminiLatency
+        expr: >-
+          (
+            histogram_quantile(0.90, sum by (le, model) (rate(codenotes_ai_duration_seconds_bucket[10m]))) > 45
+          ) and on (model) (
+            sum by (model) (rate(codenotes_ai_duration_seconds_count[10m])) >= (2 / 600)
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gemini AI inference p90 latency exceeded 45s (min 2 inferences in 10m)"
+          description: "90th percentile duration for Gemini model inference exceeded 45 seconds over the last 10 minutes (minimum volume: 2 inferences)."
+
+      - alert: TranscriptProviderPrimaryFailure
+        expr: >-
+          (sum(rate(codenotes_transcript_requests_total{source="supadata", status="error"}[10m])) or vector(0))
+          /
+          (sum(rate(codenotes_transcript_requests_total{source="supadata"}[10m])) >= (2 / 600))
+          > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Primary transcript provider (Supadata) error rate exceeded 20% (min 2 requests in 10m)"
+          description: "Supadata transcript requests experienced over 20% errors in the last 10 minutes, triggering elevated fallback traffic (minimum volume: 2 requests)."
