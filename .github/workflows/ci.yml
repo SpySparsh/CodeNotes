@@ -61,6 +61,14 @@ jobs:
           TEST_DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/codenotes_test
         run: npm run test:integration:rls
 
+      - name: Validate Prometheus configuration and alert rules
+        run: |
+          docker run --rm -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 promtool check config /etc/prometheus/prometheus.yml
+          docker run --rm -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 promtool check rules /etc/prometheus/rules/alerts.yml
+
+      - name: Validate Docker Compose monitoring configuration
+        run: docker compose -f docker-compose.prometheus.yml config --quiet
+
       - name: Run linter (ESLint)
         run: npm run lint
 

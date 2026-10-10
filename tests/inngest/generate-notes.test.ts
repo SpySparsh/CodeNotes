@@ -1,5 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NonRetriableError } from 'inngest';
+import * as Sentry from '@sentry/nextjs';
+
+vi.mock('@sentry/nextjs', () => ({
+  withScope: vi.fn((cb: (scope: any) => void) => {
+    const scope = {
+      setTag: vi.fn(),
+    };
+    return cb(scope);
+  }),
+  captureException: vi.fn(),
+  flush: vi.fn().mockResolvedValue(true),
+}));
 
 vi.mock('youtube-transcript', () => ({
   YoutubeTranscript: {
@@ -588,11 +600,21 @@ describe('Inngest generateNotesFunction', () => {
     await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
   });
 
-  it('onFailure handler updates generation_idempotency status to failed in DB and captures error in Sentry', async () => {
+  it('onFailure handler updates generation_idempotency status to failed in DB and captures error in Sentry with bounded tags', async () => {
     vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [],
+      rows: [{ created_at: new Date(Date.now() - 3000).toISOString() }],
       rowCount: 1,
     } as any);
+
+    const capturedTags: Record<string, string> = {};
+    vi.mocked(Sentry.withScope).mockImplementationOnce((fn: any) => {
+      const mockScope = {
+        setTag: (key: string, val: string) => {
+          capturedTags[key] = val;
+        },
+      };
+      return fn(mockScope);
+    });
 
     const onFailureHandler = (generateNotesFunction as any).opts.onFailure;
     expect(onFailureHandler).toBeDefined();
@@ -607,5 +629,39 @@ describe('Inngest generateNotesFunction', () => {
     );
     expect(updateCall).toBeDefined();
     expect(updateCall![1]).toContain('INVALID_URL');
+
+    // Assert Sentry exception was captured exactly once
+    expect(Sentry.withScope).toHaveBeenCalled();
+    expect(Sentry.captureException).toHaveBeenCalled();
+
+    // Verify bounded low-cardinality tags are present
+    expect(capturedTags['inngest.function']).toBe('generate-notes');
+    expect(capturedTags['error.code']).toBe('INVALID_URL');
+    expect(capturedTags['error.unrecoverable']).toBe('true');
+
+    // Verify high-cardinality values are NOT tagged
+    expect(capturedTags).not.toHaveProperty('videoId');
+    expect(capturedTags).not.toHaveProperty('idempotencyKey');
+    expect(capturedTags).not.toHaveProperty('userId');
+  });
+
+  it('prevents terminal error reporting to Sentry during successful execution or cache replaying', async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const { step } = createMockStep();
+    // Simulate already completed note
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'completed', note_id: 'existing-note-id', lease_until: null }],
+      rowCount: 1,
+    } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    const result = await fnHandler({ event: mockEvent, step });
+
+    expect(result.skipped).toBe(true);
+    expect(result.noteId).toBe('existing-note-id');
+
+    // Sentry error capture must NOT be invoked for successfully replayed jobs
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 });
