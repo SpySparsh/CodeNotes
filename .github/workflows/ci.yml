@@ -63,8 +63,8 @@ jobs:
 
       - name: Validate Prometheus configuration and alert rules
         run: |
-          docker run --rm -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 promtool check config /etc/prometheus/prometheus.yml
-          docker run --rm -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 promtool check rules /etc/prometheus/rules/alerts.yml
+          docker run --rm --entrypoint promtool -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool -v "${{ github.workspace }}/prometheus:/etc/prometheus" prom/prometheus:v2.54.1 check rules /etc/prometheus/rules/alerts.yml
 
       - name: Validate Docker Compose monitoring configuration
         run: docker compose -f docker-compose.prometheus.yml config --quiet
