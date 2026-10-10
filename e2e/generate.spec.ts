@@ -89,6 +89,49 @@ test.describe('Note Generation Flow', () => {
     expect(statusPollCount).toBeGreaterThanOrEqual(1);
   });
 
+  test('should handle duplicate submission by immediately replaying cached completed note', async ({ page }) => {
+    const targetUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    let postGenerateCount = 0;
+
+    // 1. Intercept POST /api/generate returning 200 OK cache hit
+    await page.route('**/api/generate', async (route) => {
+      if (route.request().method() === 'POST') {
+        postGenerateCount++;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            success: true,
+            status: 'completed',
+            noteId: MOCK_NOTE_ID_1,
+            cached: true,
+          }),
+        });
+      } else {
+        await route.continue();
+      }
+    });
+
+    // 2. Intercept GET /api/notes/:id
+    await page.route(`**/api/notes/${MOCK_NOTE_ID_1}`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ note: MOCK_NOTES[0] }),
+      });
+    });
+
+    // Fill URL input and submit duplicate video
+    const input = page.locator('input[placeholder="Paste a YouTube coding tutorial URL..."]');
+    await input.fill(targetUrl);
+    await page.getByRole('button', { name: /Generate/i }).click();
+
+    // Verify immediate redirect to note without polling
+    await expect(page).toHaveURL(new RegExp(`/notes/${MOCK_NOTE_ID_1}`), { timeout: 15000 });
+    await expect(page.getByRole('heading', { level: 1, name: /Mastering React 19 Server Components/i })).toBeVisible();
+    expect(postGenerateCount).toBe(1);
+  });
+
   test('should handle asynchronous generation failure gracefully', async ({ page }) => {
     const targetUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
     const mockIdempotencyKey = 'e2e-gen-key-failure-456';

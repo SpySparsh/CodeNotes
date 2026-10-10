@@ -16,9 +16,14 @@ const MOCK_USER = {
 };
 
 const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey, x-client-info');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    req.headers['access-control-request-headers'] || '*'
+  );
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Content-Type', 'application/json');
 
   if (req.method === 'OPTIONS') {
@@ -27,55 +32,90 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const url = new URL(req.url, `http://${HOST}:${PORT}`);
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
 
-  if (url.pathname === '/health') {
-    res.writeHead(200);
-    res.end(JSON.stringify({ status: 'ok' }));
-    return;
-  }
-
-  if (url.pathname.startsWith('/auth/v1/user')) {
-    const authHeader = req.headers['authorization'] || '';
-    if (authHeader.startsWith('Bearer ') && authHeader.length > 7) {
+    if (url.pathname === '/health') {
       res.writeHead(200);
-      res.end(JSON.stringify(MOCK_USER));
-    } else {
-      res.writeHead(401);
-      res.end(JSON.stringify({ message: 'Invalid or missing JWT', status: 401 }));
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
     }
-    return;
-  }
 
-  if (url.pathname.startsWith('/auth/v1/token')) {
-    res.writeHead(200);
-    res.end(
-      JSON.stringify({
-        access_token: 'mock-e2e-access-token',
-        token_type: 'bearer',
-        expires_in: 3600,
-        expires_at: 1893456000,
-        refresh_token: 'mock-e2e-refresh-token',
-        user: MOCK_USER,
-      })
-    );
-    return;
-  }
+    if (url.pathname.startsWith('/auth/v1/user')) {
+      const authHeader = req.headers['authorization'] || '';
+      if (authHeader.startsWith('Bearer ') && authHeader.length > 7) {
+        res.writeHead(200);
+        res.end(JSON.stringify(MOCK_USER));
+      } else {
+        res.writeHead(401);
+        res.end(JSON.stringify({ message: 'Invalid or missing JWT', status: 401 }));
+      }
+      return;
+    }
 
-  if (url.pathname.startsWith('/auth/v1/logout')) {
-    res.writeHead(200);
-    res.end(JSON.stringify({}));
-    return;
-  }
+    if (url.pathname.startsWith('/auth/v1/signup')) {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          access_token: 'mock-e2e-access-token',
+          token_type: 'bearer',
+          expires_in: 3600,
+          expires_at: 1893456000,
+          refresh_token: 'mock-e2e-refresh-token',
+          user: MOCK_USER,
+          session: {
+            access_token: 'mock-e2e-access-token',
+            token_type: 'bearer',
+            expires_in: 3600,
+            expires_at: 1893456000,
+            refresh_token: 'mock-e2e-refresh-token',
+            user: MOCK_USER,
+          },
+        })
+      );
+      return;
+    }
 
-  if (url.pathname.startsWith('/auth/v1/settings')) {
-    res.writeHead(200);
-    res.end(JSON.stringify({ external: { google: true } }));
-    return;
-  }
+    if (url.pathname.startsWith('/auth/v1/token')) {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          access_token: 'mock-e2e-access-token',
+          token_type: 'bearer',
+          expires_in: 3600,
+          expires_at: 1893456000,
+          refresh_token: 'mock-e2e-refresh-token',
+          user: MOCK_USER,
+          session: {
+            access_token: 'mock-e2e-access-token',
+            token_type: 'bearer',
+            expires_in: 3600,
+            expires_at: 1893456000,
+            refresh_token: 'mock-e2e-refresh-token',
+            user: MOCK_USER,
+          },
+        })
+      );
+      return;
+    }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
+    if (url.pathname.startsWith('/auth/v1/logout')) {
+      res.writeHead(200);
+      res.end(JSON.stringify({}));
+      return;
+    }
+
+    if (url.pathname.startsWith('/auth/v1/settings')) {
+      res.writeHead(200);
+      res.end(JSON.stringify({ external: { google: true } }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
 });
 
 server.listen(PORT, HOST, () => {

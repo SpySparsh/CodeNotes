@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { authenticateTestUser, MOCK_NOTES, MOCK_NOTE_ID_1 } from './helpers';
+import { authenticateTestUser, MOCK_NOTES, MOCK_NOTE_ID_1, MOCK_USER_B_ID, MOCK_USER_B_EMAIL } from './helpers';
 
 test.describe('Study Library & Note Management', () => {
   test.beforeEach(async ({ page }) => {
@@ -251,5 +251,46 @@ test.describe('Study Library & Note Management', () => {
     await page.getByRole('button', { name: /Try Again/i }).click();
 
     await expect(page.getByText('Mastering React 19 Server Components')).toBeVisible();
+  });
+
+  test('should enforce user isolation: User B is denied access when navigating to User A note', async ({ page }) => {
+    // Authenticate as User B
+    await authenticateTestUser(page, { userId: MOCK_USER_B_ID, email: MOCK_USER_B_EMAIL });
+
+    // Mock API returning 404 for User A's note
+    await page.route(`**/api/notes/${MOCK_NOTE_ID_1}`, async (route) => {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Note not found' }),
+      });
+    });
+
+    // Mock User B's library returning empty notes list
+    await page.route(/\/api\/notes(?!\/)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          notes: [],
+          nextCursor: null,
+          hasMore: false,
+        }),
+      });
+    });
+
+    // User B attempts to access User A's note directly
+    await page.goto(`/notes/${MOCK_NOTE_ID_1}`);
+
+    // Verify error state
+    await expect(page.getByRole('heading', { name: 'Error Loading Note' })).toBeVisible();
+    await expect(page.getByText('Note not found')).toBeVisible();
+
+    // Click Return to Library
+    await page.getByRole('link', { name: 'Return to Library' }).click();
+    await expect(page).toHaveURL(/\/library/);
+    await expect(page.getByRole('heading', { level: 3, name: /Your library is empty/i })).toBeVisible();
+    await expect(page.getByText('Mastering React 19 Server Components')).not.toBeVisible();
   });
 });

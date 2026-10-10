@@ -20,6 +20,21 @@ export const MOCK_USER = {
   updated_at: '2026-01-01T00:00:00.000Z',
 };
 
+export const MOCK_USER_B_ID = 'ba7d21ff-8535-4c92-ab4d-e8f37b17ac99';
+export const MOCK_USER_B_EMAIL = 'user-b@example.com';
+
+export const MOCK_USER_B = {
+  id: MOCK_USER_B_ID,
+  aud: 'authenticated',
+  role: 'authenticated',
+  email: MOCK_USER_B_EMAIL,
+  email_confirmed_at: '2026-01-01T00:00:00.000Z',
+  app_metadata: { provider: 'email', providers: ['email'] },
+  user_metadata: { name: 'User B' },
+  created_at: '2026-01-01T00:00:00.000Z',
+  updated_at: '2026-01-01T00:00:00.000Z',
+};
+
 /**
  * Determine the Supabase auth cookie storage key based on configured Supabase URL
  */
@@ -58,7 +73,7 @@ export function createMockSessionCookieValue(options: {
       email,
       email_confirmed_at: '2026-01-01T00:00:00.000Z',
       app_metadata: { provider: 'email', providers: ['email'] },
-      user_metadata: { name: 'E2E Test User' },
+      user_metadata: { name: options.userId === MOCK_USER_B_ID ? 'User B' : 'E2E Test User' },
       created_at: '2026-01-01T00:00:00.000Z',
       updated_at: '2026-01-01T00:00:00.000Z',
     },
@@ -73,6 +88,7 @@ export function createMockSessionCookieValue(options: {
 export async function authenticateTestUser(page: Page, options: { userId?: string; email?: string } = {}) {
   const cookieName = getSupabaseCookieName();
   const cookieValue = createMockSessionCookieValue(options);
+  const currentUser = options.userId === MOCK_USER_B_ID ? MOCK_USER_B : MOCK_USER;
 
   // Set auth cookie in browser context
   await page.context().addCookies([
@@ -103,9 +119,9 @@ export async function authenticateTestUser(page: Page, options: { userId?: strin
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify(MOCK_USER),
+        body: JSON.stringify(currentUser),
       });
-    } else if (url.includes('/auth/v1/token')) {
+    } else if (url.includes('/auth/v1/token') || url.includes('/auth/v1/signup')) {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -115,7 +131,15 @@ export async function authenticateTestUser(page: Page, options: { userId?: strin
           expires_in: 3600,
           expires_at: 1893456000,
           refresh_token: 'mock-e2e-refresh-token',
-          user: MOCK_USER,
+          user: currentUser,
+          session: {
+            access_token: 'mock-e2e-access-token',
+            token_type: 'bearer',
+            expires_in: 3600,
+            expires_at: 1893456000,
+            refresh_token: 'mock-e2e-refresh-token',
+            user: currentUser,
+          },
         }),
       });
     } else if (url.includes('/auth/v1/logout')) {

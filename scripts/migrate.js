@@ -18,36 +18,33 @@
 const { Pool } = require('pg');
 const path = require('path');
 
-// Load .env.local for local development.
-require('dotenv').config({ path: path.join(process.cwd(), '.env.local') });
+async function migrateDatabase(connectionString, customSsl) {
+  if (!connectionString) {
+    throw new Error('[migrate] ERROR: Database connection string is required.');
+  }
 
-if (!process.env.DATABASE_URL) {
-  console.error('[migrate] ERROR: DATABASE_URL is not set.');
-  process.exit(1);
-}
+  const ssl =
+    customSsl !== undefined
+      ? customSsl
+      : process.env.NODE_ENV === 'production'
+        ? {
+            ca: process.env.DATABASE_CA_CERT,
+            rejectUnauthorized: true,
+          }
+        : false;
 
-const ssl =
-  process.env.NODE_ENV === 'production'
-    ? {
-        ca: process.env.DATABASE_CA_CERT,
-        rejectUnauthorized: true,
-      }
-    : false;
+  const pool = new Pool({
+    connectionString,
+    ssl,
+    connectionTimeoutMillis: 10000,
+  });
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl,
-  connectionTimeoutMillis: 10000,
-});
-
-async function migrate() {
   let client;
-
   try {
     client = await pool.connect();
   } catch (err) {
-    console.error('[migrate] ERROR: Could not connect to database:', err.message);
-    process.exit(1);
+    await pool.end();
+    throw new Error(`[migrate] ERROR: Could not connect to database: ${err.message}`);
   }
 
   try {
@@ -365,11 +362,23 @@ async function migrate() {
       // Ignore rollback error
     }
     console.error('[migrate] ERROR: Migration failed, transaction rolled back:', err.message);
-    process.exit(1);
+    throw err;
   } finally {
     client.release();
     await pool.end();
   }
 }
 
-migrate();
+if (require.main === module) {
+  require('dotenv').config({ path: path.join(process.cwd(), '.env.local') });
+  if (!process.env.DATABASE_URL) {
+    console.error('[migrate] ERROR: DATABASE_URL is not set.');
+    process.exit(1);
+  }
+
+  migrateDatabase(process.env.DATABASE_URL)
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}
+
+module.exports = { migrateDatabase };

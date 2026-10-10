@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { authenticateTestUser, MOCK_USER_EMAIL } from './helpers';
 
 test.describe('Authentication & Route Protection', () => {
   test('should render the login page with all expected elements', async ({ page }) => {
@@ -24,6 +25,16 @@ test.describe('Authentication & Route Protection', () => {
     await expect(page.getByText(/Password is required/i)).toBeVisible();
   });
 
+  test('should complete deterministic login flow and redirect to /library', async ({ page }) => {
+    await page.goto('/login');
+
+    await page.locator('input#email').fill(MOCK_USER_EMAIL);
+    await page.locator('input#password').fill('ValidPass123!');
+    await page.getByRole('button', { name: /Sign in/i }).click();
+
+    await expect(page).toHaveURL(/\/library/, { timeout: 15000 });
+  });
+
   test('should render the signup page and validate minimum password length', async ({ page }) => {
     await page.goto('/signup');
 
@@ -38,6 +49,16 @@ test.describe('Authentication & Route Protection', () => {
     await page.getByRole('button', { name: /Create Account/i }).click();
 
     await expect(page.getByText(/Password must be at least 6 characters/i)).toBeVisible();
+  });
+
+  test('should complete deterministic signup flow with immediate session redirect to /library', async ({ page }) => {
+    await page.goto('/signup');
+
+    await page.locator('input#email').fill('brandnewuser@example.com');
+    await page.locator('input#password').fill('ValidPass123!');
+    await page.getByRole('button', { name: /Create Account/i }).click();
+
+    await expect(page).toHaveURL(/\/library/, { timeout: 15000 });
   });
 
   test('should redirect unauthenticated users from protected page /library to /login', async ({ page }) => {
