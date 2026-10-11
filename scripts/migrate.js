@@ -281,16 +281,49 @@ async function migrateDatabase(connectionString, customSsl) {
 
       ALTER TABLE generation_idempotency ENABLE ROW LEVEL SECURITY;
       ALTER TABLE generation_idempotency FORCE ROW LEVEL SECURITY;
+
+      -- Internal infrastructure tables: lock down with RLS
+      ALTER TABLE youtube_transcripts ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE youtube_transcripts FORCE ROW LEVEL SECURITY;
+
+      ALTER TABLE rate_limit_buckets ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE rate_limit_buckets FORCE ROW LEVEL SECURITY;
     `);
 
-    // Step 5 — Grant permissions to authenticated role if role exists
-    console.log('[migrate] Configuring role permissions and RLS policies');
+    // Step 5 — Grant permissions to authenticated role, revoke from internal tables, and harden default privileges
+    console.log('[migrate] Configuring role permissions, default privileges, and RLS policies');
     await client.query(`
       DO $$
       BEGIN
+        -- Revoke all table privileges on all application and internal tables from PUBLIC
+        REVOKE ALL ON TABLE notes FROM PUBLIC;
+        REVOKE ALL ON TABLE generation_idempotency FROM PUBLIC;
+        REVOKE ALL ON TABLE youtube_transcripts FROM PUBLIC;
+        REVOKE ALL ON TABLE rate_limit_buckets FROM PUBLIC;
+
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+          -- Revoke all table privileges on all application and internal tables from anon
+          REVOKE ALL ON TABLE notes FROM anon;
+          REVOKE ALL ON TABLE generation_idempotency FROM anon;
+          REVOKE ALL ON TABLE youtube_transcripts FROM anon;
+          REVOKE ALL ON TABLE rate_limit_buckets FROM anon;
+          -- Prevent future tables created in public from automatically granting access to anon
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon;
+        END IF;
+
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+          -- Revoke all privileges first to strip TRUNCATE, REFERENCES, TRIGGER and any inherited defaults
+          REVOKE ALL ON TABLE notes FROM authenticated;
+          REVOKE ALL ON TABLE generation_idempotency FROM authenticated;
+          REVOKE ALL ON TABLE youtube_transcripts FROM authenticated;
+          REVOKE ALL ON TABLE rate_limit_buckets FROM authenticated;
+
+          -- Grant strictly the required CRUD operations for authenticated users (enforced by RLS)
           GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE notes TO authenticated;
           GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE generation_idempotency TO authenticated;
+
+          -- Prevent future tables created in public from automatically granting access to authenticated
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM authenticated;
         END IF;
       END $$;
     `);

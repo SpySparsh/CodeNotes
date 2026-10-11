@@ -158,6 +158,34 @@ describe('PostgreSQL Row Level Security (RLS) Engine Enforcement (Real Migration
     }
   }
 
+  /**
+   * Helper to run queries switched to the 'anon' role.
+   */
+  async function executeAsAnon<T>(
+    callback: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const client = await testPool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1, $2, true)', ['request.jwt.claim.sub', '']);
+      await client.query('SELECT set_config($1, $2, true)', [
+        'request.jwt.claims',
+        JSON.stringify({ role: 'anon' }),
+      ]);
+      await client.query('SET LOCAL ROLE anon');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   beforeAll(async () => {
     const validated = validateTestDatabaseUrl(process.env.TEST_DATABASE_URL);
     testDbUrl = validated.url;
@@ -216,7 +244,9 @@ describe('PostgreSQL Row Level Security (RLS) Engine Enforcement (Real Migration
         $$ LANGUAGE sql STABLE;
 
         GRANT USAGE ON SCHEMA public TO authenticated;
+        GRANT USAGE ON SCHEMA public TO anon;
         GRANT USAGE ON SCHEMA auth TO authenticated;
+        GRANT USAGE ON SCHEMA auth TO anon;
         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA auth TO authenticated;
         GRANT ALL ON ALL TABLES IN SCHEMA auth TO authenticated;
       `);
@@ -394,5 +424,448 @@ describe('PostgreSQL Row Level Security (RLS) Engine Enforcement (Real Migration
       const selectRes = await client.query('SELECT * FROM notes WHERE id = $1', [NOTE_B_ID]);
       expect(selectRes.rowCount).toBe(0);
     });
+  });
+
+  it('8. Verifies youtube_transcripts and rate_limit_buckets have RLS enabled and forced', async () => {
+    const adminClient = await testPool.connect();
+    try {
+      const res = await adminClient.query(`
+        SELECT relname, relrowsecurity, relforcerowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname IN ('youtube_transcripts', 'rate_limit_buckets')
+        ORDER BY c.relname;
+      `);
+      expect(res.rows).toHaveLength(2);
+      for (const row of res.rows) {
+        expect(row.relrowsecurity).toBe(true);
+        expect(row.relforcerowsecurity).toBe(true);
+      }
+    } finally {
+      adminClient.release();
+    }
+  });
+
+  it('9. Verifies authenticated role is denied access to youtube_transcripts and rate_limit_buckets', async () => {
+    // Check youtube_transcripts SELECT, INSERT, UPDATE, DELETE
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(client.query('SELECT * FROM youtube_transcripts')).rejects.toThrow(
+        /permission denied for table youtube_transcripts/i
+      );
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO youtube_transcripts (video_id, transcript_text, provider) VALUES ('vid_test', 'text', 'test')"
+        )
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query(
+          "UPDATE youtube_transcripts SET transcript_text = 'hack' WHERE video_id = 'vid_test'"
+        )
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query("DELETE FROM youtube_transcripts WHERE video_id = 'vid_test'")
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    // Check rate_limit_buckets SELECT, INSERT, UPDATE, DELETE
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(client.query('SELECT * FROM rate_limit_buckets')).rejects.toThrow(
+        /permission denied for table rate_limit_buckets/i
+      );
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO rate_limit_buckets (key, window_start, count, expires_at) VALUES ('key_test', NOW(), 1, NOW() + interval '1 minute')"
+        )
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query(
+          "UPDATE rate_limit_buckets SET count = 999 WHERE key = 'key_test'"
+        )
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(
+        client.query("DELETE FROM rate_limit_buckets WHERE key = 'key_test'")
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+  });
+
+  it('10. Verifies anon role is denied access to youtube_transcripts and rate_limit_buckets', async () => {
+    // Check youtube_transcripts SELECT, INSERT, UPDATE, DELETE
+    await executeAsAnon(async (client) => {
+      await expect(client.query('SELECT * FROM youtube_transcripts')).rejects.toThrow(
+        /permission denied for table youtube_transcripts/i
+      );
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO youtube_transcripts (video_id, transcript_text, provider) VALUES ('vid_anon_test', 'text', 'test')"
+        )
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "UPDATE youtube_transcripts SET transcript_text = 'hack' WHERE video_id = 'vid_anon_test'"
+        )
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query("DELETE FROM youtube_transcripts WHERE video_id = 'vid_anon_test'")
+      ).rejects.toThrow(/permission denied for table youtube_transcripts/i);
+    });
+
+    // Check rate_limit_buckets SELECT, INSERT, UPDATE, DELETE
+    await executeAsAnon(async (client) => {
+      await expect(client.query('SELECT * FROM rate_limit_buckets')).rejects.toThrow(
+        /permission denied for table rate_limit_buckets/i
+      );
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO rate_limit_buckets (key, window_start, count, expires_at) VALUES ('key_anon_test', NOW(), 1, NOW() + interval '1 minute')"
+        )
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "UPDATE rate_limit_buckets SET count = 999 WHERE key = 'key_anon_test'"
+        )
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query("DELETE FROM rate_limit_buckets WHERE key = 'key_anon_test'")
+      ).rejects.toThrow(/permission denied for table rate_limit_buckets/i);
+    });
+  });
+
+  it('11. Verifies complete effective table privilege matrix for all tables across anon and authenticated', async () => {
+    const adminClient = await testPool.connect();
+    try {
+      const allPrivileges = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
+      const allTables = ['notes', 'generation_idempotency', 'youtube_transcripts', 'rate_limit_buckets'];
+
+      // 1. anon must have ZERO privileges on ALL 4 tables
+      for (const table of allTables) {
+        for (const priv of allPrivileges) {
+          const res = await adminClient.query(
+            'SELECT has_table_privilege($1, $2, $3) AS has_priv',
+            ['anon', `public.${table}`, priv]
+          );
+          expect(
+            res.rows[0].has_priv,
+            `Role "anon" unexpectedly has "${priv}" privilege on table "public.${table}"`
+          ).toBe(false);
+        }
+      }
+
+      // 2. authenticated on internal tables: ZERO privileges
+      for (const table of ['youtube_transcripts', 'rate_limit_buckets']) {
+        for (const priv of allPrivileges) {
+          const res = await adminClient.query(
+            'SELECT has_table_privilege($1, $2, $3) AS has_priv',
+            ['authenticated', `public.${table}`, priv]
+          );
+          expect(
+            res.rows[0].has_priv,
+            `Role "authenticated" unexpectedly has "${priv}" privilege on internal table "public.${table}"`
+          ).toBe(false);
+        }
+      }
+
+      // 3. authenticated on application tables: strictly SELECT, INSERT, UPDATE, DELETE (NO TRUNCATE, REFERENCES, TRIGGER)
+      for (const table of ['notes', 'generation_idempotency']) {
+        for (const priv of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+          const res = await adminClient.query(
+            'SELECT has_table_privilege($1, $2, $3) AS has_priv',
+            ['authenticated', `public.${table}`, priv]
+          );
+          expect(
+            res.rows[0].has_priv,
+            `Role "authenticated" should have "${priv}" on application table "public.${table}"`
+          ).toBe(true);
+        }
+
+        for (const priv of ['TRUNCATE', 'REFERENCES', 'TRIGGER']) {
+          const res = await adminClient.query(
+            'SELECT has_table_privilege($1, $2, $3) AS has_priv',
+            ['authenticated', `public.${table}`, priv]
+          );
+          expect(
+            res.rows[0].has_priv,
+            `Role "authenticated" must NOT have "${priv}" on application table "public.${table}"`
+          ).toBe(false);
+        }
+      }
+    } finally {
+      adminClient.release();
+    }
+  });
+
+  it('12. Verifies anon role is completely denied access to notes and generation_idempotency', async () => {
+    // Attempt queries on notes as anon
+    await executeAsAnon(async (client) => {
+      await expect(client.query('SELECT * FROM notes')).rejects.toThrow(
+        /permission denied for table notes/i
+      );
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO notes (id, user_id, video_id, video_title, video_url, overview) VALUES ('00000000-0000-4000-8000-000000000001', '11111111-1111-4111-8111-111111111111', 'v1', 't1', 'http://v1', 'o1')"
+        )
+      ).rejects.toThrow(/permission denied for table notes/i);
+    });
+
+    // Attempt queries on generation_idempotency as anon
+    await executeAsAnon(async (client) => {
+      await expect(client.query('SELECT * FROM generation_idempotency')).rejects.toThrow(
+        /permission denied for table generation_idempotency/i
+      );
+    });
+
+    await executeAsAnon(async (client) => {
+      await expect(
+        client.query(
+          "INSERT INTO generation_idempotency (user_id, key, status) VALUES ('11111111-1111-4111-8111-111111111111', 'k1', 'pending')"
+        )
+      ).rejects.toThrow(/permission denied for table generation_idempotency/i);
+    });
+  });
+
+  it('13. Verifies authenticated role is denied TRUNCATE on application tables', async () => {
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(client.query('TRUNCATE notes')).rejects.toThrow(
+        /permission denied for table notes/i
+      );
+    });
+
+    await executeAsUser(USER_A_ID, async (client) => {
+      await expect(client.query('TRUNCATE generation_idempotency')).rejects.toThrow(
+        /permission denied for table generation_idempotency/i
+      );
+    });
+  });
+
+  it('14. Verifies authenticated role retains user-scoped CRUD on generation_idempotency', async () => {
+    const IDEMP_KEY_A = 'test-idemp-key-a';
+
+    // User A inserts idempotency record
+    await executeAsUser(USER_A_ID, async (client) => {
+      const insRes = await client.query(
+        `INSERT INTO generation_idempotency (user_id, key, status, video_id)
+         VALUES ($1, $2, 'processing', 'vid_a')
+         RETURNING key, status`,
+        [USER_A_ID, IDEMP_KEY_A]
+      );
+      expect(insRes.rowCount).toBe(1);
+    });
+
+    // User A reads own idempotency record
+    await executeAsUser(USER_A_ID, async (client) => {
+      const selRes = await client.query(
+        'SELECT * FROM generation_idempotency WHERE user_id = $1 AND key = $2',
+        [USER_A_ID, IDEMP_KEY_A]
+      );
+      expect(selRes.rowCount).toBe(1);
+      expect(selRes.rows[0].status).toBe('processing');
+    });
+
+    // User B CANNOT read User A idempotency record
+    await executeAsUser(USER_B_ID, async (client) => {
+      const selRes = await client.query(
+        'SELECT * FROM generation_idempotency WHERE user_id = $1 AND key = $2',
+        [USER_A_ID, IDEMP_KEY_A]
+      );
+      expect(selRes.rowCount).toBe(0);
+    });
+
+    // User A updates own record
+    await executeAsUser(USER_A_ID, async (client) => {
+      const updRes = await client.query(
+        `UPDATE generation_idempotency SET status = 'completed' WHERE user_id = $1 AND key = $2`,
+        [USER_A_ID, IDEMP_KEY_A]
+      );
+      expect(updRes.rowCount).toBe(1);
+    });
+
+    // User A deletes own record
+    await executeAsUser(USER_A_ID, async (client) => {
+      const delRes = await client.query(
+        `DELETE FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
+        [USER_A_ID, IDEMP_KEY_A]
+      );
+      expect(delRes.rowCount).toBe(1);
+    });
+  });
+
+  it('15. Verifies application/admin role retains full table privileges and CRUD on youtube_transcripts and rate_limit_buckets', async () => {
+    const adminClient = await testPool.connect();
+    try {
+      // Verify app/admin connection role retains all operational privileges
+      for (const table of ['youtube_transcripts', 'rate_limit_buckets']) {
+        for (const priv of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+          const res = await adminClient.query(
+            'SELECT has_table_privilege(current_user, $1, $2) AS has_priv',
+            [`public.${table}`, priv]
+          );
+          expect(res.rows[0].has_priv).toBe(true);
+        }
+      }
+
+      // 1. youtube_transcripts CRUD
+      await adminClient.query("DELETE FROM youtube_transcripts WHERE video_id = 'test_admin_probe'");
+
+      const insRes = await adminClient.query(`
+        INSERT INTO youtube_transcripts (video_id, transcript_text, provider)
+        VALUES ('test_admin_probe', 'Sample transcript', 'supadata')
+        RETURNING video_id;
+      `);
+      expect(insRes.rowCount).toBe(1);
+
+      const selRes = await adminClient.query(
+        "SELECT * FROM youtube_transcripts WHERE video_id = 'test_admin_probe'"
+      );
+      expect(selRes.rowCount).toBe(1);
+      expect(selRes.rows[0].transcript_text).toBe('Sample transcript');
+
+      const updRes = await adminClient.query(
+        "UPDATE youtube_transcripts SET transcript_text = 'Updated' WHERE video_id = 'test_admin_probe'"
+      );
+      expect(updRes.rowCount).toBe(1);
+
+      const delRes = await adminClient.query(
+        "DELETE FROM youtube_transcripts WHERE video_id = 'test_admin_probe'"
+      );
+      expect(delRes.rowCount).toBe(1);
+
+      // 2. rate_limit_buckets CRUD
+      const windowStart = new Date('2026-01-01T00:00:00Z');
+      await adminClient.query("DELETE FROM rate_limit_buckets WHERE key = 'test_admin_bucket'");
+
+      const insB = await adminClient.query(
+        `INSERT INTO rate_limit_buckets (key, window_start, count, expires_at)
+         VALUES ($1, $2, $3, $4)
+         RETURNING key;`,
+        ['test_admin_bucket', windowStart, 5, new Date('2026-01-01T00:01:00Z')]
+      );
+      expect(insB.rowCount).toBe(1);
+
+      const selB = await adminClient.query(
+        "SELECT * FROM rate_limit_buckets WHERE key = 'test_admin_bucket'"
+      );
+      expect(selB.rowCount).toBe(1);
+      expect(Number(selB.rows[0].count)).toBe(5);
+
+      const updB = await adminClient.query(
+        "UPDATE rate_limit_buckets SET count = 6 WHERE key = 'test_admin_bucket'"
+      );
+      expect(updB.rowCount).toBe(1);
+
+      const delB = await adminClient.query(
+        "DELETE FROM rate_limit_buckets WHERE key = 'test_admin_bucket'"
+      );
+      expect(delB.rowCount).toBe(1);
+    } finally {
+      adminClient.release();
+    }
+  });
+
+  it('16. Verifies migration is idempotent and safe to re-run', async () => {
+    // Calling migrateDatabase a second time must succeed without throwing
+    await expect(migrateDatabase(testDbUrl, false)).resolves.not.toThrow();
+
+    // Verify RLS is still enabled and forced
+    const adminClient = await testPool.connect();
+    try {
+      const res = await adminClient.query(`
+        SELECT relname, relrowsecurity, relforcerowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname IN ('youtube_transcripts', 'rate_limit_buckets')
+        ORDER BY c.relname;
+      `);
+      expect(res.rows).toHaveLength(2);
+      for (const row of res.rows) {
+        expect(row.relrowsecurity).toBe(true);
+        expect(row.relforcerowsecurity).toBe(true);
+      }
+    } finally {
+      adminClient.release();
+    }
+  });
+
+  it('17. Verifies future tables created in public schema do not grant privileges to anon or authenticated', async () => {
+    const adminClient = await testPool.connect();
+    try {
+      await adminClient.query('DROP TABLE IF EXISTS public.test_future_internal_table CASCADE');
+      await adminClient.query(`
+        CREATE TABLE public.test_future_internal_table (
+          id SERIAL PRIMARY KEY,
+          secret_data TEXT
+        );
+      `);
+
+      // Verify table permissions via has_table_privilege
+      const permCheck = await adminClient.query(`
+        SELECT
+          has_table_privilege('anon', 'public.test_future_internal_table', 'SELECT') AS anon_select,
+          has_table_privilege('anon', 'public.test_future_internal_table', 'INSERT') AS anon_insert,
+          has_table_privilege('authenticated', 'public.test_future_internal_table', 'SELECT') AS auth_select,
+          has_table_privilege('authenticated', 'public.test_future_internal_table', 'INSERT') AS auth_insert
+      `);
+
+      expect(permCheck.rows[0].anon_select).toBe(false);
+      expect(permCheck.rows[0].anon_insert).toBe(false);
+      expect(permCheck.rows[0].auth_select).toBe(false);
+      expect(permCheck.rows[0].auth_insert).toBe(false);
+
+      // Verify query attempts as authenticated role throw permission denied
+      await executeAsUser(USER_A_ID, async (client) => {
+        await expect(client.query('SELECT * FROM public.test_future_internal_table')).rejects.toThrow(
+          /permission denied/i
+        );
+      });
+
+      // Verify query attempts as anon role throw permission denied
+      await executeAsAnon(async (client) => {
+        await expect(client.query('SELECT * FROM public.test_future_internal_table')).rejects.toThrow(
+          /permission denied/i
+        );
+      });
+
+      // Clean up
+      await adminClient.query('DROP TABLE public.test_future_internal_table');
+    } finally {
+      adminClient.release();
+    }
   });
 });
