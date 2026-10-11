@@ -30,6 +30,7 @@ import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { toast } from 'sonner';
 import Link from 'next/link';
+import { captureEvent } from '@/lib/analytics';
 
 export default function LibraryPage() {
   const router = useRouter();
@@ -115,6 +116,7 @@ export default function LibraryPage() {
   const handleDelete = async (id: string) => {
     try {
       await deleteMutation.mutateAsync(id);
+      captureEvent('note_deleted');
       toast.success('Note deleted successfully');
     } catch (err: any) {
       if (err?.status === 401) {

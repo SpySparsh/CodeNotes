@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { Library, Video, LogOut, User as UserIcon } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import type { User } from '@supabase/supabase-js';
+import { trackAuthSuccess, resetUser } from '@/lib/analytics';
 
 export default function Navbar() {
   const [user, setUser] = useState<User | null>(null);
@@ -18,6 +19,9 @@ export default function Navbar() {
       try {
         const { data: { user } } = await supabase.auth.getUser();
         setUser(user);
+        if (user) {
+          trackAuthSuccess(user);
+        }
       } catch {
         setUser(null);
       } finally {
@@ -28,8 +32,14 @@ export default function Navbar() {
     getUser();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
+      const currentUser = session?.user ?? null;
+      setUser(currentUser);
       setLoading(false);
+      if (currentUser) {
+        trackAuthSuccess(currentUser);
+      } else {
+        resetUser();
+      }
     });
 
     return () => {
@@ -39,6 +49,7 @@ export default function Navbar() {
 
   const handleSignOut = async () => {
     await supabase.auth.signOut();
+    resetUser();
     setUser(null);
     router.push('/');
     router.refresh();

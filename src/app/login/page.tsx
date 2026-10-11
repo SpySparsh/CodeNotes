@@ -9,6 +9,7 @@ import { createClient } from '@/lib/supabase/client';
 import { Video, ArrowRight, Loader2 } from 'lucide-react';
 import { loginSchema, LoginInput } from '@/lib/validations/auth';
 import { sanitizeRedirectPath } from '@/lib/auth/redirect';
+import { trackAuthSuccess, setOAuthFlowIntent, captureEvent } from '@/lib/analytics';
 
 function LoginForm() {
   const [loading, setLoading] = useState(false);
@@ -44,7 +45,7 @@ function LoginForm() {
     setError(null);
 
     try {
-      const { error: signInError } = await supabase.auth.signInWithPassword({
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
         email: data.email,
         password: data.password,
       });
@@ -53,6 +54,12 @@ function LoginForm() {
         setError(signInError.message);
         setLoading(false);
         return;
+      }
+
+      if (signInData?.user) {
+        trackAuthSuccess(signInData.user, 'email', 'login');
+      } else {
+        captureEvent('user_logged_in', { method: 'email' });
       }
 
       router.push(next);
@@ -66,6 +73,7 @@ function LoginForm() {
   const handleGoogleLogin = async () => {
     setOauthLoading(true);
     setError(null);
+    setOAuthFlowIntent('login');
 
     try {
       const origin = window.location.origin;

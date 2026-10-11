@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { prism } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { captureEvent, sanitizeLanguage } from '@/lib/analytics';
 
 interface CodeBlockProps {
   code: string;
@@ -16,6 +17,7 @@ export default function CodeBlock({ code, language }: CodeBlockProps) {
   const handleCopy = async () => {
     await navigator.clipboard.writeText(code);
     setCopied(true);
+    captureEvent('code_copied', { language: sanitizeLanguage(language) });
     setTimeout(() => setCopied(false), 2000);
   };
 

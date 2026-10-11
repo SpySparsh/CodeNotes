@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Youtube, ChevronLeft, Bot, Lightbulb, Code2, Check, AlertCircle, RefreshCw } from 'lucide-react';
@@ -9,13 +9,22 @@ import { useParams, useRouter } from 'next/navigation';
 import CodeBlock from '@/components/CodeBlock';
 import { useNoteQuery } from '@/lib/queries/useNotes';
 import { Button } from '@/components/ui/button';
+import { captureEvent } from '@/lib/analytics';
 
 export default function NotePage() {
   const { id } = useParams();
   const noteId = Array.isArray(id) ? id[0] : (id as string);
   const router = useRouter();
+  const lastTrackedNoteIdRef = useRef<string | null>(null);
 
   const { data, isLoading, isError, error, refetch } = useNoteQuery(noteId);
+
+  useEffect(() => {
+    if (data?.note && lastTrackedNoteIdRef.current !== data.note.id) {
+      lastTrackedNoteIdRef.current = data.note.id;
+      captureEvent('note_viewed');
+    }
+  }, [data?.note]);
 
   useEffect(() => {
     if (isError && (error as any)?.status === 401) {

@@ -142,3 +142,50 @@ To prevent data leakage into Sentry logs:
    - Fields named `transcript`, `prompt`, `aiNotes`, `rawOutput`, `notes`, or request `body` are dropped regardless of object nesting depth.
 6. **Bounded Inngest Scope**:
    - Inngest's `onFailure` handler records only bounded tags (`inngest.function: 'generate-notes'`, `error.code`, `error.unrecoverable`). Video IDs, user UUIDs, and idempotency keys are kept only in local structured logs.
+
+---
+
+## 8. PostHog Product Analytics & Privacy Architecture
+
+CodeNotes integrates lightweight, client-side product analytics using `posthog-js` ([`src/lib/analytics/`](file:///d:/unstuckstudy/src/lib/analytics/)).
+
+### Distinct Telemetry Roles
+CodeNotes maintains strict role boundaries across telemetry systems:
+- **Prometheus (`/api/metrics`)**: Operational service health, aggregate request rates, pipeline stage latencies, rate limits, and reconciler runs. Contains no user identifiers.
+- **Sentry**: Error monitoring, uncaught exceptions, and unrecoverable pipeline crashes. User PII and content payloads are scrubbed unconditionally.
+- **PostHog**: Product adoption, conversion, and feature usage analytics. Operates exclusively in the browser with explicit, privacy-first event capturing.
+
+### Safe Optional Configuration
+PostHog is completely optional. If `NEXT_PUBLIC_POSTHOG_KEY` is unset or blank:
+- PostHog SDK initialization is skipped entirely (`isPostHogEnabled() === false`).
+- Exactly zero network requests or beacons are transmitted.
+- All tracking helper calls (`captureEvent`, `identifyUser`, `resetUser`, `capturePageView`) resolve immediately as no-ops.
+
+### Strict Privacy Protections & Disabled Capabilities
+To safeguard user privacy and prevent data leakage:
+1. **Disabled Auto-Capture**: Automatic DOM interaction click/input tracking (`autocapture: false`), automatic pageview tracking (`capture_pageview: false`), and automatic pageleave tracking (`capture_pageleave: false`) are disabled.
+2. **Disabled Recording & Surveys**: Session recordings (`disable_session_recording: true`) and in-app surveys (`disable_surveys: true`) are permanently disabled.
+3. **Decide Endpoint Disabled**: Remote feature flag evaluation and experiment polling are turned off (`advanced_disable_decide: true`).
+4. **Normalized Manual Pageviews**: Pageviews are tracked manually using sanitized template routes (`/`, `/library`, `/login`, `/signup`, `/notes/[id]`). Dynamic UUIDs, query strings, fragments, and OAuth callback codes are never tracked.
+5. **PII and Content Exclusion**:
+   - User identity uses the opaque Supabase user UUID (`user.id`). Email addresses and personal information are strictly forbidden and rejected at identification time.
+   - User identity is immediately reset on logout via `resetUser()`.
+   - **Forbidden Properties**: Property sanitization strictly blocks `video_id`, `note_id`, raw URLs, prompts, transcripts, AI summaries, code snippet contents, and unbounded error messages.
+6. **Central `before_send` Privacy Filter**:
+   - A global interceptor in `posthog.init` scrubs every outgoing event and drops unauthorized events.
+   - Removes SDK default properties: `$referrer`, `$referring_domain`, session-entry/exit URLs (`$entry_current_url`, `$exit_current_url`), and attribution parameters (`utm_*`).
+   - Normalizes `$current_url` and `$pathname` strictly into safe route templates (`/`, `/library`, `/login`, `/signup`, `/notes/[id]`), preventing accidental query string, fragment, or dynamic UUID transmission.
+
+### Curated Product Event Catalog
+
+| Event Name | Trigger Location | Allowed Properties | Privacy Boundary |
+| :--- | :--- | :--- | :--- |
+| `$pageview` | Route transitions (`PostHogProvider`) | `$current_url` (normalized route template) | No query params, fragments, or dynamic UUIDs |
+| `user_signed_up` | Account creation (`/signup` or Google OAuth) | `method: 'email' \| 'google'` | Method only; no emails or user metadata |
+| `user_logged_in` | User login (`/login` or Google OAuth) | `method: 'email' \| 'google'` | Method only; no emails or user credentials |
+| `generation_requested` | URL submitted (`UrlInput`) | *(none)* | No `video_id` or YouTube URL transmitted |
+| `generation_completed` | Polling succeeds (`UrlInput`) | `duration_ms` / `duration_seconds` | Latency only; deduplicated to fire once per lifecycle |
+| `generation_failed` | Polling fails (`UrlInput`) | `error_code` (bounded enum) | Bounded enum; no raw exception messages |
+| `note_viewed` | Note page loaded (`/notes/[id]`) | *(none)* | Deduplicated to fire once per unique note ID; no `note_id` |
+| `code_copied` | Copy code clicked (`CodeBlock`) | `language` (bounded string) | Language name only; code snippet content excluded |
+| `note_deleted` | Note removed (`/library`) | *(none)* | Only on successful deletion; no `note_id` transmitted |

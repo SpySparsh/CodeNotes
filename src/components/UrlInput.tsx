@@ -11,12 +11,15 @@ import { createClient } from '@/lib/supabase/client';
 import { generateUrlSchema, GenerateUrlInput } from '@/lib/validations/generate';
 import { useGenerationStatus } from '@/hooks/useGenerationStatus';
 import { toast } from 'sonner';
+import { captureEvent, sanitizeErrorCode } from '@/lib/analytics';
 
 export default function UrlInput() {
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [serverError, setServerError] = useState('');
   const isSubmittingRef = useRef(false);
+  const startTimeRef = useRef<number | null>(null);
+  const terminalFiredRef = useRef<boolean>(false);
   const router = useRouter();
   const queryClient = useQueryClient();
   const supabase = createClient();
@@ -44,6 +47,14 @@ export default function UrlInput() {
     if (!statusData) return;
 
     if (statusData.status === 'completed' && statusData.noteId) {
+      if (!terminalFiredRef.current) {
+        terminalFiredRef.current = true;
+        const durationMs = startTimeRef.current
+          ? Math.round(performance.now() - startTimeRef.current)
+          : undefined;
+        captureEvent('generation_completed', durationMs !== undefined ? { duration_ms: durationMs } : undefined);
+      }
+
       toast.success('Notes generated successfully!');
       queryClient.invalidateQueries({ queryKey: ['notes'] });
       const targetNoteId = statusData.noteId;
@@ -53,6 +64,13 @@ export default function UrlInput() {
       reset();
       router.push(`/notes/${targetNoteId}`);
     } else if (statusData.status === 'failed') {
+      if (!terminalFiredRef.current) {
+        terminalFiredRef.current = true;
+        captureEvent('generation_failed', {
+          error_code: sanitizeErrorCode(statusData.code),
+        });
+      }
+
       const errorMsg = statusData.error || 'Failed to generate notes';
       toast.error(errorMsg);
       setServerError(errorMsg);
@@ -65,6 +83,13 @@ export default function UrlInput() {
   // Handle polling network / authorization errors
   useEffect(() => {
     if (statusError) {
+      if (!terminalFiredRef.current) {
+        terminalFiredRef.current = true;
+        captureEvent('generation_failed', {
+          error_code: 'UNKNOWN_ERROR',
+        });
+      }
+
       const errorMsg = statusError.message || 'Failed to verify generation status';
       setServerError(errorMsg);
       toast.error(errorMsg);
@@ -122,6 +147,8 @@ export default function UrlInput() {
 
       if (response.status === 200 && resData.status === 'completed' && resData.noteId) {
         // Cache hit / already completed
+        captureEvent('generation_requested');
+        captureEvent('generation_completed', { duration_ms: 0 });
         toast.success('Notes loaded from library!');
         queryClient.invalidateQueries({ queryKey: ['notes'] });
         reset();
@@ -130,6 +157,9 @@ export default function UrlInput() {
       }
 
       // 202 Accepted: asynchronous job in flight
+      captureEvent('generation_requested');
+      startTimeRef.current = performance.now();
+      terminalFiredRef.current = false;
       const returnedKey = resData.idempotencyKey || idempotencyKey;
       setActiveKey(returnedKey);
     } catch (err: any) {

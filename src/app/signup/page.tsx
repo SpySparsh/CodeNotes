@@ -9,6 +9,7 @@ import { createClient } from '@/lib/supabase/client';
 import { Video, ArrowRight, Loader2, CheckCircle2 } from 'lucide-react';
 import { signupSchema, SignupInput } from '@/lib/validations/auth';
 import { sanitizeRedirectPath } from '@/lib/auth/redirect';
+import { trackAuthSuccess, setOAuthFlowIntent, captureEvent } from '@/lib/analytics';
 
 function SignupForm() {
   const [loading, setLoading] = useState(false);
@@ -61,6 +62,12 @@ function SignupForm() {
         return;
       }
 
+      if (authData?.user) {
+        trackAuthSuccess(authData.user, 'email', 'signup');
+      } else {
+        captureEvent('user_signed_up', { method: 'email' });
+      }
+
       // If user session is returned immediately (email confirmation disabled):
       if (authData.session) {
         router.push(next);
@@ -85,6 +92,7 @@ function SignupForm() {
   const handleGoogleSignup = async () => {
     setOauthLoading(true);
     setError(null);
+    setOAuthFlowIntent('signup');
 
     try {
       const origin = window.location.origin;
