@@ -8,6 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { createClient } from '@/lib/supabase/client';
 import { Video, ArrowRight, Loader2 } from 'lucide-react';
 import { loginSchema, LoginInput } from '@/lib/validations/auth';
+import { sanitizeRedirectPath } from '@/lib/auth/redirect';
 
 function LoginForm() {
   const [loading, setLoading] = useState(false);
@@ -16,7 +17,12 @@ function LoginForm() {
 
   const router = useRouter();
   const searchParams = useSearchParams();
-  const next = searchParams.get('next') || '/library';
+  const nextParam = searchParams.get('next');
+  const next = sanitizeRedirectPath(
+    nextParam,
+    typeof window !== 'undefined' ? window.location.origin : undefined,
+    '/library'
+  );
   const errorParam = searchParams.get('error');
 
   const supabase = createClient();

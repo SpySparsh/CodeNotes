@@ -98,6 +98,21 @@ Starts:
 
 ---
 
+### Manual Verification & Smoke Testing
+
+To manually verify generation, transcript caching, and idempotency replay in a live or local environment:
+
+1. **Initial Generation (Cache Miss)**:
+   Submit a YouTube URL from the web UI (`/`). The client generates a fresh `Idempotency-Key` UUID. Background execution fetches the transcript (calling Supadata or scraper), runs Gemini 2.5 inference, and persists the note.
+2. **Transcript Caching vs. Note Deduplication**:
+   Submitting the same video URL again from the UI generates a *new* `Idempotency-Key` UUID. The system reuses the cached transcript from `youtube_transcripts` (avoiding external caption calls), but runs Gemini inference again and creates an independent note. Separate UUIDs do not deduplicate notes.
+3. **Idempotency Replay**:
+   To test idempotency replay (`200 OK` with `cached: true`):
+   - **Replay of a UI submission**: Re-send the request with the exact same `Idempotency-Key: <original-uuid>` header used by the UI.
+   - **Deterministic hash replay**: Submit `POST /api/generate` with `{ "url": "..." }` and *omit* the `Idempotency-Key` header entirely across both initial and replay requests. The server derives `sha256(userId:videoId)`. Replaying that headerless request returns the completed note without re-running Gemini. A request without the header does not match a UUID-based UI job.
+
+---
+
 ## 5. Automated Test Suites
 
 CodeNotes maintains a comprehensive testing pyramid across unit, integration, RLS policy, observability, and end-to-end suites.

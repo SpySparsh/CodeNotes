@@ -83,10 +83,15 @@ flowchart TD
 1. **Authentication**: Resolves user session via Supabase Auth ([`src/lib/auth.ts`](file:///d:/unstuckstudy/src/lib/auth.ts)).
 2. **Rate Limiting**: Checks PostgreSQL token bucket ([`src/lib/rate-limit.ts`](file:///d:/unstuckstudy/src/lib/rate-limit.ts)) to enforce per-user request limits.
 3. **Payload Validation**: Canonicalizes YouTube URL and extracts video ID ([`src/lib/transcript.ts`](file:///d:/unstuckstudy/src/lib/transcript.ts)).
-4. **Idempotency Check**: Looks up `generation_idempotency` by `(user_id, key)`:
-   - If already `completed`: Returns `200 OK` with cached `noteId` immediately (no AI work re-executed).
-   - If `processing` or `pending`: Replays current status with `202 Accepted`.
-   - If payload mismatch (reusing key with different video ID): Rejects with `422 Unprocessable Entity`.
+4. **Idempotency Check**: Determines the idempotency key:
+   - If the `Idempotency-Key` request header is present, its trimmed string value is used.
+   - If the header is omitted, the key is deterministically derived as `sha256("${userId}:${videoId}")`.
+   - In the web UI ([`src/components/UrlInput.tsx`](file:///d:/unstuckstudy/src/components/UrlInput.tsx)), each submission generates a fresh UUID in the `Idempotency-Key` header.
+   - Looks up `generation_idempotency` by `(user_id, key)`:
+     - If already `completed`: Returns `200 OK` with cached `noteId` immediately (no AI work re-executed). Replay of a UI-created job requires reusing that exact `Idempotency-Key` UUID. A request without the header uses a different, deterministic key unless the original request also omitted the header.
+     - If `processing` or `pending`: Replays current status with `202 Accepted`.
+     - If payload mismatch (reusing key with different video ID): Rejects with `422 Unprocessable Entity`.
+     - Submitting the same video with a separate UUID creates a distinct generation record: it benefits from transcript caching via `youtube_transcripts` (avoiding external caption calls), but runs Gemini inference again to create a new note rather than deduplicating notes.
 5. **Durable Reservation**: Atomically inserts or updates row with status `pending`.
 6. **Event Dispatch**: Dispatches `notes/generate.requested` with deterministic event ID `gen-${userId}-${idempotencyKey}` to Inngest.
 7. **Immediate Response**: Returns `202 Accepted` within ~50ms. The browser client switches to non-blocking polling.
