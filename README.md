@@ -1,138 +1,157 @@
-# CodeNotes
+# CodeNotes AI
 
-CodeNotes is an AI-powered application that converts YouTube programming tutorials into structured technical study notes. A user pastes a YouTube URL; the request is validated, authenticated via Supabase Auth, recorded as durable idempotency state in PostgreSQL, and dispatched as a durable serverless event to Inngest. Inngest steps reliably fetch video transcripts and metadata, invoke Google Gemini 2.5 Flash with schema enforcement, and atomically commit the study notes to PostgreSQL with Row Level Security (RLS) enforcement. The frontend seamlessly tracks generation progress via TanStack Query status polling.
+CodeNotes is an AI-powered technical study-notes application that transforms YouTube programming tutorials into structured, syntax-highlighted study notes. A user submits a YouTube URL; the system validates the input, authenticates via Supabase Auth, registers a durable idempotency reservation in PostgreSQL, and dispatches a background event to Inngest.
 
----
-
-## Features
-
-- **Durable Serverless AI Generation**: Decouples HTTP ingestion from AI pipeline latency via Inngest serverless step execution without requiring persistent worker VMs or Redis instances.
-- **At-Least-Once Processing with Idempotent Persistence**: Durable PostgreSQL idempotency records ensure zero duplicate note writes even across function retries or network partitions.
-- **Supabase Authentication & Multi-Tenant RLS**: Complete user isolation enforced at the PostgreSQL database level via `withUserTransaction` and transaction-local JWT claims.
-- **Modern Notes Library**: Keyset cursor pagination, search filtering, sorting, and responsive grid/list views powered by TanStack Query and Zustand.
-- **Resilient AI Pipeline**: Parallel transcript & title fetching with automatic fallback to Gemini direct-video analysis when captions are disabled.
-- **Truthful Status UX**: Live status transitions (`pending` → `processing` → `completed` / `failed`) without artificial progress bars.
-- **Observability**: Structured JSON logging with request IDs and Prometheus metrics for HTTP requests and generation duration.
+Inngest durable steps fetch the video transcript using a dual-provider strategy (Supadata API primary with `youtube-transcript` fallback) and shared PostgreSQL transcript caching, invoke Google Gemini 2.5 Flash with structured schema enforcement, and atomically persist the study notes to PostgreSQL under Row Level Security (RLS) user isolation. The frontend provides live status polling and a keyset-paginated library with full search and sorting.
 
 ---
 
-## Architecture
+## Key Highlights & Architecture
+
+- **Durable Serverless Execution**: Eliminates the operational overhead of persistent worker VMs, Redis, or BullMQ by utilizing Inngest serverless step functions.
+- **Distributed Idempotency & Processing Leases**: Guarantees zero duplicate note writes and safe retries across network drops and concurrent requests via PostgreSQL `generation_idempotency` records with 15-minute leases.
+- **Multi-Tenant PostgreSQL Row Level Security (RLS)**: Enforces complete user isolation directly at the database layer via `withUserTransaction` and transaction-local JWT claims (`SET LOCAL "request.jwt.claim.sub"`).
+- **Dual-Provider Transcript Strategy & Shared Caching**: Reuses public transcripts across users in `youtube_transcripts` while keeping generated notes strictly isolated. Falls back cleanly from Supadata to YouTube scraping.
+- **Crash-Safe Reconciliation**: A 5-minute Inngest cron job scans stale `pending` and `processing` records, re-dispatching dropped jobs to ensure zero orphaned user requests.
+- **Full Observability Stack**: Built-in Prometheus metrics at `/api/metrics`, Prometheus alerting rules, pre-configured Grafana dashboard, deep `/api/health` probes, and privacy-safe Sentry error sanitization.
 
 ```text
-Browser
+Browser Tier (React 19 / TanStack Query)
   │
-  ├── 1. POST /api/generate { url } (Idempotency-Key)
-  │      └── requireUser() → validate → write DB 'pending' → inngest.send() → return 202 Accepted
-  │
-  ├── 2. Polling: GET /api/generate/status?key=... (TanStack Query every 1.5s)
-  │
-Inngest Serverless Execution Engine (/api/inngest)
-  │
-  ▼
-Durable Function: "generate-notes"
-  │
-  ├── Step 1: claim-generation-processing
-  │           └── Check DB status, validate payload, claim 5-minute lease (status = 'processing')
-  ├── Step 2: fetch-transcript-and-title [OUTSIDE DB TRANSACTION]
-  │           └── fetchTranscript (timeout 15s) + extractVideoTitle (timeout 4s)
-  ├── Step 3: generate-ai-notes [OUTSIDE DB TRANSACTION]
-  │           └── Gemini 2.5 Flash inference with fallback to direct video (timeout 75s)
-  ├── Step 4: persist-notes [INSIDE withUserTransaction(userId)]
-  │           ├── SET LOCAL "request.jwt.claim.sub" = userId
-  │           ├── SET LOCAL ROLE authenticated
-  │           ├── INSERT INTO notes (...)
-  │           └── UPDATE generation_idempotency SET status = 'completed', note_id = ...
-  └── onFailure: On unrecoverable error or max retries: update DB status = 'failed' with error code
+  ├── 1. POST /api/generate ──► Auth & Rate Limit ──► Write 'pending' DB row ──► Return 202 Accepted
+  │                                                                 │
+  │                                                                 ▼
+  │                                                     Dispatch Inngest Event
+  │                                                                 │
+  └── 2. Polling /api/generate/status                               ▼
+                                                        Inngest Serverless Engine (/api/inngest)
+                                                                    │
+                                                                    ├── Step 1: Claim 15-min lease
+                                                                    ├── Step 2: Fetch transcript (Cache / Supadata / Scraper)
+                                                                    ├── Step 3: Gemini 2.5 Flash inference
+                                                                    └── Step 4: Atomic RLS commit (notes table)
 ```
 
----
-
-## Distributed Idempotency & Failure Guarantees
-
-1. **Authoritative Source of Truth**: PostgreSQL `generation_idempotency` table `(user_id, key)` is the ultimate source of truth for job lifecycle state.
-2. **Deterministic Event Ingestion**: Inngest event IDs use deterministic identifiers (`gen-${userId}-${key}`) preventing duplicate event ingestion.
-3. **Processing Lease Invariant**: Concurrent or re-delivered function executions verify the active lease (`lease_until`) and avoid repeating expensive transcript or AI operations.
-4. **Crash-Safe Reconciliation**: If `inngest.send` fails due to a network glitch, the durable `pending` row is retained in PostgreSQL. An Inngest cron job (`*/5 * * * *`) scans stale pending/processing records and safely re-dispatches them.
-5. **Database Transaction Boundary**: Long-running transcript and Gemini operations execute entirely outside database transactions; PostgreSQL connection pool clients are checked out only during the final atomic write (< 20ms).
-
----
-
-## API Reference
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `POST` | `/api/generate` | Dispatch a new note generation job (authenticated, returns 202 Accepted or 200 cached) |
-| `GET` | `/api/generate/status` | Poll status of an in-flight generation (`pending`, `processing`, `completed`, `failed`) |
-| `GET/POST/PUT` | `/api/inngest` | Inngest serve handler for serverless step execution and cron schedules |
-| `GET` | `/api/notes` | List saved notes with keyset cursor pagination, search, and sorting |
-| `GET` | `/api/notes/[id]` | Retrieve a single note by UUID (authenticated, RLS-scoped) |
-| `DELETE` | `/api/notes/[id]` | Delete a note by UUID (authenticated, RLS-scoped) |
-| `GET` | `/api/health` | Health check — probes database with `SELECT 1` |
-| `GET` | `/api/metrics` | Prometheus metrics (HTTP + generation metrics) |
+For detailed component flows and sequence diagrams, see the [Architecture Documentation](docs/architecture.md).
 
 ---
 
 ## Tech Stack
 
-- **Framework**: Next.js 16.3 (App Router), React 19, TypeScript 5
-- **Durable Execution & Background Jobs**: Inngest (`inngest`, `inngest/next`)
-- **Database & Auth**: PostgreSQL (Supabase), Row Level Security (RLS), raw `pg.Pool`
-- **State Management**: TanStack Query v5, Zustand v5
-- **Validation**: React Hook Form, Zod
-- **AI & Video Processing**: Google Gemini 2.5 Flash (`@google/generative-ai`), `youtube-transcript`
-- **Observability**: Prometheus (`prom-client`), Structured JSON logging
+| Layer | Technologies |
+| :--- | :--- |
+| **Framework & UI** | Next.js 16.3 (App Router, Turbopack), React 19, TypeScript 5, Tailwind CSS |
+| **State & Polling** | TanStack Query v5, Zustand v5, React Hook Form, Zod |
+| **Durable Execution** | Inngest (`inngest`, `inngest/next`) |
+| **Database & Auth** | PostgreSQL 16 (Supabase), Row Level Security (RLS), `pg` connection pool |
+| **AI & Transcripts** | Google Gemini 2.5 Flash (`@google/generative-ai`), Supadata API, `youtube-transcript` |
+| **Observability** | Prometheus (`prom-client`), Grafana, `@sentry/nextjs`, structured JSON logging |
+| **Testing** | Vitest, Playwright, Docker Compose |
+
+---
+
+## Project Documentation
+
+Detailed technical documentation is available in the `docs/` directory:
+
+- 📖 **[Architecture Guide](docs/architecture.md)**: Deep dive into synchronous ingestion vs. durable execution, Mermaid architecture and sequence diagrams, database schema, RLS policies, distributed idempotency, and reconciliation.
+- 🛠️ **[Development & Testing Guide](docs/development.md)**: Prerequisites, local setup instructions, environment variables reference, migrations, and running the test suites (unit, integration, RLS, E2E, and observability).
+- 📊 **[Observability & Monitoring Guide](docs/observability.md)**: Prometheus metrics reference, alerting rules, Grafana dashboard panels, process-local scraping limitations in serverless, health checks, and Sentry PII sanitization.
 
 ---
 
 ## Local Development Setup
 
 ### 1. Prerequisites
-- Node.js 20+
-- PostgreSQL database (local or Supabase)
-- Google Gemini API key
+- **Node.js**: `v20.x` or higher
+- **PostgreSQL**: `16.x` (local instance or Supabase)
+- **Docker Compose**: Required for running the Prometheus/Grafana stack and RLS test containers
 
 ### 2. Environment Configuration
-Copy `.env.example` to `.env.local` and set:
+Copy `.env.example` to `.env.local`:
+```bash
+cp .env.example .env.local
+```
+Set your database and API keys:
 ```env
-DATABASE_URL=postgresql://postgres:password@localhost:5432/codenotes
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+DATABASE_URL=postgresql://postgres:postgrespassword@localhost:5432/codenotes
+NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
 GEMINI_API_KEY=your-gemini-api-key
+SUPADATA_API_KEY=your-optional-supadata-key
 ```
 
-### 3. Run Migrations
+### 3. Run Database Migrations
+Apply the idempotent schema migration:
 ```bash
 npm run db:migrate
 ```
 
-### 4. Start Next.js App and Inngest Dev Server
-In terminal 1 (Next.js App):
-```bash
-npm run dev
-```
+### 4. Start Development Servers
+In separate terminal sessions:
 
-In terminal 2 (Inngest Local Dev Server):
 ```bash
+# Terminal 1: Next.js Web App (Turbopack)
+npm run dev
+
+# Terminal 2: Inngest Local Dev Server
 npm run inngest:dev
+
+# Terminal 3 (Optional): Prometheus & Grafana Monitoring Stack
+docker compose -f docker-compose.prometheus.yml up -d
 ```
-The Inngest Dev Server will be available at [http://localhost:8288](http://localhost:8288) to inspect function runs, triggers, and step logs.
+- **App**: [http://localhost:3000](http://localhost:3000)
+- **Inngest Dashboard**: [http://localhost:8288](http://localhost:8288)
+- **Prometheus**: [http://localhost:9090](http://localhost:9090)
+- **Grafana**: [http://localhost:3001](http://localhost:3001) (`admin` / `admin`)
 
 ---
 
-## Quality & Testing
+## Quality & Testing Gates
 
-Run all quality gates:
+CodeNotes enforces automated quality checks covering the full testing pyramid:
 
 ```bash
-# Run unit & integration test suites
+# 1. Run all unit, integration, and sanitizer tests (Vitest)
 npm test
 
-# Run linter
-npm run lint
+# 2. Run PostgreSQL Row Level Security (RLS) integration tests
+# (Requires TEST_DATABASE_URL pointing to isolated local 'codenotes_test' database)
+npm run test:integration:rls
 
-# Run TypeScript type check
+# 3. Validate Prometheus config, alert rules, and Grafana dashboard queries
+npm run validate:observability
+
+# 4. Run deterministic Playwright end-to-end tests
+npm run test:e2e
+
+# 5. Linting and TypeScript type checking
+npm run lint
 npx tsc --noEmit
 
-# Production build
+# 6. Production Next.js build compilation
 npm run build
 ```
+
+---
+
+## API Reference
+
+| Method | Endpoint | Purpose |
+| :--- | :--- | :--- |
+| `POST` | `/api/generate` | Dispatch a note generation job (authenticated, returns 202 Accepted or 200 cached replay) |
+| `GET` | `/api/generate/status` | Poll generation status (`pending`, `processing`, `completed`, `failed`) |
+| `GET/POST/PUT` | `/api/inngest` | Inngest serve handler for serverless step execution and cron schedules |
+| `GET` | `/api/notes` | List saved notes with keyset cursor pagination, search, and sorting |
+| `GET` | `/api/notes/[id]` | Retrieve a single note by UUID (authenticated, RLS-scoped) |
+| `DELETE` | `/api/notes/[id]` | Delete a note by UUID (authenticated, RLS-scoped) |
+| `GET` | `/api/health` | Active database liveness probe (`SELECT 1`) returning connection latency |
+| `GET` | `/api/metrics` | Prometheus metrics endpoint exposing HTTP, pipeline, and AI inference telemetry |
+
+---
+
+## Operational Notes & Boundaries
+
+1. **Process-Local Prometheus Metrics**: The in-memory Prometheus registry in `/api/metrics` reflects metrics for the local Node.js process. In distributed or serverless multi-instance deployments (such as Vercel), scraping process-local memory does not provide global aggregation without an external aggregator like Prometheus Pushgateway or an OpenTelemetry Collector.
+2. **Scrape Availability vs. Database Health**: Prometheus `up{job="codenotes"}` proves only that the HTTP server is responsive and scrapable; active database availability must be verified via the `/api/health` endpoint.
+3. **Optional Error Reporting**: Sentry error tracking is completely optional. If `SENTRY_DSN` is unset, the SDK initializes disabled with zero outbound network calls, and any captured exceptions resolve as safe no-ops.
