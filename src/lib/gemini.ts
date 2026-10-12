@@ -126,7 +126,7 @@ ${transcript}
     recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
     logger.error('gemini_json_parse_failed', {
       errorMessage: String(parseError),
-      rawOutputPreview: cleanedText.slice(0, 200),
+      outputLength: cleanedText.length,
     });
     throw new Error('AI returned malformed data.');
   }
@@ -250,7 +250,7 @@ Return the result strictly as a JSON object matching this schema:
     recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
     logger.error('gemini_json_parse_failed', {
       errorMessage: String(parseError),
-      rawOutputPreview: cleanedText.slice(0, 200),
+      outputLength: cleanedText.length,
     });
     throw new Error('AI returned malformed data.');
   }

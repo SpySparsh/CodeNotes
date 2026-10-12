@@ -201,7 +201,6 @@ export const generateNotesFunction = inngest.createFunction(
       userId,
       idempotencyKey,
       videoId,
-      videoUrl,
     });
 
     // Step 1: Atomic Claim and Idempotency Validation

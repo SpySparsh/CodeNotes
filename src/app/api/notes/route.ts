@@ -164,7 +164,7 @@ export async function GET(request?: Request) {
       durationMs,
       count: notes.length,
       hasMore,
-      search: search || undefined,
+      hasSearch: Boolean(search),
       sort,
       order,
     });
