@@ -249,8 +249,18 @@ export function sanitizePostHogEventBeforeSend<T extends PostHogRawEvent>(
     delete rawProps[unsafeKey];
   }
 
+  const configuredProjectToken = process.env.NEXT_PUBLIC_POSTHOG_KEY?.trim() || null;
+
   // Remove explicit prohibited property keys
   for (const prohibitedKey of PROHIBITED_PROPERTY_KEYS) {
+    if (
+      prohibitedKey === 'token' &&
+      configuredProjectToken &&
+      rawProps.token === configuredProjectToken
+    ) {
+      // Preserve PostHog SDK's required project ingestion token
+      continue;
+    }
     delete rawProps[prohibitedKey];
   }
 

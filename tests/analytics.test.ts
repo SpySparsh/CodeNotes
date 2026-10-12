@@ -183,6 +183,12 @@ describe('PostHog Product Analytics', () => {
       });
     });
 
+    it('strictly forbids user-supplied token property on all events', () => {
+      expect(() => {
+        sanitizeEventProperties('generation_requested', { token: 'phc_valid_project_key_xyz' } as any);
+      }).toThrow(/prohibited property "token"/i);
+    });
+
     it('allows valid duration properties for generation_completed', () => {
       const sanitized = sanitizeEventProperties('generation_completed', {
         duration_ms: 14500,
@@ -297,6 +303,52 @@ describe('PostHog Product Analytics', () => {
       expect(sanitized?.properties?.prompt).toBeUndefined();
       expect(sanitized?.properties?.transcript).toBeUndefined();
       expect(sanitized?.properties?.email).toBeUndefined();
+      expect(sanitized?.properties?.token).toBeUndefined();
+    });
+
+    it('preserves the configured PostHog project token attached by the SDK for ingestion routing', () => {
+      process.env.NEXT_PUBLIC_POSTHOG_KEY = 'phc_valid_project_key_xyz';
+      const rawPayload = {
+        uuid: 'test-uuid-sdk-token',
+        event: '$pageview',
+        properties: {
+          route: '/',
+          token: 'phc_valid_project_key_xyz',
+        },
+      };
+
+      const sanitized = sanitizePostHogEventBeforeSend(rawPayload);
+      expect(sanitized?.properties?.token).toBe('phc_valid_project_key_xyz');
+      expect(sanitized?.properties?.route).toBe('/');
+    });
+
+    it('strips mismatched or unexpected tokens from properties', () => {
+      process.env.NEXT_PUBLIC_POSTHOG_KEY = 'phc_valid_project_key_xyz';
+      const rawPayload = {
+        uuid: 'test-uuid-mismatched-token',
+        event: '$pageview',
+        properties: {
+          route: '/',
+          token: 'phc_other_or_stolen_token',
+        },
+      };
+
+      const sanitized = sanitizePostHogEventBeforeSend(rawPayload);
+      expect(sanitized?.properties?.token).toBeUndefined();
+    });
+
+    it('strips token when NEXT_PUBLIC_POSTHOG_KEY is not configured', () => {
+      delete process.env.NEXT_PUBLIC_POSTHOG_KEY;
+      const rawPayload = {
+        uuid: 'test-uuid-no-env',
+        event: '$pageview',
+        properties: {
+          route: '/',
+          token: 'phc_some_token',
+        },
+      };
+
+      const sanitized = sanitizePostHogEventBeforeSend(rawPayload);
       expect(sanitized?.properties?.token).toBeUndefined();
     });
 
@@ -705,6 +757,7 @@ describe('PostHog Product Analytics', () => {
         'phc_mock_test_key_123',
         expect.objectContaining({
           api_host: 'https://us.i.posthog.com',
+          request_batching: false,
           autocapture: false,
           capture_pageview: false,
           capture_pageleave: false,
@@ -715,6 +768,16 @@ describe('PostHog Product Analytics', () => {
           disable_capture_url_hashes: true,
           before_send: sanitizePostHogEventBeforeSend,
           persistence: 'localStorage',
+        })
+      );
+    });
+
+    it('initPostHog disables request batching to prevent queue starvation during client hydration', () => {
+      initPostHog();
+      expect(posthog.init).toHaveBeenCalledWith(
+        'phc_mock_test_key_123',
+        expect.objectContaining({
+          request_batching: false,
         })
       );
     });

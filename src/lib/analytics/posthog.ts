@@ -57,6 +57,7 @@ export function initPostHog(): void {
 
   posthog.init(apiKey, {
     api_host: apiHost,
+    request_batching: false,
     // Explicitly disable all automatic tracking and session recording
     autocapture: false,
     capture_pageview: false,
