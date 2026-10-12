@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   registry,
   recordHttpRequest,
@@ -218,5 +218,177 @@ describe('Prometheus Metrics Layer', () => {
     expect(metricsText).not.toMatch(/youtube\.com/i);
     expect(metricsText).not.toMatch(/SELECT/i);
     expect(metricsText).not.toMatch(/INSERT/i);
+  });
+});
+
+describe('/api/metrics Route Authentication & Access Controls', () => {
+  const originalEnv = { ...process.env };
+
+  const setEnv = (key: string, val?: string) => {
+    if (val === undefined) {
+      delete process.env[key];
+    } else {
+      (process.env as Record<string, string | undefined>)[key] = val;
+    }
+  };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    registry.resetMetrics();
+  });
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  it('valid Bearer token returns HTTP 200 and Prometheus metrics when authentication is enabled', async () => {
+    setEnv('METRICS_SECRET', 'super-secret-metrics-token-12345');
+    setEnv('NODE_ENV', 'production');
+
+    recordHttpRequest('GET', '/api/notes', 200, 0.05);
+
+    const req = new Request('https://example.com/api/metrics', {
+      headers: {
+        authorization: 'Bearer super-secret-metrics-token-12345',
+      },
+    });
+
+    const res = await getMetrics(req);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe(registry.contentType);
+    expect(res.headers.get('cache-control')).toContain('no-store');
+
+    const body = await res.text();
+    expect(body).toContain('http_requests_total{method="GET",route="/api/notes",status="200"} 1');
+  });
+
+  it('missing token returns HTTP 401 when authentication is enabled', async () => {
+    setEnv('METRICS_SECRET', 'super-secret-metrics-token-12345');
+    setEnv('NODE_ENV', 'production');
+
+    const reqWithoutAuth = new Request('https://example.com/api/metrics');
+    const res = await getMetrics(reqWithoutAuth);
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get('cache-control')).toContain('no-store');
+
+    const body = await res.text();
+    expect(body).not.toContain('super-secret');
+    expect(body).not.toContain('# HELP');
+    expect(body).not.toContain('http_requests_total');
+  });
+
+  it('incorrect token returns HTTP 401 without throwing or leaking secret', async () => {
+    setEnv('METRICS_SECRET', 'super-secret-metrics-token-12345');
+    setEnv('NODE_ENV', 'production');
+
+    // Different length
+    const reqDiffLen = new Request('https://example.com/api/metrics', {
+      headers: { authorization: 'Bearer wrong' },
+    });
+    const resDiffLen = await getMetrics(reqDiffLen);
+    expect(resDiffLen.status).toBe(401);
+    expect(await resDiffLen.text()).not.toContain('# HELP');
+
+    // Same length, wrong characters
+    const reqSameLen = new Request('https://example.com/api/metrics', {
+      headers: { authorization: 'Bearer super-secret-metrics-token-XXXXX' },
+    });
+    const resSameLen = await getMetrics(reqSameLen);
+    expect(resSameLen.status).toBe(401);
+    expect(await resSameLen.text()).not.toContain('# HELP');
+
+    // Empty Bearer token
+    const reqEmpty = new Request('https://example.com/api/metrics', {
+      headers: { authorization: 'Bearer ' },
+    });
+    const resEmpty = await getMetrics(reqEmpty);
+    expect(resEmpty.status).toBe(401);
+  });
+
+  it('missing secret in production returns HTTP 503 and no metrics', async () => {
+    setEnv('METRICS_SECRET', undefined);
+    setEnv('NODE_ENV', 'production');
+
+    const req = new Request('https://example.com/api/metrics', {
+      headers: { authorization: 'Bearer some-random-token' },
+    });
+    const res = await getMetrics(req);
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get('cache-control')).toContain('no-store');
+
+    const body = await res.text();
+    expect(body).not.toContain('# HELP');
+    expect(body).not.toContain('http_requests_total');
+  });
+
+  it('missing secret in preview deployment returns HTTP 503 and no metrics', async () => {
+    setEnv('METRICS_SECRET', undefined);
+    setEnv('NODE_ENV', 'development');
+    setEnv('VERCEL_ENV', 'preview');
+
+    const req = new Request('https://example.com/api/metrics');
+    const res = await getMetrics(req);
+
+    expect(res.status).toBe(503);
+    const body = await res.text();
+    expect(body).not.toContain('# HELP');
+  });
+
+  it('development mode without a secret preserves the local test workflow', async () => {
+    setEnv('METRICS_SECRET', undefined);
+    setEnv('VERCEL_ENV', undefined);
+    setEnv('NODE_ENV', 'development');
+
+    recordHttpRequest('GET', '/api/health', 200, 0.01);
+
+    // Call without authorization header
+    const req = new Request('https://example.com/api/metrics');
+    const res = await getMetrics(req);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe(registry.contentType);
+    expect(res.headers.get('cache-control')).toContain('no-store');
+
+    const body = await res.text();
+    expect(body).toContain('# HELP http_requests_total');
+  });
+
+  it('development mode with a configured secret requires authentication', async () => {
+    setEnv('METRICS_SECRET', 'local-dev-secret');
+    setEnv('VERCEL_ENV', undefined);
+    setEnv('NODE_ENV', 'development');
+
+    // Unauthenticated request should be rejected even in development if secret is configured
+    const reqWithoutAuth = new Request('https://example.com/api/metrics');
+    const resWithoutAuth = await getMetrics(reqWithoutAuth);
+    expect(resWithoutAuth.status).toBe(401);
+
+    // Authenticated request succeeds
+    const reqWithAuth = new Request('https://example.com/api/metrics', {
+      headers: { authorization: 'Bearer local-dev-secret' },
+    });
+    const resWithAuth = await getMetrics(reqWithAuth);
+    expect(resWithAuth.status).toBe(200);
+  });
+
+  it('error responses contain no secret or metrics payload', async () => {
+    const sensitiveSecret = 'super-sensitive-secret-value-never-leak';
+    setEnv('METRICS_SECRET', sensitiveSecret);
+    setEnv('NODE_ENV', 'production');
+
+    const res401 = await getMetrics(new Request('https://example.com/api/metrics'));
+    const body401 = await res401.text();
+    expect(body401).not.toContain(sensitiveSecret);
+    expect(body401).not.toContain('# HELP');
+    expect(body401).not.toContain('codenotes');
+
+    setEnv('METRICS_SECRET', undefined);
+    const res503 = await getMetrics(new Request('https://example.com/api/metrics'));
+    const body503 = await res503.text();
+    expect(body503).not.toContain(sensitiveSecret);
+    expect(body503).not.toContain('# HELP');
+    expect(body503).not.toContain('codenotes');
   });
 });
