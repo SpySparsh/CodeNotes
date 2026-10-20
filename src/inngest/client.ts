@@ -1,4 +1,6 @@
-import { Inngest } from 'inngest';
+import { Inngest, Middleware } from 'inngest';
+import { extendedTracesMiddleware } from 'inngest/experimental';
+import { flushTracing } from '@/lib/tracing';
 
 export interface NoteGenerateEventData {
   userId: string;
@@ -13,13 +15,33 @@ export type Events = {
   };
 };
 
-export const inngest = new Inngest({
-  id: 'codenotes',
-  isDev: process.env.NODE_ENV !== 'production' || process.env.INNGEST_DEV === '1',
-  checkpointing: {
-    maxRuntime: '240s',
-  },
-});
+class TracingFlushMiddleware extends Middleware.BaseMiddleware {
+  id = 'codenotes:tracing-flush';
+
+  async wrapRequest({ next }: any) {
+    return next().finally(async () => {
+      await flushTracing();
+    });
+  }
+}
+
+const globalForInngest = globalThis as unknown as { inngestClient?: Inngest };
+
+export const inngest =
+  globalForInngest.inngestClient ??
+  new Inngest({
+    id: 'codenotes',
+    isDev: process.env.NODE_ENV !== 'production' || process.env.INNGEST_DEV === '1',
+    checkpointing: {
+      maxRuntime: '240s',
+    },
+    middleware: [
+      extendedTracesMiddleware({ behaviour: 'off' }),
+      TracingFlushMiddleware,
+    ],
+  });
+
+globalForInngest.inngestClient = inngest;
 
 /**
  * Generates a deterministic event ID to prevent duplicate event ingestion in Inngest.

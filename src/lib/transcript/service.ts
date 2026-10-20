@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import { query } from '@/lib/db';
 import { recordTranscriptRequest, recordTranscriptDuration } from '@/lib/metrics';
+import { withSpan } from '@/lib/tracing';
 import { TranscriptError, TranscriptResult } from './types';
 import { canonicalizeYouTubeUrl, extractVideoId, validateYouTubeUrl } from './canonicalize';
 import { fetchSupadataTranscript } from './supadata';
@@ -33,12 +34,21 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
 
   // 1. Shared Cache Lookup (Fail-open)
   try {
-    const cacheRes = await query(
-      `SELECT transcript_text, language, provider
-       FROM youtube_transcripts
-       WHERE video_id = $1`,
-      [videoId]
-    );
+    const cacheRes = await withSpan('transcript.cache_lookup', async (span) => {
+      const res = await query(
+        `SELECT transcript_text, language, provider
+         FROM youtube_transcripts
+         WHERE video_id = $1`,
+        [videoId]
+      );
+      const isHit = res.rows.length > 0;
+      span.setAttribute('cache_hit', isHit);
+      if (isHit) {
+        span.setAttribute('provider', res.rows[0].provider || 'cache');
+        span.setAttribute('output_length', res.rows[0].transcript_text?.length || 0);
+      }
+      return res;
+    });
 
     if (cacheRes.rows.length > 0) {
       const cachedRow = cacheRes.rows[0];
@@ -88,7 +98,13 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
   // 3. Primary Provider: Supadata
   const supadataStart = performance.now();
   try {
-    const result = await fetchSupadataTranscript(canonicalUrl);
+    const result = await withSpan('transcript.fetch_primary', async (span) => {
+      span.setAttribute('provider', 'supadata');
+      const res = await fetchSupadataTranscript(canonicalUrl);
+      span.setAttribute('status', 'success');
+      span.setAttribute('output_length', res.text.length);
+      return res;
+    });
     recordTranscriptRequest('supadata', 'success');
     logger.info('transcript_acquisition_success', {
       videoId,
@@ -129,7 +145,13 @@ export async function acquireTranscript(url: string): Promise<TranscriptResult> 
   if (!acquiredResult) {
     const fallbackStart = performance.now();
     try {
-      const result = await fetchYouTubeTranscriptScraper(canonicalUrl);
+      const result = await withSpan('transcript.fetch_fallback', async (span) => {
+        span.setAttribute('provider', 'youtube-transcript');
+        const res = await fetchYouTubeTranscriptScraper(canonicalUrl);
+        span.setAttribute('status', 'success');
+        span.setAttribute('output_length', res.text.length);
+        return res;
+      });
       recordTranscriptRequest('youtube_transcript_fallback', 'success');
       logger.info('transcript_acquisition_success', {
         videoId,
@@ -210,15 +232,22 @@ export async function extractVideoTitle(url: string): Promise<string> {
   }
 
   try {
-    const canonical = canonicalizeYouTubeUrl(url);
-    const response = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(canonical)}`, {
-      signal: AbortSignal.timeout(4000),
+    return await withSpan('transcript.fetch_title', async (span) => {
+      span.setAttribute('provider', 'noembed');
+      const canonical = canonicalizeYouTubeUrl(url);
+      const response = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(canonical)}`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) {
+        span.setAttribute('status', 'fallback');
+        return 'Unknown Video';
+      }
+      const data = await response.json();
+      const title = data.title || 'Unknown Video';
+      span.setAttribute('status', 'success');
+      span.setAttribute('output_length', title.length);
+      return title;
     });
-    if (!response.ok) {
-      return 'Unknown Video';
-    }
-    const data = await response.json();
-    return data.title || 'Unknown Video';
   } catch (error: any) {
     logger.warn('noembed_fetch_failed', { errorMessage: error?.message });
     return 'Unknown Video';

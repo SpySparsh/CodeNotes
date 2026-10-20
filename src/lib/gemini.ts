@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import { logger } from '@/lib/logger';
 import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
+import { withSpan } from '@/lib/tracing';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
 const genAI = new GoogleGenerativeAI(apiKey);
@@ -91,8 +92,14 @@ ${transcript}
   let rawText = '';
 
   try {
-    const result = await model.generateContent(prompt);
-    rawText = result.response.text();
+    rawText = await withSpan('ai.gemini_generate', async (span) => {
+      span.setAttribute('model', GEMINI_MODEL);
+      const result = await model.generateContent(prompt);
+      const text = result.response.text();
+      span.setAttribute('status', 'success');
+      span.setAttribute('output_length', text.length);
+      return text;
+    });
   } catch (error: any) {
     recordAiRequest(GEMINI_MODEL, 'error');
     recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
@@ -112,12 +119,18 @@ ${transcript}
   }
 
   let cleanedText = rawText;
-  if (cleanedText.startsWith('```json')) {
-    cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
-  }
 
   try {
-    const parsedData = JSON.parse(cleanedText) as GeneratedNotes;
+    const parsedData = await withSpan('ai.json_parse', async (span) => {
+      span.setAttribute('model', GEMINI_MODEL);
+      if (cleanedText.startsWith('```json')) {
+        cleanedText = cleanedText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '').trim();
+      }
+      span.setAttribute('output_length', cleanedText.length);
+      const data = JSON.parse(cleanedText) as GeneratedNotes;
+      span.setAttribute('status', 'success');
+      return data;
+    });
     recordAiRequest(GEMINI_MODEL, 'success');
     recordAiDuration(GEMINI_MODEL, (performance.now() - startTime) / 1000);
     return parsedData;

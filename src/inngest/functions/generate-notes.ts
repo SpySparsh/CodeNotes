@@ -16,6 +16,7 @@ import {
   recordGenerationStageDuration,
   recordGenerationDuration,
 } from '@/lib/metrics';
+import { withSpan } from '@/lib/tracing';
 import * as Sentry from '@sentry/nextjs';
 
 export function classifyError(error: any): { isUnrecoverable: boolean; code: string; message: string } {
@@ -379,48 +380,53 @@ export const generateNotesFunction = inngest.createFunction(
 
         let createdAtEpochMs: number | null = null;
 
-        await withUserTransaction(userId, async (client) => {
-          // Re-check status inside transaction with row lock to avoid race conditions
-          const checkRes = await client.query(
-            `SELECT status, note_id, created_at FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
-            [userId, idempotencyKey]
-          );
+        await withSpan('db.persist_notes_transaction', async (span) => {
+          span.setAttribute('operation', 'persist_notes');
+          await withUserTransaction(userId, async (client) => {
+            // Re-check status inside transaction with row lock to avoid race conditions
+            const checkRes = await client.query(
+              `SELECT status, note_id, created_at FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
+              [userId, idempotencyKey]
+            );
 
-          if (checkRes.rows.length > 0) {
-            createdAtEpochMs = checkRes.rows[0].created_at ? new Date(checkRes.rows[0].created_at).getTime() : null;
-            if (checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
-              return;
+            if (checkRes.rows.length > 0) {
+              createdAtEpochMs = checkRes.rows[0].created_at ? new Date(checkRes.rows[0].created_at).getTime() : null;
+              if (checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
+                span.setAttribute('status', 'skipped_already_completed');
+                return;
+              }
             }
-          }
 
-          await client.query(
-            `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [
-              noteId,
-              userId,
-              mediaData.resolvedVideoId,
-              mediaData.videoTitle,
-              videoUrl,
-              thumbnailUrl,
-              generatedNotes.aiNotes.overview,
-              generatedNotes.aiNotes.keyConcepts,
-              generatedNotes.aiNotes.detailedNotes,
-              generatedNotes.aiNotes.shorthands,
-            ]
-          );
+            await client.query(
+              `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                noteId,
+                userId,
+                mediaData.resolvedVideoId,
+                mediaData.videoTitle,
+                videoUrl,
+                thumbnailUrl,
+                generatedNotes.aiNotes.overview,
+                generatedNotes.aiNotes.keyConcepts,
+                generatedNotes.aiNotes.detailedNotes,
+                generatedNotes.aiNotes.shorthands,
+              ]
+            );
 
-          await client.query(
-            `UPDATE generation_idempotency
-             SET status = 'completed',
-                 note_id = $3,
-                 error_message = NULL,
-                 error_code = NULL,
-                 lease_until = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE user_id = $1 AND key = $2`,
-            [userId, idempotencyKey, noteId]
-          );
+            await client.query(
+              `UPDATE generation_idempotency
+               SET status = 'completed',
+                   note_id = $3,
+                   error_message = NULL,
+                   error_code = NULL,
+                   lease_until = NULL,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE user_id = $1 AND key = $2`,
+              [userId, idempotencyKey, noteId]
+            );
+          });
+          span.setAttribute('status', 'success');
         });
 
         recordGenerationJob('completed');

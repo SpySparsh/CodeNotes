@@ -10,6 +10,9 @@ const nextConfig = {
   turbopack: {
     root: __dirname,
   },
+  serverExternalPackages: [
+    'inngest',
+  ],
 };
 
 export default withSentryConfig(nextConfig, {
