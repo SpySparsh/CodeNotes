@@ -56,6 +56,15 @@ vi.mock('@sentry/nextjs', () => ({
   flush: vi.fn().mockResolvedValue(true),
   getClient: vi.fn(() => null),
   init: vi.fn(),
+  startSpan: vi.fn((_opts: any, cb: any) =>
+    cb({
+      setAttribute: vi.fn(),
+      setAttributes: vi.fn(),
+      setStatus: vi.fn(),
+      end: vi.fn(),
+    })
+  ),
+  setHttpStatus: vi.fn(),
 }));
 
 import { generateNotes, GEMINI_MODEL } from '@/lib/gemini';

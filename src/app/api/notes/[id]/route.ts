@@ -4,19 +4,25 @@ import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
 import { recordHttpRequest } from '@/lib/metrics';
 import { requireUser, UnauthorizedError } from '@/lib/auth';
+import { withSentryRouteSpan, withSentryChildSpan } from '@/lib/sentry-tracing';
 
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const startTime = performance.now();
-  const requestId = getRequestId(request);
+  return withSentryRouteSpan(
+    { name: 'GET /api/notes/[id]', method: 'GET', route: '/api/notes/[id]' },
+    async () => {
+      const startTime = performance.now();
+      const requestId = getRequestId(request);
 
-  try {
-    const user = await requireUser();
-    const { id } = await params;
-    const result = await query('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [id, user.id]);
-    const durationMs = performance.now() - startTime;
+      try {
+        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const { id } = await params;
+        const result = await withSentryChildSpan('db.query_note_by_id', { op: 'db' }, () =>
+          query('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
+        );
+        const durationMs = performance.now() - startTime;
 
     if (result.rows.length === 0) {
       recordHttpRequest('GET', '/api/notes/[id]', 404, durationMs / 1000);
@@ -101,87 +107,96 @@ export async function GET(
       { status: 500, headers: { 'x-request-id': requestId } }
     );
   }
+    }
+  );
 }
 
 export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const startTime = performance.now();
-  const requestId = getRequestId(request);
+  return withSentryRouteSpan(
+    { name: 'DELETE /api/notes/[id]', method: 'DELETE', route: '/api/notes/[id]' },
+    async () => {
+      const startTime = performance.now();
+      const requestId = getRequestId(request);
 
-  try {
-    const user = await requireUser();
-    const { id } = await params;
-    const result = await query('DELETE FROM notes WHERE id = $1 AND user_id = $2', [id, user.id]);
-    const durationMs = performance.now() - startTime;
+      try {
+        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const { id } = await params;
+        const result = await withSentryChildSpan('db.delete_note', { op: 'db' }, () =>
+          query('DELETE FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
+        );
+        const durationMs = performance.now() - startTime;
 
-    if (result.rowCount === 0) {
-      recordHttpRequest('DELETE', '/api/notes/[id]', 404, durationMs / 1000);
-      logger.warn('delete_note_not_found', {
-        requestId,
-        userId: user.id,
-        method: 'DELETE',
-        path: `/api/notes/${id}`,
-        status: 404,
-        durationMs,
-        noteId: id,
-      });
+        if (result.rowCount === 0) {
+          recordHttpRequest('DELETE', '/api/notes/[id]', 404, durationMs / 1000);
+          logger.warn('delete_note_not_found', {
+            requestId,
+            userId: user.id,
+            method: 'DELETE',
+            path: `/api/notes/${id}`,
+            status: 404,
+            durationMs,
+            noteId: id,
+          });
 
-      return NextResponse.json(
-        { error: 'Note not found' },
-        { status: 404, headers: { 'x-request-id': requestId } }
-      );
+          return NextResponse.json(
+            { error: 'Note not found' },
+            { status: 404, headers: { 'x-request-id': requestId } }
+          );
+        }
+
+        recordHttpRequest('DELETE', '/api/notes/[id]', 200, durationMs / 1000);
+        logger.info('delete_note_completed', {
+          requestId,
+          userId: user.id,
+          method: 'DELETE',
+          path: `/api/notes/${id}`,
+          status: 200,
+          durationMs,
+          noteId: id,
+        });
+
+        return NextResponse.json(
+          { success: true },
+          { headers: { 'x-request-id': requestId } }
+        );
+      } catch (error: any) {
+        const durationMs = performance.now() - startTime;
+
+        if (error instanceof UnauthorizedError || error.name === 'UnauthorizedError') {
+          recordHttpRequest('DELETE', '/api/notes/[id]', 401, durationMs / 1000);
+          logger.warn('delete_note_unauthorized', {
+            requestId,
+            method: 'DELETE',
+            path: '/api/notes/[id]',
+            status: 401,
+            durationMs,
+          });
+
+          return NextResponse.json(
+            { error: 'Unauthorized' },
+            { status: 401, headers: { 'x-request-id': requestId } }
+          );
+        }
+
+        recordHttpRequest('DELETE', '/api/notes/[id]', 500, durationMs / 1000);
+        logger.error('delete_note_failed', {
+          requestId,
+          method: 'DELETE',
+          path: '/api/notes/[id]',
+          status: 500,
+          durationMs,
+          errorMessage: error.message || 'Unknown error',
+          errorStack: error.stack,
+        });
+
+        return NextResponse.json(
+          { error: 'Failed to delete the note' },
+          { status: 500, headers: { 'x-request-id': requestId } }
+        );
+      }
     }
-
-    recordHttpRequest('DELETE', '/api/notes/[id]', 200, durationMs / 1000);
-    logger.info('delete_note_completed', {
-      requestId,
-      userId: user.id,
-      method: 'DELETE',
-      path: `/api/notes/${id}`,
-      status: 200,
-      durationMs,
-      noteId: id,
-    });
-
-    return NextResponse.json(
-      { success: true },
-      { headers: { 'x-request-id': requestId } }
-    );
-  } catch (error: any) {
-    const durationMs = performance.now() - startTime;
-
-    if (error instanceof UnauthorizedError || error.name === 'UnauthorizedError') {
-      recordHttpRequest('DELETE', '/api/notes/[id]', 401, durationMs / 1000);
-      logger.warn('delete_note_unauthorized', {
-        requestId,
-        method: 'DELETE',
-        path: '/api/notes/[id]',
-        status: 401,
-        durationMs,
-      });
-
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401, headers: { 'x-request-id': requestId } }
-      );
-    }
-
-    recordHttpRequest('DELETE', '/api/notes/[id]', 500, durationMs / 1000);
-    logger.error('delete_note_failed', {
-      requestId,
-      method: 'DELETE',
-      path: '/api/notes/[id]',
-      status: 500,
-      durationMs,
-      errorMessage: error.message || 'Unknown error',
-      errorStack: error.stack,
-    });
-
-    return NextResponse.json(
-      { error: 'Failed to delete the note' },
-      { status: 500, headers: { 'x-request-id': requestId } }
-    );
-  }
+  );
 }

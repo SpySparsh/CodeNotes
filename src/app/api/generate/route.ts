@@ -9,17 +9,21 @@ import { requireUser, UnauthorizedError } from '@/lib/auth';
 import { inngest, generateDeterministicEventId } from '@/inngest/client';
 import { generateUrlSchema } from '@/lib/validations/generate';
 import { checkRateLimit } from '@/lib/rate-limit';
+import { withSentryRouteSpan, withSentryChildSpan } from '@/lib/sentry-tracing';
 
 export const STALE_IDEMPOTENCY_THRESHOLD_MS = 120000;
 
 export async function POST(request: Request) {
-  const startTime = performance.now();
-  const requestId = getRequestId(request);
-  let authenticatedUserId: string | null = null;
+  return withSentryRouteSpan(
+    { name: 'POST /api/generate', method: 'POST', route: '/api/generate' },
+    async (span) => {
+      const startTime = performance.now();
+      const requestId = getRequestId(request);
+      let authenticatedUserId: string | null = null;
 
-  try {
-    const user = await requireUser();
-    authenticatedUserId = user.id;
+      try {
+        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        authenticatedUserId = user.id;
 
     const body = await request.json().catch(() => ({}));
     const parseResult = generateUrlSchema.safeParse(body);
@@ -66,10 +70,14 @@ export async function POST(request: Request) {
     }
 
     // Rate limiting: 5 generation requests per user per 60-second window
-    const rateLimit = await checkRateLimit({
-      key: `generate:${authenticatedUserId}`,
-      limit: 5,
-      windowSeconds: 60,
+    const rateLimit = await withSentryChildSpan('rate_limit.check', { op: 'rate_limit' }, async (childSpan) => {
+      const res = await checkRateLimit({
+        key: `generate:${authenticatedUserId}`,
+        limit: 5,
+        windowSeconds: 60,
+      });
+      childSpan.setAttribute('rate_limit.allowed', res.allowed);
+      return res;
     });
 
     if (!rateLimit.allowed) {
@@ -106,11 +114,13 @@ export async function POST(request: Request) {
     const eventId = generateDeterministicEventId(authenticatedUserId, idempotencyKey);
 
     // Check existing idempotency state
-    const existing = await query(
-      `SELECT status, video_id, video_url, note_id, error_message, error_code, created_at, updated_at
-       FROM generation_idempotency
-       WHERE user_id = $1 AND key = $2`,
-      [authenticatedUserId, idempotencyKey]
+    const existing = await withSentryChildSpan('db.idempotency_lookup', { op: 'db' }, () =>
+      query(
+        `SELECT status, video_id, video_url, note_id, error_message, error_code, created_at, updated_at
+         FROM generation_idempotency
+         WHERE user_id = $1 AND key = $2`,
+        [authenticatedUserId, idempotencyKey]
+      )
     );
 
     if (existing.rows.length > 0) {
@@ -138,6 +148,7 @@ export async function POST(request: Request) {
 
       // 1. If completed: return cached noteId directly
       if (row.status === 'completed' && row.note_id) {
+        span.setAttribute('operation.status', 'replayed');
         const durationMs = performance.now() - startTime;
         recordHttpRequest('POST', '/api/generate', 200, durationMs / 1000);
         recordGenerationJob('replayed');
@@ -177,16 +188,18 @@ export async function POST(request: Request) {
           );
 
           try {
-            await inngest.send({
-              name: 'notes/generate.requested',
-              id: eventId,
-              data: {
-                userId: authenticatedUserId,
-                idempotencyKey,
-                videoId,
-                videoUrl: url,
-              },
-            });
+            await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
+              inngest.send({
+                name: 'notes/generate.requested',
+                id: eventId,
+                data: {
+                  userId: authenticatedUserId,
+                  idempotencyKey,
+                  videoId,
+                  videoUrl: url,
+                },
+              })
+            );
           } catch (sendErr: any) {
             logger.warn('generation_stale_requeue_deferred', {
               eventId,
@@ -195,6 +208,7 @@ export async function POST(request: Request) {
             });
           }
 
+          span.setAttribute('operation.status', 'stale_requeued');
           const durationMs = performance.now() - startTime;
           recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
           recordGenerationJob('started');
@@ -218,6 +232,7 @@ export async function POST(request: Request) {
         }
 
         // Fresh pending/processing job in flight: return existing job info
+        span.setAttribute('operation.status', 'in_progress');
         const durationMs = performance.now() - startTime;
         recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
         logger.info('generation_idempotency_in_progress', {
@@ -255,16 +270,18 @@ export async function POST(request: Request) {
         );
 
         try {
-          await inngest.send({
-            name: 'notes/generate.requested',
-            id: eventId,
-            data: {
-              userId: authenticatedUserId,
-              idempotencyKey,
-              videoId,
-              videoUrl: url,
-            },
-          });
+          await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
+            inngest.send({
+              name: 'notes/generate.requested',
+              id: eventId,
+              data: {
+                userId: authenticatedUserId,
+                idempotencyKey,
+                videoId,
+                videoUrl: url,
+              },
+            })
+          );
         } catch (sendErr: any) {
           logger.warn('generation_retry_enqueue_deferred', {
             eventId,
@@ -273,6 +290,7 @@ export async function POST(request: Request) {
           });
         }
 
+        span.setAttribute('operation.status', 'retry_queued');
         const durationMs = performance.now() - startTime;
         recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
         recordGenerationJob('started');
@@ -299,16 +317,18 @@ export async function POST(request: Request) {
     );
 
     try {
-      await inngest.send({
-        name: 'notes/generate.requested',
-        id: eventId,
-        data: {
-          userId: authenticatedUserId,
-          idempotencyKey,
-          videoId,
-          videoUrl: url,
-        },
-      });
+      await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
+        inngest.send({
+          name: 'notes/generate.requested',
+          id: eventId,
+          data: {
+            userId: authenticatedUserId,
+            idempotencyKey,
+            videoId,
+            videoUrl: url,
+          },
+        })
+      );
     } catch (inngestErr: any) {
       // Retain the durable PostgreSQL pending record. Do NOT delete it.
       // The background Inngest cron reconciler ensures crash-safe recovery.
@@ -320,6 +340,7 @@ export async function POST(request: Request) {
       });
     }
 
+    span.setAttribute('operation.status', 'job_queued');
     const durationMs = performance.now() - startTime;
     recordHttpRequest('POST', '/api/generate', 202, durationMs / 1000);
     recordGenerationJob('started');
@@ -381,4 +402,6 @@ export async function POST(request: Request) {
       { status: 500, headers: { 'x-request-id': requestId } }
     );
   }
+    }
+  );
 }

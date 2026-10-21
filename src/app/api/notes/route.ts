@@ -11,13 +11,17 @@ import {
   SortField,
   SortOrder,
 } from '@/lib/validations/notes';
+import { withSentryRouteSpan, withSentryChildSpan } from '@/lib/sentry-tracing';
 
 export async function GET(request?: Request) {
-  const startTime = performance.now();
-  const requestId = getRequestId(request);
+  return withSentryRouteSpan(
+    { name: 'GET /api/notes', method: 'GET', route: '/api/notes' },
+    async (span) => {
+      const startTime = performance.now();
+      const requestId = getRequestId(request);
 
-  try {
-    const user = await requireUser();
+      try {
+        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
 
     // Parse URL search parameters
     const url = request ? new URL(request.url) : new URL('http://localhost/api/notes');
@@ -45,6 +49,11 @@ export async function GET(request?: Request) {
     }
 
     const { cursor, limit, search, sort, order } = parsedQuery.data;
+
+    span.setAttribute('notes.sort_field', sort);
+    span.setAttribute('notes.sort_order', order);
+    span.setAttribute('notes.is_search_applied', Boolean(search));
+    span.setAttribute('notes.has_cursor', Boolean(cursor));
 
     // Decode and validate cursor if present
     let decodedCursor: { sortValue: string; id: string; sortField: SortField; sortOrder: SortOrder } | null = null;
@@ -124,7 +133,9 @@ export async function GET(request?: Request) {
       LIMIT $${limitParamIdx}
     `;
 
-    const result = await query(queryString, sqlParams);
+    const result = await withSentryChildSpan('db.query_notes_keyset', { op: 'db' }, () =>
+      query(queryString, sqlParams)
+    );
     const hasMore = result.rows.length > limit;
     const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
 
@@ -152,6 +163,8 @@ export async function GET(request?: Request) {
       overview: row.overview,
       createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
     }));
+
+    span.setAttribute('notes.returned_count', notes.length);
 
     const durationMs = performance.now() - startTime;
     recordHttpRequest('GET', '/api/notes', 200, durationMs / 1000);
@@ -208,4 +221,6 @@ export async function GET(request?: Request) {
       { status: 500, headers: { 'x-request-id': requestId } }
     );
   }
+    }
+  );
 }
