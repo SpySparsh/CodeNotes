@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { mockStartSpan, mockSetHttpStatus, capturedSpans } = vi.hoisted(() => {
+const { mockStartSpan, mockSetHttpStatus, capturedSpans, mockClient } = vi.hoisted(() => {
   const capturedSpans: any[] = [];
+  const mockClient = {
+    flush: vi.fn().mockResolvedValue(true),
+  };
   const mockStartSpan = vi.fn((options: any, callback: any) => {
     const spanObj: any = {
       name: options.name,
@@ -30,7 +33,7 @@ const { mockStartSpan, mockSetHttpStatus, capturedSpans } = vi.hoisted(() => {
       span.setAttribute('http.response.status_code', status);
     }
   });
-  return { mockStartSpan, mockSetHttpStatus, capturedSpans };
+  return { mockStartSpan, mockSetHttpStatus, capturedSpans, mockClient };
 });
 
 vi.mock('@sentry/nextjs', async (importOriginal) => {
@@ -39,6 +42,7 @@ vi.mock('@sentry/nextjs', async (importOriginal) => {
     ...actual,
     startSpan: mockStartSpan,
     setHttpStatus: mockSetHttpStatus,
+    getClient: vi.fn(() => mockClient),
   };
 });
 

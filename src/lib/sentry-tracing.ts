@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/nextjs';
 import type { Span } from '@sentry/nextjs';
+import { after } from 'next/server';
 import { isProhibitedAttribute, sanitizeErrorMessage } from '@/lib/tracing';
 import { isSensitiveKey, sanitizeText } from '@/lib/sentry/sanitizer';
 
@@ -145,8 +146,39 @@ export interface RouteSpanOptions {
 }
 
 /**
+ * Flushes pending Sentry telemetry at the completion of a root route handler.
+ * In Next.js route handlers, uses `after()` from `next/server` to schedule the bounded
+ * flush after the response finishes streaming, avoiding response latency while guaranteeing
+ * that serverless runtimes keep the container alive until flush completion.
+ * Outside a Next.js request context (such as test suites or local utility scripts),
+ * safely falls back to directly awaiting the bounded flush.
+ * Ensures flush failures are isolated and never mask application responses or errors.
+ */
+export async function scheduleOrAwaitSentryFlush(timeoutMs = 2000): Promise<void> {
+  const client = Sentry.getClient();
+  if (!client) return;
+
+  const flushTelemetry = async () => {
+    try {
+      await Promise.resolve(client.flush(timeoutMs)).catch(() => false);
+    } catch {
+      // Defensively isolate background flush failure
+    }
+  };
+
+  try {
+    // When invoked within a Next.js request context (route handlers), schedule after response
+    after(flushTelemetry);
+  } catch {
+    // Outside a Next.js request scope (e.g. tests or scripts), await bounded flush directly
+    await flushTelemetry();
+  }
+}
+
+/**
  * Wraps an HTTP route handler execution in a root Sentry transaction span.
- * Guarantees proper status recording, error propagation, and sensitive data exclusion.
+ * Guarantees proper status recording, error propagation, sensitive data exclusion,
+ * and lifecycle-aware bounded flushing on serverless and local runtimes.
  */
 export async function withSentryRouteSpan<T extends { status?: number }>(
   options: RouteSpanOptions,
@@ -170,43 +202,53 @@ export async function withSentryRouteSpan<T extends { status?: number }>(
     '[id]'
   );
 
-  return Sentry.startSpan(
-    {
-      name: safeName,
-      op: 'http.server',
-      forceTransaction: true,
-      attributes: {
-        'http.method': options.method,
-        'http.route': options.route,
+  let response: T;
+  try {
+    response = await Sentry.startSpan(
+      {
+        name: safeName,
+        op: 'http.server',
+        forceTransaction: true,
+        parentSpan: null,
+        attributes: {
+          'http.method': options.method,
+          'http.route': options.route,
+        },
       },
-    },
-    async (rawSpan) => {
-      const safeSpan = createSafeSentrySpan(rawSpan);
-      try {
-        const response = await fn(safeSpan);
-        const status = typeof response?.status === 'number' ? response.status : 200;
-        safeSpan.setAttribute('http.status_code', status);
-        if (typeof Sentry.setHttpStatus === 'function') {
-          Sentry.setHttpStatus(rawSpan, status);
+      async (rawSpan) => {
+        const safeSpan = createSafeSentrySpan(rawSpan);
+        try {
+          const res = await fn(safeSpan);
+          const status = typeof res?.status === 'number' ? res.status : 200;
+          safeSpan.setAttribute('http.status_code', status);
+          if (typeof Sentry.setHttpStatus === 'function') {
+            Sentry.setHttpStatus(rawSpan, status);
+          }
+          if (status >= 500) {
+            safeSpan.setStatus({ code: 2, message: 'internal_error' });
+          }
+          return res;
+        } catch (error: any) {
+          const safeMessage = sanitizeErrorMessage(error?.message);
+          safeSpan.setAttribute('http.status_code', 500);
+          if (typeof Sentry.setHttpStatus === 'function') {
+            Sentry.setHttpStatus(rawSpan, 500);
+          }
+          safeSpan.setStatus({
+            code: 2,
+            message: safeMessage,
+          });
+          throw error;
         }
-        if (status >= 500) {
-          safeSpan.setStatus({ code: 2, message: 'internal_error' });
-        }
-        return response;
-      } catch (error: any) {
-        const safeMessage = sanitizeErrorMessage(error?.message);
-        safeSpan.setAttribute('http.status_code', 500);
-        if (typeof Sentry.setHttpStatus === 'function') {
-          Sentry.setHttpStatus(rawSpan, 500);
-        }
-        safeSpan.setStatus({
-          code: 2,
-          message: safeMessage,
-        });
-        throw error;
       }
-    }
-  );
+    );
+  } finally {
+    // Root span has ended in Sentry.startSpan's internal finally.
+    // Streamed spans are now buffered; schedule or await the bounded flush.
+    await scheduleOrAwaitSentryFlush();
+  }
+
+  return response;
 }
 
 export interface ChildSpanOptions {
