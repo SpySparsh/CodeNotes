@@ -19,6 +19,22 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
   let dbQuerySpy: any;
   let inngestSendSpy: any;
 
+  function getCapturedEventItems(envelopes: any[]): Array<[any, any]> {
+    return envelopes.flatMap((envelope) => {
+      const items = Array.isArray(envelope) ? envelope[1] : [];
+      if (!Array.isArray(items)) return [];
+      return items.filter((item: any) => item?.[0]?.type === 'event');
+    });
+  }
+
+  function getCapturedNonEventItems(envelopes: any[]): Array<[any, any]> {
+    return envelopes.flatMap((envelope) => {
+      const items = Array.isArray(envelope) ? envelope[1] : [];
+      if (!Array.isArray(items)) return [];
+      return items.filter((item: any) => item?.[0]?.type !== 'event');
+    });
+  }
+
   beforeEach(() => {
     process.env = { ...originalEnv };
     delete process.env.SENTRY_PROBE_SECRET;
@@ -65,6 +81,7 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(response.status).toBe(404);
     expect(body.error).toBe('Not Found');
     expect(receivedEnvelopes.length).toBe(0);
+    expect(getCapturedEventItems(receivedEnvelopes)).toHaveLength(0);
 
     // Also verify GET returns 404 when disabled to prevent route enumeration
     const getResponse = await GET();
@@ -87,6 +104,7 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(response.status).toBe(404);
     expect(body.error).toBe('Not Found');
     expect(receivedEnvelopes.length).toBe(0);
+    expect(getCapturedEventItems(receivedEnvelopes)).toHaveLength(0);
   });
 
   it('3. returns 401 when the probe header is missing', async () => {
@@ -102,6 +120,7 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(response.status).toBe(401);
     expect(body.error).toBe('Unauthorized');
     expect(receivedEnvelopes.length).toBe(0);
+    expect(getCapturedEventItems(receivedEnvelopes)).toHaveLength(0);
   });
 
   it('4. returns 401 when the probe header does not match the configured secret', async () => {
@@ -120,6 +139,7 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(response.status).toBe(401);
     expect(body.error).toBe('Unauthorized');
     expect(receivedEnvelopes.length).toBe(0);
+    expect(getCapturedEventItems(receivedEnvelopes)).toHaveLength(0);
   });
 
   it('5. returns 405 Method Not Allowed for non-POST methods when probe is enabled', async () => {
@@ -136,6 +156,7 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(deleteRes.status).toBe(405);
 
     expect(receivedEnvelopes.length).toBe(0);
+    expect(getCapturedEventItems(receivedEnvelopes)).toHaveLength(0);
   });
 
   it('6. captures exactly one synthetic exception when authorized, delivering to transport with bounded flush', async () => {
@@ -162,19 +183,28 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     const serializedResponse = JSON.stringify(body);
     expect(serializedResponse.includes(TEST_SECRET)).toBe(false);
 
-    // Inspect delivered envelope
-    expect(receivedEnvelopes.length).toBe(1);
-    const envelope = receivedEnvelopes[0];
-    const items = envelope[1] || [];
+    // Inspect delivered envelopes
+    expect(receivedEnvelopes.length).toBeGreaterThanOrEqual(1);
 
-    // Verify entire serialized envelope string never contains the secret
-    const serializedEnvelope = JSON.stringify(envelope);
-    expect(serializedEnvelope.includes(TEST_SECRET)).toBe(false);
+    // Verify entire serialized content of every received envelope never contains the secret
+    for (const envelope of receivedEnvelopes) {
+      const serializedEnvelope = JSON.stringify(envelope);
+      expect(serializedEnvelope.includes(TEST_SECRET)).toBe(false);
+    }
 
-    // Find the error event item in the envelope
-    const eventItem = items.find((item: any) => item[0]?.type === 'event');
-    expect(eventItem).toBeDefined();
-    const eventPayload = eventItem[1];
+    // Require exactly one exception event item across all received envelopes
+    const eventItems = getCapturedEventItems(receivedEnvelopes);
+    expect(eventItems).toHaveLength(1);
+    const [eventHeader, eventPayload] = eventItems[0];
+    expect(eventHeader?.type).toBe('event');
+
+    // Reject additional exception events; any non-event items must be benign SDK telemetry (session / client_report)
+    const nonEventItems = getCapturedNonEventItems(receivedEnvelopes);
+    for (const [nonEventHeader, nonEventPayload] of nonEventItems) {
+      expect(['session', 'sessions', 'client_report']).toContain(nonEventHeader?.type);
+      expect(nonEventPayload?.exception).toBeUndefined();
+      expect(nonEventPayload?.request).toBeUndefined();
+    }
 
     // Verify exception metadata
     expect(eventPayload.exception?.values).toBeDefined();
@@ -211,8 +241,16 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(response.status).toBe(200);
     expect(body.ok).toBe(true);
 
-    expect(receivedEnvelopes.length).toBe(1);
-    const eventPayload = receivedEnvelopes[0][1].find((item: any) => item[0]?.type === 'event')[1];
+    expect(receivedEnvelopes.length).toBeGreaterThanOrEqual(1);
+
+    for (const envelope of receivedEnvelopes) {
+      const serializedEnvelope = JSON.stringify(envelope);
+      expect(serializedEnvelope.includes(TEST_SECRET)).toBe(false);
+    }
+
+    const eventItems = getCapturedEventItems(receivedEnvelopes);
+    expect(eventItems).toHaveLength(1);
+    const eventPayload = eventItems[0][1];
 
     // The exception message must remain strictly fixed
     expect(eventPayload.exception.values[0].value).toBe(PROBE_EXCEPTION_MESSAGE);
@@ -266,22 +304,26 @@ describe('Production Sentry Error Probe Endpoint (Step 10O)', () => {
     expect(serializedResponse.includes('secret_bearer_token_xyz')).toBe(false);
     expect(serializedResponse.includes('secret_cookie_token_999')).toBe(false);
 
-    // 2. Entire serialized Sentry envelope never discloses the secret or request metadata
-    expect(receivedEnvelopes.length).toBe(1);
-    const envelope = receivedEnvelopes[0];
-    const serializedEnvelope = JSON.stringify(envelope);
+    // 2. Entire serialized Sentry envelopes never disclose the secret or request metadata
+    expect(receivedEnvelopes.length).toBeGreaterThanOrEqual(1);
+    for (const envelope of receivedEnvelopes) {
+      const serializedEnvelope = JSON.stringify(envelope);
 
-    expect(serializedEnvelope.includes(TEST_SECRET)).toBe(false);
-    expect(serializedEnvelope.includes('secret_bearer_token_xyz')).toBe(false);
-    expect(serializedEnvelope.includes('secret_cookie_token_999')).toBe(false);
-    expect(serializedEnvelope.includes('caller_private_value')).toBe(false);
-    expect(serializedEnvelope.includes('secret_param')).toBe(false);
-    expect(serializedEnvelope.includes('query_data')).toBe(false);
-    expect(serializedEnvelope.includes('secret_user@example.com')).toBe(false);
-    expect(serializedEnvelope.includes('injected_user_id')).toBe(false);
+      expect(serializedEnvelope.includes(TEST_SECRET)).toBe(false);
+      expect(serializedEnvelope.includes('secret_bearer_token_xyz')).toBe(false);
+      expect(serializedEnvelope.includes('secret_cookie_token_999')).toBe(false);
+      expect(serializedEnvelope.includes('caller_private_value')).toBe(false);
+      expect(serializedEnvelope.includes('secret_param')).toBe(false);
+      expect(serializedEnvelope.includes('query_data')).toBe(false);
+      expect(serializedEnvelope.includes('secret_user@example.com')).toBe(false);
+      expect(serializedEnvelope.includes('injected_user_id')).toBe(false);
+    }
 
     // 3. Inspect event payload properties directly
-    const eventPayload = envelope[1].find((item: any) => item[0]?.type === 'event')[1];
+    const eventItems = getCapturedEventItems(receivedEnvelopes);
+    expect(eventItems).toHaveLength(1);
+    const eventPayload = eventItems[0][1];
+
     expect(eventPayload.user).toBeUndefined();
     expect(eventPayload.request?.headers).toBeUndefined();
     expect(eventPayload.request?.cookies).toBeUndefined();
