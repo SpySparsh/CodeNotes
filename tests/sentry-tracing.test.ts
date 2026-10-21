@@ -227,8 +227,8 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       expect(extractRoutePath(undefined)).toBeNull();
     });
 
-    it('temporarily samples exact root route GET /api/notes at 100% (1.0) when parentSampled is undefined (Step 10Y)', () => {
-      // Direct span name matching
+    it('temporarily samples exact root route GET /api/notes at 100% (1.0), even when parentSampled is false (Step 10AD)', () => {
+      // Direct span name matching without parent decision
       expect(serverTracesSampler({ name: 'GET /api/notes' })).toBe(1.0);
       // Span name with query string or fragment
       expect(serverTracesSampler({ name: 'GET /api/notes?cursor=abc#top' })).toBe(1.0);
@@ -237,6 +237,27 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
         serverTracesSampler({
           name: 'handler',
           attributes: { 'http.route': '/api/notes', 'http.method': 'GET' },
+        })
+      ).toBe(1.0);
+
+      // Precedence over parentSampled: false (browser un-sampled trace)
+      expect(serverTracesSampler({ name: 'GET /api/notes', parentSampled: false })).toBe(1.0);
+      expect(serverTracesSampler({ name: 'GET /api/notes?cursor=abc#top', parentSampled: false })).toBe(1.0);
+      expect(
+        serverTracesSampler({
+          name: 'handler',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'GET' },
+          parentSampled: false,
+        })
+      ).toBe(1.0);
+
+      // Precedence with parentSampled: true
+      expect(serverTracesSampler({ name: 'GET /api/notes', parentSampled: true })).toBe(1.0);
+      expect(
+        serverTracesSampler({
+          name: 'handler',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'GET' },
+          parentSampled: true,
         })
       ).toBe(1.0);
     });
@@ -350,9 +371,23 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       }
     });
 
-    it('honors explicit inherited sampling decision for non-excluded routes', () => {
-      expect(serverTracesSampler({ name: 'GET /api/notes', parentSampled: true })).toBe(true);
-      expect(serverTracesSampler({ name: 'GET /api/notes', parentSampled: false })).toBe(false);
+    it('preserves inherited sampling decisions for other targeted and non-excluded routes', () => {
+      // GET /api/notes/[id] with parentSampled: false remains unsampled
+      expect(serverTracesSampler({ name: 'GET /api/notes/[id]', parentSampled: false })).toBe(false);
+      expect(
+        serverTracesSampler({
+          name: 'handler',
+          attributes: { 'http.route': '/api/notes/[id]', 'http.method': 'GET' },
+          parentSampled: false,
+        })
+      ).toBe(false);
+      expect(serverTracesSampler({ name: 'GET /api/notes/[id]', parentSampled: true })).toBe(true);
+
+      // DELETE /api/notes/[id] with parentSampled: false remains unsampled
+      expect(serverTracesSampler({ name: 'DELETE /api/notes/[id]', parentSampled: false })).toBe(false);
+      expect(serverTracesSampler({ name: 'DELETE /api/notes/[id]', parentSampled: true })).toBe(true);
+
+      // POST /api/generate preserves inherited sampling
       expect(
         serverTracesSampler({
           name: 'handler',
@@ -367,6 +402,22 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
           parentSampled: false,
         })
       ).toBe(false);
+
+      // Non-GET method on /api/notes preserves inherited sampling
+      expect(
+        serverTracesSampler({
+          name: 'POST /api/notes',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'POST' },
+          parentSampled: false,
+        })
+      ).toBe(false);
+      expect(
+        serverTracesSampler({
+          name: 'POST /api/notes',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'POST' },
+          parentSampled: true,
+        })
+      ).toBe(true);
     });
 
     it('returns 0 for un-instrumented or unknown routes', () => {
