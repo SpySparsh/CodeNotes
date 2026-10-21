@@ -362,7 +362,22 @@ export function serverTracesSampler(samplingContext: any): number | boolean {
     return samplingContext.parentSampled;
   }
 
-  // 3. Sample targeted high-value API routes at ~10%
+  // 3. Temporary Step 10Y diagnostic: force 100% sampling for the exact root transaction GET /api/notes
+  // when starting a new trace. Other instrumented routes remain at the standard 10% rate.
+  const httpMethod =
+    (samplingContext?.attributes?.['http.method'] as string | undefined) ||
+    (spanName.startsWith('GET ') ? 'GET' : undefined);
+
+  const isExactGetNotesRoute =
+    spanName === 'GET /api/notes' ||
+    (extractedPath === '/api/notes' && httpMethod === 'GET') ||
+    (normalizedRouteAttr === '/api/notes' && httpMethod === 'GET');
+
+  if (isExactGetNotesRoute) {
+    return 1.0;
+  }
+
+  // 4. Sample targeted high-value API routes at ~10%
   if (
     TARGET_INSTRUMENTED_ROUTES.has(spanName) ||
     (normalizedRouteAttr && TARGET_API_ROUTES.has(normalizedRouteAttr))
@@ -370,7 +385,7 @@ export function serverTracesSampler(samplingContext: any): number | boolean {
     return 0.1;
   }
 
-  // 4. Default unsampled for any other route
+  // 5. Default unsampled for any other route
   return 0;
 }
 

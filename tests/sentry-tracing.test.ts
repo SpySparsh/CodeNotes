@@ -227,17 +227,47 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       expect(extractRoutePath(undefined)).toBeNull();
     });
 
-    it('samples high-value instrumented routes at approximately 10% when parentSampled is undefined', () => {
-      for (const routeName of TARGET_INSTRUMENTED_ROUTES) {
+    it('temporarily samples exact root route GET /api/notes at 100% (1.0) when parentSampled is undefined (Step 10Y)', () => {
+      // Direct span name matching
+      expect(serverTracesSampler({ name: 'GET /api/notes' })).toBe(1.0);
+      // Span name with query string or fragment
+      expect(serverTracesSampler({ name: 'GET /api/notes?cursor=abc#top' })).toBe(1.0);
+      // Attribute-based route and method matching
+      expect(
+        serverTracesSampler({
+          name: 'handler',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'GET' },
+        })
+      ).toBe(1.0);
+    });
+
+    it('samples other high-value instrumented routes at approximately 10% (0.1) when parentSampled is undefined', () => {
+      const remainingTargetRoutes = Array.from(TARGET_INSTRUMENTED_ROUTES).filter(
+        (r) => r !== 'GET /api/notes'
+      );
+      for (const routeName of remainingTargetRoutes) {
         const rate = serverTracesSampler({ name: routeName });
         expect(rate).toBe(0.1);
       }
+
+      // Explicit verification for other routes and methods
+      expect(serverTracesSampler({ name: 'GET /api/notes/[id]' })).toBe(0.1);
+      expect(serverTracesSampler({ name: 'DELETE /api/notes/[id]' })).toBe(0.1);
+      expect(serverTracesSampler({ name: 'POST /api/generate' })).toBe(0.1);
+
+      // Non-GET method on /api/notes does NOT receive 100% override
+      expect(
+        serverTracesSampler({
+          name: 'POST /api/notes',
+          attributes: { 'http.route': '/api/notes', 'http.method': 'POST' },
+        })
+      ).toBe(0.1);
     });
 
     it('samples when route attribute is present in sampling context without parent decision', () => {
       const rate = serverTracesSampler({
         name: 'handler',
-        attributes: { 'http.route': '/api/notes' },
+        attributes: { 'http.route': '/api/generate' },
       });
       expect(rate).toBe(0.1);
     });
