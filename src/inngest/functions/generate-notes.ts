@@ -215,67 +215,74 @@ export const generateNotesFunction = inngest.createFunction(
     }> => {
       const stageStart = performance.now();
       try {
-        const existing = await query(
-          `SELECT status, video_id, note_id, lease_until FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
-          [userId, idempotencyKey]
-        );
+        return await withSpan('db.claim_generation_processing', async (span) => {
+          span.setAttribute('operation', 'claim_generation_processing');
 
-        if (existing.rows.length === 0) {
-          logger.warn('inngest_missing_idempotency_record', { userId, idempotencyKey, videoId });
-          throw new NonRetriableError('Idempotency record not found in database');
-        }
+          const existing = await query(
+            `SELECT status, video_id, note_id, lease_until FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
+            [userId, idempotencyKey]
+          );
 
-        const record = existing.rows[0];
+          if (existing.rows.length === 0) {
+            logger.warn('inngest_missing_idempotency_record', { userId, idempotencyKey, videoId });
+            throw new NonRetriableError('Idempotency record not found in database');
+          }
 
-        // Payload mismatch validation
-        if (record.video_id && videoId && record.video_id !== videoId) {
-          logger.error('inngest_payload_mismatch', {
-            userId,
-            idempotencyKey,
-            existingVideoId: record.video_id,
-            requestedVideoId: videoId,
-          });
-          throw new NonRetriableError('Idempotency key payload mismatch: video ID mismatch');
-        }
+          const record = existing.rows[0];
 
-        // If already completed, skip duplicate work
-        if (record.status === 'completed' && record.note_id) {
-          logger.info('inngest_job_already_completed', {
-            userId,
-            idempotencyKey,
-            noteId: record.note_id,
-          });
-          return { claimed: false, skipped: true, noteId: record.note_id };
-        }
+          // Payload mismatch validation
+          if (record.video_id && videoId && record.video_id !== videoId) {
+            logger.error('inngest_payload_mismatch', {
+              userId,
+              idempotencyKey,
+              existingVideoId: record.video_id,
+              requestedVideoId: videoId,
+            });
+            throw new NonRetriableError('Idempotency key payload mismatch: video ID mismatch');
+          }
 
-        // Check lease: if already processing with active future lease, skip
-        if (
-          record.status === 'processing' &&
-          record.lease_until &&
-          new Date(record.lease_until).getTime() > Date.now()
-        ) {
-          logger.info('inngest_active_lease_held', {
-            userId,
-            idempotencyKey,
-            leaseUntil: record.lease_until,
-          });
-          return { claimed: false, skipped: true, reason: 'Active lease held by another execution' };
-        }
+          // If already completed, skip duplicate work
+          if (record.status === 'completed' && record.note_id) {
+            logger.info('inngest_job_already_completed', {
+              userId,
+              idempotencyKey,
+              noteId: record.note_id,
+            });
+            span.setAttribute('status', 'skipped_already_completed');
+            return { claimed: false, skipped: true, noteId: record.note_id };
+          }
 
-        // Claim lease for 15 minutes
-        await query(
-          `UPDATE generation_idempotency
-           SET status = 'processing',
-               video_id = COALESCE(video_id, $3),
-               video_url = COALESCE(video_url, $4),
-               attempts = COALESCE(attempts, 0) + 1,
-               lease_until = NOW() + INTERVAL '15 minutes',
-               updated_at = CURRENT_TIMESTAMP
-           WHERE user_id = $1 AND key = $2`,
-          [userId, idempotencyKey, videoId, videoUrl]
-        );
+          // Check lease: if already processing with active future lease, skip
+          if (
+            record.status === 'processing' &&
+            record.lease_until &&
+            new Date(record.lease_until).getTime() > Date.now()
+          ) {
+            logger.info('inngest_active_lease_held', {
+              userId,
+              idempotencyKey,
+              leaseUntil: record.lease_until,
+            });
+            span.setAttribute('status', 'skipped_active_lease');
+            return { claimed: false, skipped: true, reason: 'Active lease held by another execution' };
+          }
 
-        return { claimed: true, skipped: false, videoId, videoUrl };
+          // Claim lease for 15 minutes
+          await query(
+            `UPDATE generation_idempotency
+             SET status = 'processing',
+                 video_id = COALESCE(video_id, $3),
+                 video_url = COALESCE(video_url, $4),
+                 attempts = COALESCE(attempts, 0) + 1,
+                 lease_until = NOW() + INTERVAL '15 minutes',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = $1 AND key = $2`,
+            [userId, idempotencyKey, videoId, videoUrl]
+          );
+
+          span.setAttribute('status', 'success');
+          return { claimed: true, skipped: false, videoId, videoUrl };
+        });
       } finally {
         recordGenerationStageDuration('claim', (performance.now() - stageStart) / 1000);
       }

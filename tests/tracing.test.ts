@@ -260,7 +260,7 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       expect(attrs['url']).toBeUndefined();
     });
 
-    it('verifies fallback spans and database persistence spans strictly omit prohibited identifiers', async () => {
+    it('verifies fallback spans and database persistence/claim spans strictly omit prohibited identifiers', async () => {
       const exporter = new InMemorySpanExporter();
       const testProvider = new BasicTracerProvider({
         spanProcessors: [new SimpleSpanProcessor(exporter)],
@@ -276,7 +276,13 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
         span.setAttribute('output_length', 3200);
       });
 
-      // 2. Database persistence span simulation (as in db.persist_notes_transaction)
+      // 2. Database claim span simulation (as in db.claim_generation_processing)
+      await withSpan('db.claim_generation_processing', async (span) => {
+        span.setAttribute('operation', 'claim_generation_processing');
+        span.setAttribute('status', 'success');
+      });
+
+      // 3. Database persistence span simulation (as in db.persist_notes_transaction)
       await withSpan('db.persist_notes_transaction', async (span) => {
         span.setAttribute('operation', 'persist_notes');
         span.setAttribute('status', 'success');
@@ -285,12 +291,14 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       tracerSpy.mockRestore();
 
       const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(2);
+      expect(spans.length).toBe(3);
 
       const fallbackSpan = spans.find((s) => s.name === 'transcript.fetch_fallback');
+      const claimSpan = spans.find((s) => s.name === 'db.claim_generation_processing');
       const dbSpan = spans.find((s) => s.name === 'db.persist_notes_transaction');
 
       expect(fallbackSpan).toBeDefined();
+      expect(claimSpan).toBeDefined();
       expect(dbSpan).toBeDefined();
 
       // Assert operational attributes
@@ -298,11 +306,14 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       expect(fallbackSpan?.attributes['status']).toBe('success');
       expect(fallbackSpan?.attributes['output_length']).toBe(3200);
 
+      expect(claimSpan?.attributes['operation']).toBe('claim_generation_processing');
+      expect(claimSpan?.attributes['status']).toBe('success');
+
       expect(dbSpan?.attributes['operation']).toBe('persist_notes');
       expect(dbSpan?.attributes['status']).toBe('success');
 
-      // Assert prohibited identifiers are strictly absent in both spans
-      for (const span of [fallbackSpan, dbSpan]) {
+      // Assert prohibited identifiers are strictly absent in all spans
+      for (const span of [fallbackSpan, claimSpan, dbSpan]) {
         const attrs = span!.attributes;
         expect(attrs['user_id']).toBeUndefined();
         expect(attrs['userId']).toBeUndefined();
@@ -454,6 +465,15 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       const testTracer = testProvider.getTracer(TRACER_NAME);
       const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
 
+      // Simulate Step 1: claim-generation-processing
+      await testTracer.startActiveSpan('step.claim-generation-processing', async (stepSpan) => {
+        await withSpan('db.claim_generation_processing', async (span) => {
+          span.setAttribute('operation', 'claim_generation_processing');
+          span.setAttribute('status', 'success');
+        });
+        stepSpan.end();
+      });
+
       // Simulate Step 2: fetch-transcript-and-title
       await testTracer.startActiveSpan('step.fetch-transcript-and-title', async (stepSpan) => {
         // Cache lookup
@@ -510,17 +530,20 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       tracerSpy.mockRestore();
 
       const spans = exporter.getFinishedSpans();
-      // Total: 3 steps + 6 nested operation spans = 9 spans
-      expect(spans.length).toBe(9);
+      // Total: 4 steps + 7 nested operation spans = 11 spans
+      expect(spans.length).toBe(11);
 
+      const step1 = spans.find((s) => s.name === 'step.claim-generation-processing');
       const step2 = spans.find((s) => s.name === 'step.fetch-transcript-and-title');
       const step3 = spans.find((s) => s.name === 'step.generate-ai-notes');
       const step4 = spans.find((s) => s.name === 'step.persist-notes');
 
+      expect(step1).toBeDefined();
       expect(step2).toBeDefined();
       expect(step3).toBeDefined();
       expect(step4).toBeDefined();
 
+      const claimSpan = spans.find((s) => s.name === 'db.claim_generation_processing');
       const cacheLookup = spans.find((s) => s.name === 'transcript.cache_lookup');
       const fetchTitle = spans.find((s) => s.name === 'transcript.fetch_title');
       const fetchPrimary = spans.find((s) => s.name === 'transcript.fetch_primary');
@@ -528,8 +551,19 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       const jsonParse = spans.find((s) => s.name === 'ai.json_parse');
       const persistTx = spans.find((s) => s.name === 'db.persist_notes_transaction');
 
-      // Verify Step 2 children
+      expect(claimSpan).toBeDefined();
+      expect(cacheLookup).toBeDefined();
+      expect(fetchTitle).toBeDefined();
+      expect(fetchPrimary).toBeDefined();
+      expect(geminiGenerate).toBeDefined();
+      expect(jsonParse).toBeDefined();
+      expect(persistTx).toBeDefined();
+
+      // Verify Step 1 children
       const getParentId = (s: any) => s?.parentSpanContext?.spanId ?? s?.parentSpanId;
+      expect(getParentId(claimSpan)).toBe(step1?.spanContext().spanId);
+
+      // Verify Step 2 children
       expect(getParentId(cacheLookup)).toBe(step2?.spanContext().spanId);
       expect(getParentId(fetchTitle)).toBe(step2?.spanContext().spanId);
       expect(getParentId(fetchPrimary)).toBe(step2?.spanContext().spanId);
@@ -542,6 +576,8 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       expect(getParentId(persistTx)).toBe(step4?.spanContext().spanId);
 
       // Verify attributes
+      expect(claimSpan?.attributes['operation']).toBe('claim_generation_processing');
+      expect(claimSpan?.attributes['status']).toBe('success');
       expect(cacheLookup?.attributes['cache_hit']).toBe(false);
       expect(fetchTitle?.attributes['provider']).toBe('noembed');
       expect(fetchPrimary?.attributes['provider']).toBe('supadata');
@@ -568,11 +604,153 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
         'transcript',
         'url',
       ];
-      for (const span of [cacheLookup, fetchTitle, fetchPrimary, geminiGenerate, jsonParse, persistTx]) {
+      for (const span of [claimSpan, cacheLookup, fetchTitle, fetchPrimary, geminiGenerate, jsonParse, persistTx]) {
         for (const key of prohibitedKeys) {
           expect(span?.attributes[key]).toBeUndefined();
         }
       }
+    });
+  });
+
+  describe('Claim Step Instrumentation (db.claim_generation_processing)', () => {
+    it('creates db.claim_generation_processing on successful claim with safe attributes', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      const claimResult = await withSpan('db.claim_generation_processing', async (span) => {
+        span.setAttribute('operation', 'claim_generation_processing');
+        span.setAttribute('status', 'success');
+        return { claimed: true, skipped: false, videoId: 'vid-123', videoUrl: 'https://youtube.com/watch?v=vid-123' };
+      });
+
+      tracerSpy.mockRestore();
+
+      expect(claimResult).toEqual({
+        claimed: true,
+        skipped: false,
+        videoId: 'vid-123',
+        videoUrl: 'https://youtube.com/watch?v=vid-123',
+      });
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].name).toBe('db.claim_generation_processing');
+      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
+      expect(spans[0].attributes['operation']).toBe('claim_generation_processing');
+      expect(spans[0].attributes['status']).toBe('success');
+    });
+
+    it('records skipped_already_completed and skipped_active_lease statuses without altering return values', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      // Case A: already completed
+      const completedResult = await withSpan('db.claim_generation_processing', async (span) => {
+        span.setAttribute('operation', 'claim_generation_processing');
+        span.setAttribute('status', 'skipped_already_completed');
+        return { claimed: false, skipped: true, noteId: 'note-cached-uuid' };
+      });
+
+      // Case B: active lease held
+      const activeLeaseResult = await withSpan('db.claim_generation_processing', async (span) => {
+        span.setAttribute('operation', 'claim_generation_processing');
+        span.setAttribute('status', 'skipped_active_lease');
+        return { claimed: false, skipped: true, reason: 'Active lease held by another execution' };
+      });
+
+      tracerSpy.mockRestore();
+
+      expect(completedResult).toEqual({ claimed: false, skipped: true, noteId: 'note-cached-uuid' });
+      expect(activeLeaseResult).toEqual({ claimed: false, skipped: true, reason: 'Active lease held by another execution' });
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(2);
+
+      expect(spans[0].attributes['operation']).toBe('claim_generation_processing');
+      expect(spans[0].attributes['status']).toBe('skipped_already_completed');
+      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
+
+      expect(spans[1].attributes['operation']).toBe('claim_generation_processing');
+      expect(spans[1].attributes['status']).toBe('skipped_active_lease');
+      expect(spans[1].status.code).toBe(SpanStatusCode.OK);
+    });
+
+    it('records error status and exception event when claim encounters an exception', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      await expect(
+        withSpan('db.claim_generation_processing', async (span) => {
+          span.setAttribute('operation', 'claim_generation_processing');
+          throw new Error('Idempotency record not found in database');
+        })
+      ).rejects.toThrow('Idempotency record not found in database');
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].name).toBe('db.claim_generation_processing');
+      expect(spans[0].status.code).toBe(SpanStatusCode.ERROR);
+      expect(spans[0].status.message).toBe('Idempotency record not found in database');
+      expect(spans[0].events.some((e) => e.name === 'exception')).toBe(true);
+    });
+
+    it('strictly drops prohibited identifiers attempted on claim span', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      await withSpan('db.claim_generation_processing', async (span) => {
+        span.setAttribute('operation', 'claim_generation_processing');
+        span.setAttribute('status', 'success');
+        // Prohibited keys attempted on claim span
+        span.setAttribute('user_id', 'usr-test-1234');
+        span.setAttribute('userId', 'usr-test-1234');
+        span.setAttribute('video_id', 'dQw4w9WgXcQ');
+        span.setAttribute('videoId', 'dQw4w9WgXcQ');
+        span.setAttribute('idempotency_key', 'idem-key-999');
+        span.setAttribute('idempotencyKey', 'idem-key-999');
+        span.setAttribute('url', 'https://youtube.com/watch?v=dQw4w9WgXcQ');
+        span.setAttribute('token', 'secret-token');
+      });
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      const attrs = spans[0].attributes;
+
+      expect(attrs['operation']).toBe('claim_generation_processing');
+      expect(attrs['status']).toBe('success');
+
+      expect(attrs['user_id']).toBeUndefined();
+      expect(attrs['userId']).toBeUndefined();
+      expect(attrs['video_id']).toBeUndefined();
+      expect(attrs['videoId']).toBeUndefined();
+      expect(attrs['idempotency_key']).toBeUndefined();
+      expect(attrs['idempotencyKey']).toBeUndefined();
+      expect(attrs['url']).toBeUndefined();
+      expect(attrs['token']).toBeUndefined();
     });
   });
 });
