@@ -104,6 +104,8 @@ export function filterSafeAttributes(
   return safe;
 }
 
+const RAW_SPAN_KEY = Symbol('raw_span');
+
 /**
  * Wraps a Sentry Span with a defensive Proxy that silences any attempts
  * to set non-allowlisted or sensitive attributes.
@@ -113,6 +115,9 @@ export function createSafeSentrySpan(span: Span): Span {
 
   return new Proxy(span, {
     get(target, prop, receiver) {
+      if (prop === RAW_SPAN_KEY) {
+        return target;
+      }
       if (prop === 'setAttribute') {
         return (key: string, value: any) => {
           if (isAllowedSpanAttribute(key, value)) {
@@ -137,6 +142,15 @@ export function createSafeSentrySpan(span: Span): Span {
       return typeof val === 'function' ? val.bind(target) : val;
     },
   });
+}
+
+/**
+ * Returns the underlying raw span if a safe span proxy was provided,
+ * or the span itself if already raw/unwrapped.
+ */
+export function unwrapSafeSpan(span?: Span): Span | undefined {
+  if (!span) return span;
+  return (span as any)[RAW_SPAN_KEY] ?? span;
 }
 
 export interface RouteSpanOptions {
@@ -254,10 +268,13 @@ export async function withSentryRouteSpan<T extends { status?: number }>(
 export interface ChildSpanOptions {
   op?: string;
   attributes?: Record<string, unknown>;
+  parentSpan?: Span;
 }
 
 /**
  * Wraps a synchronous or asynchronous sub-operation in an active child span under the current Sentry span.
+ * Explicitly parents the child span to options.parentSpan when provided, guaranteeing correct
+ * trace tree hierarchy even when global OpenTelemetry context discovery is fragmented or hijacked.
  */
 export async function withSentryChildSpan<T>(
   name: string,
@@ -276,13 +293,19 @@ export async function withSentryChildSpan<T>(
   }
 
   const initialAttributes = filterSafeAttributes(options?.attributes);
+  const resolvedParentSpan = options?.parentSpan ? unwrapSafeSpan(options.parentSpan) : undefined;
+
+  const spanOptions: any = {
+    name,
+    op: options?.op,
+    attributes: initialAttributes,
+  };
+  if (resolvedParentSpan) {
+    spanOptions.parentSpan = resolvedParentSpan;
+  }
 
   return Sentry.startSpan(
-    {
-      name,
-      op: options?.op,
-      attributes: initialAttributes,
-    },
+    spanOptions,
     async (rawSpan) => {
       const safeSpan = createSafeSentrySpan(rawSpan);
       try {

@@ -1,11 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import * as Sentry from '@sentry/nextjs';
+import { initTracing } from '@/lib/tracing';
 import {
   withSentryRouteSpan,
   withSentryChildSpan,
   sanitizeSpan,
   scheduleOrAwaitSentryFlush,
 } from '@/lib/sentry-tracing';
+
+// Model production runtime initialization order (src/instrumentation.ts):
+// The Inngest OpenTelemetry provider is initialized BEFORE Sentry.
+initTracing();
 
 const { mockAfter, afterState } = vi.hoisted(() => {
   const afterState = {
@@ -86,24 +91,39 @@ describe('Sentry API Tracing Span Export Integration (Step 10J)', () => {
     }
   });
 
-  it('1. exports both root span and child span to the test transport on successful execution', async () => {
+  it('1. exports both root span and child spans with verified parent_span_id and trace_id under production-like provider initialization', async () => {
     const response = await withSentryRouteSpan(
       { name: 'GET /api/notes', method: 'GET', route: '/api/notes' },
       async (span: any) => {
         capturedRootSpan = span;
-        const authResult = await withSentryChildSpan('auth.require_user', { op: 'auth' }, async (childSpan) => {
-          childSpan.setAttribute('operation', 'auth_check');
-          return { userId: 'mock-user-id' };
-        });
+        const authResult = await withSentryChildSpan(
+          'auth.require_user',
+          { op: 'auth', parentSpan: span },
+          async (childSpan) => {
+            childSpan.setAttribute('operation', 'auth_check');
+            // Attempt to set sensitive attribute
+            childSpan.setAttribute('user_id', 'leak-attempt');
+            return { userId: 'mock-user-id' };
+          }
+        );
+
+        const dbResult = await withSentryChildSpan(
+          'db.query_notes_keyset',
+          { op: 'db', parentSpan: span },
+          async (childSpan) => {
+            childSpan.setAttribute('operation', 'db_keyset');
+            return [{ id: 'note-1' }];
+          }
+        );
 
         span.setAttribute('notes.returned_count', 5);
-        return { status: 200, data: authResult };
+        return { status: 200, data: { auth: authResult, db: dbResult } };
       }
     );
 
     // Verify response is preserved
     expect(response.status).toBe(200);
-    expect(response.data.userId).toBe('mock-user-id');
+    expect(response.data.auth.userId).toBe('mock-user-id');
 
     // Verify flush was called and executed
     expect(flushCallCount).toBeGreaterThanOrEqual(1);
@@ -123,20 +143,38 @@ describe('Sentry API Tracing Span Export Integration (Step 10J)', () => {
     }
 
     const rootSpan = allSpanItems.find((s) => s.name === 'GET /api/notes');
-    const childSpan = allSpanItems.find((s) => s.name === 'auth.require_user');
+    const authSpan = allSpanItems.find((s) => s.name === 'auth.require_user');
+    const dbSpan = allSpanItems.find((s) => s.name === 'db.query_notes_keyset');
 
+    // Root span assertions
     expect(rootSpan).toBeDefined();
     expect(rootSpan.is_segment).toBe(true);
     expect(rootSpan.status).toBe('ok');
+    expect(rootSpan.span_id).toBeDefined();
+    expect(rootSpan.trace_id).toBeDefined();
     expect(getAttrValue(rootSpan.attributes['http.method'])).toBe('GET');
     expect(getAttrValue(rootSpan.attributes['http.route'])).toBe('/api/notes');
     expect(getAttrValue(rootSpan.attributes['http.status_code'])).toBe(200);
     expect(getAttrValue(rootSpan.attributes['notes.returned_count'])).toBe(5);
 
-    expect(childSpan).toBeDefined();
-    expect(childSpan.name).toBe('auth.require_user');
-    expect(getAttrValue(childSpan.attributes['sentry.op'])).toBe('auth');
-    expect(getAttrValue(childSpan.attributes['operation'])).toBe('auth_check');
+    // Auth child span assertions
+    expect(authSpan).toBeDefined();
+    expect(authSpan.is_segment).toBe(false);
+    expect(authSpan.trace_id).toBe(rootSpan.trace_id);
+    expect(authSpan.parent_span_id).toBe(rootSpan.span_id);
+    expect(authSpan.status).toBe('ok');
+    expect(getAttrValue(authSpan.attributes['sentry.op'])).toBe('auth');
+    expect(getAttrValue(authSpan.attributes['operation'])).toBe('auth_check');
+    expect(authSpan.attributes).not.toHaveProperty('user_id');
+
+    // DB child span assertions
+    expect(dbSpan).toBeDefined();
+    expect(dbSpan.is_segment).toBe(false);
+    expect(dbSpan.trace_id).toBe(rootSpan.trace_id);
+    expect(dbSpan.parent_span_id).toBe(rootSpan.span_id);
+    expect(dbSpan.status).toBe('ok');
+    expect(getAttrValue(dbSpan.attributes['sentry.op'])).toBe('db');
+    expect(getAttrValue(dbSpan.attributes['operation'])).toBe('db_keyset');
   });
 
   it('2. guarantees the root span is fully ended BEFORE the final flush is scheduled', async () => {
@@ -294,5 +332,39 @@ describe('Sentry API Tracing Span Export Integration (Step 10J)', () => {
     );
     const rootSpan = allSpanItems.find((s) => s.name === 'GET /api/notes');
     expect(rootSpan).toBeDefined();
+  });
+
+  it('8. proves explicit parentSpan correctly links child spans where ambient discovery produces undefined parent_span_id', async () => {
+    await withSentryRouteSpan(
+      { name: 'GET /api/notes', method: 'GET', route: '/api/notes' },
+      async (span: any) => {
+        // Unlinked child: relies on ambient discovery under conflicting provider
+        await withSentryChildSpan('unlinked.ambient_child', { op: 'ambient' }, async () => {});
+
+        // Explicitly linked child: passes parentSpan: span
+        await withSentryChildSpan('linked.explicit_child', { op: 'explicit', parentSpan: span }, async () => {});
+
+        return { status: 200 };
+      }
+    );
+
+    const allSpanItems = receivedEnvelopes.flatMap((env) =>
+      (env[1] || []).flatMap((i: any) => i[1]?.items || [])
+    );
+    const rootSpan = allSpanItems.find((s) => s.name === 'GET /api/notes');
+    const unlinkedChild = allSpanItems.find((s) => s.name === 'unlinked.ambient_child');
+    const linkedChild = allSpanItems.find((s) => s.name === 'linked.explicit_child');
+
+    expect(rootSpan).toBeDefined();
+    expect(unlinkedChild).toBeDefined();
+    expect(linkedChild).toBeDefined();
+
+    // Under conflicting provider, unlinked child span has undefined parent_span_id
+    expect(unlinkedChild.parent_span_id).toBeUndefined();
+
+    // With explicit parentSpan, child span is correctly parented to rootSpan
+    expect(linkedChild.parent_span_id).toBe(rootSpan.span_id);
+    expect(linkedChild.trace_id).toBe(rootSpan.trace_id);
+    expect(linkedChild.is_segment).toBe(false);
   });
 });

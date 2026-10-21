@@ -22,7 +22,11 @@ export async function POST(request: Request) {
       let authenticatedUserId: string | null = null;
 
       try {
-        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const user = await withSentryChildSpan(
+          'auth.require_user',
+          { op: 'auth', parentSpan: span },
+          () => requireUser()
+        );
         authenticatedUserId = user.id;
 
     const body = await request.json().catch(() => ({}));
@@ -70,7 +74,10 @@ export async function POST(request: Request) {
     }
 
     // Rate limiting: 5 generation requests per user per 60-second window
-    const rateLimit = await withSentryChildSpan('rate_limit.check', { op: 'rate_limit' }, async (childSpan) => {
+    const rateLimit = await withSentryChildSpan(
+      'rate_limit.check',
+      { op: 'rate_limit', parentSpan: span },
+      async (childSpan) => {
       const res = await checkRateLimit({
         key: `generate:${authenticatedUserId}`,
         limit: 5,
@@ -114,13 +121,16 @@ export async function POST(request: Request) {
     const eventId = generateDeterministicEventId(authenticatedUserId, idempotencyKey);
 
     // Check existing idempotency state
-    const existing = await withSentryChildSpan('db.idempotency_lookup', { op: 'db' }, () =>
-      query(
-        `SELECT status, video_id, video_url, note_id, error_message, error_code, created_at, updated_at
-         FROM generation_idempotency
-         WHERE user_id = $1 AND key = $2`,
-        [authenticatedUserId, idempotencyKey]
-      )
+    const existing = await withSentryChildSpan(
+      'db.idempotency_lookup',
+      { op: 'db', parentSpan: span },
+      () =>
+        query(
+          `SELECT status, video_id, video_url, note_id, error_message, error_code, created_at, updated_at
+           FROM generation_idempotency
+           WHERE user_id = $1 AND key = $2`,
+          [authenticatedUserId, idempotencyKey]
+        )
     );
 
     if (existing.rows.length > 0) {
@@ -188,17 +198,20 @@ export async function POST(request: Request) {
           );
 
           try {
-            await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
-              inngest.send({
-                name: 'notes/generate.requested',
-                id: eventId,
-                data: {
-                  userId: authenticatedUserId,
-                  idempotencyKey,
-                  videoId,
-                  videoUrl: url,
-                },
-              })
+            await withSentryChildSpan(
+              'inngest.send_event',
+              { op: 'inngest', parentSpan: span },
+              () =>
+                inngest.send({
+                  name: 'notes/generate.requested',
+                  id: eventId,
+                  data: {
+                    userId: authenticatedUserId,
+                    idempotencyKey,
+                    videoId,
+                    videoUrl: url,
+                  },
+                })
             );
           } catch (sendErr: any) {
             logger.warn('generation_stale_requeue_deferred', {
@@ -270,17 +283,20 @@ export async function POST(request: Request) {
         );
 
         try {
-          await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
-            inngest.send({
-              name: 'notes/generate.requested',
-              id: eventId,
-              data: {
-                userId: authenticatedUserId,
-                idempotencyKey,
-                videoId,
-                videoUrl: url,
-              },
-            })
+          await withSentryChildSpan(
+            'inngest.send_event',
+            { op: 'inngest', parentSpan: span },
+            () =>
+              inngest.send({
+                name: 'notes/generate.requested',
+                id: eventId,
+                data: {
+                  userId: authenticatedUserId,
+                  idempotencyKey,
+                  videoId,
+                  videoUrl: url,
+                },
+              })
           );
         } catch (sendErr: any) {
           logger.warn('generation_retry_enqueue_deferred', {
@@ -317,17 +333,20 @@ export async function POST(request: Request) {
     );
 
     try {
-      await withSentryChildSpan('inngest.send_event', { op: 'inngest' }, () =>
-        inngest.send({
-          name: 'notes/generate.requested',
-          id: eventId,
-          data: {
-            userId: authenticatedUserId,
-            idempotencyKey,
-            videoId,
-            videoUrl: url,
-          },
-        })
+      await withSentryChildSpan(
+        'inngest.send_event',
+        { op: 'inngest', parentSpan: span },
+        () =>
+          inngest.send({
+            name: 'notes/generate.requested',
+            id: eventId,
+            data: {
+              userId: authenticatedUserId,
+              idempotencyKey,
+              videoId,
+              videoUrl: url,
+            },
+          })
       );
     } catch (inngestErr: any) {
       // Retain the durable PostgreSQL pending record. Do NOT delete it.

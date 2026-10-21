@@ -21,7 +21,11 @@ export async function GET(request?: Request) {
       const requestId = getRequestId(request);
 
       try {
-        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const user = await withSentryChildSpan(
+          'auth.require_user',
+          { op: 'auth', parentSpan: span },
+          () => requireUser()
+        );
 
     // Parse URL search parameters
     const url = request ? new URL(request.url) : new URL('http://localhost/api/notes');
@@ -133,8 +137,10 @@ export async function GET(request?: Request) {
       LIMIT $${limitParamIdx}
     `;
 
-    const result = await withSentryChildSpan('db.query_notes_keyset', { op: 'db' }, () =>
-      query(queryString, sqlParams)
+    const result = await withSentryChildSpan(
+      'db.query_notes_keyset',
+      { op: 'db', parentSpan: span },
+      () => query(queryString, sqlParams)
     );
     const hasMore = result.rows.length > limit;
     const rows = hasMore ? result.rows.slice(0, limit) : result.rows;

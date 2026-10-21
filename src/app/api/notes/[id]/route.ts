@@ -12,15 +12,21 @@ export async function GET(
 ) {
   return withSentryRouteSpan(
     { name: 'GET /api/notes/[id]', method: 'GET', route: '/api/notes/[id]' },
-    async () => {
+    async (span) => {
       const startTime = performance.now();
       const requestId = getRequestId(request);
 
       try {
-        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const user = await withSentryChildSpan(
+          'auth.require_user',
+          { op: 'auth', parentSpan: span },
+          () => requireUser()
+        );
         const { id } = await params;
-        const result = await withSentryChildSpan('db.query_note_by_id', { op: 'db' }, () =>
-          query('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
+        const result = await withSentryChildSpan(
+          'db.query_note_by_id',
+          { op: 'db', parentSpan: span },
+          () => query('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
         );
         const durationMs = performance.now() - startTime;
 
@@ -117,15 +123,21 @@ export async function DELETE(
 ) {
   return withSentryRouteSpan(
     { name: 'DELETE /api/notes/[id]', method: 'DELETE', route: '/api/notes/[id]' },
-    async () => {
+    async (span) => {
       const startTime = performance.now();
       const requestId = getRequestId(request);
 
       try {
-        const user = await withSentryChildSpan('auth.require_user', { op: 'auth' }, () => requireUser());
+        const user = await withSentryChildSpan(
+          'auth.require_user',
+          { op: 'auth', parentSpan: span },
+          () => requireUser()
+        );
         const { id } = await params;
-        const result = await withSentryChildSpan('db.delete_note', { op: 'db' }, () =>
-          query('DELETE FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
+        const result = await withSentryChildSpan(
+          'db.delete_note',
+          { op: 'db', parentSpan: span },
+          () => query('DELETE FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
         );
         const durationMs = performance.now() - startTime;
 

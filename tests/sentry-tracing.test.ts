@@ -9,6 +9,7 @@ const { mockStartSpan, mockSetHttpStatus, capturedSpans, mockClient } = vi.hoist
     const spanObj: any = {
       name: options.name,
       op: options.op,
+      parentSpan: options.parentSpan,
       attributes: { ...options.attributes },
       status: undefined as any,
       setAttribute(k: string, v: any) {
@@ -518,6 +519,12 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       expect(rootSpan.attributes['notes.has_cursor']).toBe(false);
       expect(rootSpan.attributes['notes.returned_count']).toBe(1);
 
+      // Verify explicit parent linking
+      const authChild = capturedSpans.find((s) => s.name === 'auth.require_user');
+      const dbChild = capturedSpans.find((s) => s.name === 'db.query_notes_keyset');
+      expect(authChild.parentSpan).toBe(rootSpan);
+      expect(dbChild.parentSpan).toBe(rootSpan);
+
       // Verify privacy: no user IDs, cursors, or raw payloads in span attributes
       expect(rootSpan.attributes).not.toHaveProperty('user_id');
       expect(rootSpan.attributes).not.toHaveProperty('cursor');
@@ -561,6 +568,12 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       expect(rootSpan.attributes['http.route']).toBe('/api/notes/[id]');
       expect(rootSpan.attributes['http.status_code']).toBe(200);
 
+      // Verify explicit parent linking
+      const authChild = capturedSpans.find((s) => s.name === 'auth.require_user');
+      const dbChild = capturedSpans.find((s) => s.name === 'db.query_note_by_id');
+      expect(authChild.parentSpan).toBe(rootSpan);
+      expect(dbChild.parentSpan).toBe(rootSpan);
+
       // Verify that the note ID UUID is NOT in root span name or attributes
       expect(rootSpan.name).not.toContain('aaaaaaaa-aaaa');
       expect(rootSpan.attributes).not.toHaveProperty('note_id');
@@ -587,6 +600,12 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
 
       const rootSpan = capturedSpans.find((s) => s.name === 'DELETE /api/notes/[id]');
       expect(rootSpan.attributes['http.status_code']).toBe(200);
+
+      // Verify explicit parent linking
+      const authChild = capturedSpans.find((s) => s.name === 'auth.require_user');
+      const dbChild = capturedSpans.find((s) => s.name === 'db.delete_note');
+      expect(authChild.parentSpan).toBe(rootSpan);
+      expect(dbChild.parentSpan).toBe(rootSpan);
     });
 
     it('POST /api/generate instruments rate_limit, idempotency lookup, and inngest.send', async () => {
@@ -622,6 +641,16 @@ describe('Sentry Tracing & API Observability (Step 10B)', () => {
       expect(rootSpan.attributes['http.route']).toBe('/api/generate');
       expect(rootSpan.attributes['http.status_code']).toBe(202);
       expect(rootSpan.attributes['operation.status']).toBe('job_queued');
+
+      // Verify explicit parent linking across all child spans
+      const authChild = capturedSpans.find((s) => s.name === 'auth.require_user');
+      const rateLimitChild = capturedSpans.find((s) => s.name === 'rate_limit.check');
+      const dbChild = capturedSpans.find((s) => s.name === 'db.idempotency_lookup');
+      const inngestChild = capturedSpans.find((s) => s.name === 'inngest.send_event');
+      expect(authChild.parentSpan).toBe(rootSpan);
+      expect(rateLimitChild.parentSpan).toBe(rootSpan);
+      expect(dbChild.parentSpan).toBe(rootSpan);
+      expect(inngestChild.parentSpan).toBe(rootSpan);
 
       // Verify no sensitive fields in attributes
       expect(rootSpan.attributes).not.toHaveProperty('url');
