@@ -18,6 +18,13 @@
 const { Pool } = require('pg');
 const path = require('path');
 
+/**
+ * Transaction-scoped PostgreSQL advisory lock key.
+ * Stable 64-bit integer constant ensuring mutual exclusion across concurrent migration processes.
+ * Released automatically by PostgreSQL when the transaction completes (COMMIT or ROLLBACK).
+ */
+const MIGRATION_LOCK_KEY = '7892348912734912';
+
 async function migrateDatabase(connectionString, customSsl) {
   if (!connectionString) {
     throw new Error('[migrate] ERROR: Database connection string is required.');
@@ -51,6 +58,12 @@ async function migrateDatabase(connectionString, customSsl) {
     console.log('[migrate] Starting schema migration...');
     await client.query('BEGIN');
 
+    // Acquire transaction-scoped advisory lock before any DDL operations.
+    // Serializes concurrent migration invocations. Automatically released on COMMIT or ROLLBACK.
+    console.log('[migrate] Acquiring transaction-scoped migration advisory lock...');
+    await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [MIGRATION_LOCK_KEY]);
+    console.log('[migrate] Migration advisory lock acquired.');
+
     // Step 1 — notes table
     console.log('[migrate] Ensuring table: notes');
     await client.query(`
@@ -72,14 +85,25 @@ async function migrateDatabase(connectionString, customSsl) {
     // Ensure user_id column exists if table was created previously without it
     await client.query(`
       DO $$
+      DECLARE
+        v_unowned_count integer;
       BEGIN
         IF NOT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_name = 'notes' AND column_name = 'user_id'
         ) THEN
-          ALTER TABLE notes ADD COLUMN user_id UUID;
-          -- Purge unowned legacy notes in dev/portfolio before enforcing NOT NULL
-          DELETE FROM notes WHERE user_id IS NULL;
+          -- Table exists without user_id column. Check if any rows exist before adding NOT NULL column.
+          EXECUTE 'SELECT count(*) FROM notes' INTO v_unowned_count;
+          IF v_unowned_count > 0 THEN
+            RAISE EXCEPTION 'Migration safety check failed: Table "notes" contains % unowned legacy record(s) but lacks a user_id column. Aborting migration to prevent data loss. Ownership assignment must be performed manually.', v_unowned_count;
+          END IF;
+          ALTER TABLE notes ADD COLUMN user_id UUID NOT NULL;
+        ELSE
+          -- user_id column exists. Verify no unowned rows exist before enforcing NOT NULL.
+          EXECUTE 'SELECT count(*) FROM notes WHERE user_id IS NULL' INTO v_unowned_count;
+          IF v_unowned_count > 0 THEN
+            RAISE EXCEPTION 'Migration safety check failed: Table "notes" contains % unowned record(s) with NULL user_id. Aborting migration to prevent data loss.', v_unowned_count;
+          END IF;
           ALTER TABLE notes ALTER COLUMN user_id SET NOT NULL;
         END IF;
       END $$;
@@ -129,13 +153,25 @@ async function migrateDatabase(connectionString, customSsl) {
     // Ensure columns exist if table was created previously without them
     await client.query(`
       DO $$
+      DECLARE
+        v_unowned_count integer;
       BEGIN
         IF NOT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_name = 'generation_idempotency' AND column_name = 'user_id'
         ) THEN
-          ALTER TABLE generation_idempotency ADD COLUMN user_id UUID;
-          DELETE FROM generation_idempotency WHERE user_id IS NULL;
+          -- Table exists without user_id column. Check if any rows exist before adding NOT NULL column.
+          EXECUTE 'SELECT count(*) FROM generation_idempotency' INTO v_unowned_count;
+          IF v_unowned_count > 0 THEN
+            RAISE EXCEPTION 'Migration safety check failed: Table "generation_idempotency" contains % unowned legacy record(s) but lacks a user_id column. Aborting migration to prevent data loss. Ownership assignment must be performed manually.', v_unowned_count;
+          END IF;
+          ALTER TABLE generation_idempotency ADD COLUMN user_id UUID NOT NULL;
+        ELSE
+          -- user_id column exists. Verify no unowned rows exist before enforcing NOT NULL.
+          EXECUTE 'SELECT count(*) FROM generation_idempotency WHERE user_id IS NULL' INTO v_unowned_count;
+          IF v_unowned_count > 0 THEN
+            RAISE EXCEPTION 'Migration safety check failed: Table "generation_idempotency" contains % unowned record(s) with NULL user_id. Aborting migration to prevent data loss.', v_unowned_count;
+          END IF;
           ALTER TABLE generation_idempotency ALTER COLUMN user_id SET NOT NULL;
         END IF;
 
@@ -414,4 +450,4 @@ if (require.main === module) {
     .catch(() => process.exit(1));
 }
 
-module.exports = { migrateDatabase };
+module.exports = { migrateDatabase, MIGRATION_LOCK_KEY };

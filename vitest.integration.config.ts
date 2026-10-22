@@ -8,5 +8,6 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     include: ['tests/integration/**/*.integration.test.ts'],
+    fileParallelism: false,
   },
 });
