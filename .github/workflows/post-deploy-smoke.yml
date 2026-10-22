@@ -1,0 +1,235 @@
+name: Post-Deployment Smoke Test
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Production Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    steps:
+      - name: Verify production deployment health and release SHA
+        timeout-minutes: 11
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEALTH_URL: https://my-code-note.vercel.app/api/health
+          TOTAL_TIMEOUT_MS: "600000"
+          INTERVAL_MS: "15000"
+          REQUEST_TIMEOUT_MS: "10000"
+        run: |
+          cat << 'EOF' > smoke-test.js
+          const https = require('https');
+          const http = require('http');
+
+          const expectedSha = (process.env.EXPECTED_SHA || '').trim();
+          const healthUrl = (process.env.HEALTH_URL || 'https://my-code-note.vercel.app/api/health').trim();
+          const totalTimeoutMs = parseInt(process.env.TOTAL_TIMEOUT_MS || '600000', 10);
+          const intervalMs = parseInt(process.env.INTERVAL_MS || '15000', 10);
+          const maxRequestTimeoutMs = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
+          const MIN_MEANINGFUL_TIME_MS = 10;
+
+          if (!expectedSha) {
+            console.error('ERROR: EXPECTED_SHA environment variable is not set or empty.');
+            process.exit(1);
+          }
+
+          const startTime = Date.now();
+          const deadline = startTime + totalTimeoutMs;
+
+          console.log('Starting production post-deployment smoke test:');
+          console.log(`  Target URL:    ${healthUrl}`);
+          console.log(`  Expected SHA:  ${expectedSha}`);
+          console.log(`  Deadline:      ${totalTimeoutMs / 1000}s (${totalTimeoutMs}ms budget)`);
+          console.log(`  Poll Interval: ${intervalMs / 1000}s`);
+          console.log(`  Req Timeout:   ${maxRequestTimeoutMs / 1000}s max`);
+          console.log('--------------------------------------------------');
+
+          function fetchHealth(url, timeoutMs) {
+            return new Promise((resolve) => {
+              let settled = false;
+              let timer = null;
+              let req = null;
+
+              function settle(result) {
+                if (settled) return;
+                settled = true;
+                if (timer) {
+                  clearTimeout(timer);
+                  timer = null;
+                }
+                resolve(result);
+              }
+
+              if (timeoutMs <= 0) {
+                return settle({ ok: false, error: 'No remaining time budget for request' });
+              }
+
+              try {
+                const parsedUrl = new URL(url);
+                const client = parsedUrl.protocol === 'https:' ? https : http;
+
+                // Absolute per-request deadline timer from initiation
+                timer = setTimeout(() => {
+                  if (req) {
+                    req.destroy();
+                  }
+                  settle({ ok: false, error: `Request timed out after ${timeoutMs}ms` });
+                }, timeoutMs);
+
+                req = client.get(
+                  url,
+                  {
+                    headers: { 'User-Agent': 'GitHub-Actions-SmokeTest' },
+                    timeout: timeoutMs,
+                  },
+                  (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => {
+                      data += chunk;
+                      // Guard against unexpectedly large responses
+                      if (data.length > 65536) {
+                        req.destroy();
+                        settle({ ok: false, status: res.statusCode, error: 'Response body exceeded 64KB' });
+                      }
+                    });
+                    res.on('end', () => {
+                      if (res.statusCode !== 200) {
+                        return settle({ ok: false, status: res.statusCode, error: `HTTP ${res.statusCode}` });
+                      }
+                      try {
+                        const json = JSON.parse(data);
+                        if (!json || typeof json !== 'object') {
+                          return settle({ ok: false, status: res.statusCode, error: 'Response is not a JSON object' });
+                        }
+                        settle({ ok: true, status: res.statusCode, data: json });
+                      } catch {
+                        settle({ ok: false, status: res.statusCode, error: 'Invalid JSON payload' });
+                      }
+                    });
+                    res.on('error', (err) => {
+                      settle({ ok: false, error: err.message || 'Response stream error' });
+                    });
+                  }
+                );
+
+                req.on('timeout', () => {
+                  req.destroy();
+                  settle({ ok: false, error: `Socket timed out after ${timeoutMs}ms` });
+                });
+
+                req.on('error', (err) => {
+                  settle({ ok: false, error: err.message || 'Network error' });
+                });
+              } catch (err) {
+                settle({ ok: false, error: err.message || 'URL error' });
+              }
+            });
+          }
+
+          function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+          }
+
+          async function run() {
+            let attempt = 0;
+            let lastState = null;
+
+            while (true) {
+              const now = Date.now();
+              const remainingMs = deadline - now;
+              // If no meaningful time remains, do not start another request
+              if (remainingMs < MIN_MEANINGFUL_TIME_MS) {
+                break;
+              }
+
+              attempt++;
+              // Enforce request timeout is the earlier of configured timeout or remaining deadline
+              const requestTimeout = Math.min(maxRequestTimeoutMs, remainingMs);
+              const res = await fetchHealth(healthUrl, requestTimeout);
+
+              if (!res.ok) {
+                lastState = { error: res.error, httpStatus: res.status || null };
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`[Attempt ${attempt} @ ${elapsed}s] Health check not ready: ${res.error}.`);
+              } else {
+                const body = (res.data && typeof res.data === 'object') ? res.data : {};
+                const commit = typeof body.commit === 'string' ? body.commit.trim() : null;
+                const environment = typeof body.environment === 'string' ? body.environment.trim() : null;
+                const status = typeof body.status === 'string' ? body.status.trim() : null;
+                const database = typeof body.database === 'string' ? body.database.trim() : null;
+
+                lastState = { commit, environment, status, database };
+
+                const commitMatches = commit === expectedSha;
+                const envMatches = environment === 'production';
+                const statusMatches = status === 'healthy';
+                const dbMatches = database === 'connected';
+
+                if (commitMatches && envMatches && statusMatches && dbMatches) {
+                  const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                  console.log('\n==================================================');
+                  console.log(`[Attempt ${attempt} @ ${totalElapsed}s] Verification SUCCESS:`);
+                  console.log(`  - Active Commit: ${commit} (matches expected)`);
+                  console.log(`  - Environment:   ${environment}`);
+                  console.log(`  - Status:        ${status}`);
+                  console.log(`  - Database:      ${database}`);
+                  console.log(`  - Timestamp:     ${body.timestamp || 'N/A'}`);
+                  console.log('==================================================');
+                  process.exit(0);
+                }
+
+                const mismatches = [];
+                if (!commitMatches) mismatches.push(`commit (${commit ?? 'null'} != ${expectedSha})`);
+                if (!envMatches) mismatches.push(`environment (${environment ?? 'null'} != production)`);
+                if (!statusMatches) mismatches.push(`status (${status ?? 'null'} != healthy)`);
+                if (!dbMatches) mismatches.push(`database (${database ?? 'null'} != connected)`);
+
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`[Attempt ${attempt} @ ${elapsed}s] Deployment in progress: ${mismatches.join(', ')}.`);
+              }
+
+              const remainingAfterReq = deadline - Date.now();
+              if (remainingAfterReq < MIN_MEANINGFUL_TIME_MS) {
+                break;
+              }
+
+              const sleepMs = Math.min(intervalMs, remainingAfterReq);
+              await sleep(sleepMs);
+            }
+
+            const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
+            console.error('\n==================================================');
+            console.error(`ERROR: Smoke test failed: expected commit ${expectedSha} was not active within ${elapsedSec}s deadline (${attempt} attempts).`);
+            console.error('Last observed endpoint state:');
+            if (lastState && !lastState.error) {
+              console.error(`  - Observed Commit:      ${lastState.commit ?? 'null'}`);
+              console.error(`  - Observed Environment: ${lastState.environment ?? 'null'}`);
+              console.error(`  - Observed Status:      ${lastState.status ?? 'null'}`);
+              console.error(`  - Observed Database:    ${lastState.database ?? 'null'}`);
+            } else if (lastState && lastState.error) {
+              console.error(`  - Last Error:       ${lastState.error}`);
+              console.error(`  - Last HTTP Status: ${lastState.httpStatus ?? 'N/A'}`);
+            } else {
+              console.error('  - No response received.');
+            }
+            console.error('==================================================');
+            process.exit(1);
+          }
+
+          run();
+          EOF
+          node smoke-test.js
