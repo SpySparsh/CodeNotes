@@ -361,9 +361,7 @@ export function extractRoutePath(spanName?: string): string | null {
  * Server-side tracesSampler policy for Sentry performance monitoring.
  * Excludes health, metrics, inngest, and oauth routes unconditionally (even if parentSampled is true).
  * Uses exact route matching rather than substring inclusion to avoid false positives.
- * For the temporary Step 10AD diagnostic, forces 100% sampling on the exact root transaction GET /api/notes,
- * even when the incoming trace has parentSampled: false.
- * For all other non-excluded routes, honors inherited parentSampled decisions.
+ * For non-excluded routes, honors inherited parentSampled decisions.
  * Samples ~10% of high-value instrumented API routes, returning 0 for all other paths.
  */
 export function serverTracesSampler(samplingContext: any): number | boolean {
@@ -382,28 +380,12 @@ export function serverTracesSampler(samplingContext: any): number | boolean {
     return 0;
   }
 
-  // 2. Temporary Step 10AD diagnostic: force 100% sampling for the exact root transaction GET /api/notes,
-  // taking precedence over inherited parentSampled decisions (even when parentSampled is explicitly false).
-  // Other instrumented routes preserve inherited sampling or the standard 10% rate.
-  const httpMethod =
-    (samplingContext?.attributes?.['http.method'] as string | undefined) ||
-    (spanName.match(/^(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/i)?.[0]?.toUpperCase());
-
-  const isExactGetNotesRoute =
-    spanName === 'GET /api/notes' ||
-    (extractedPath === '/api/notes' && httpMethod === 'GET') ||
-    (normalizedRouteAttr === '/api/notes' && httpMethod === 'GET');
-
-  if (isExactGetNotesRoute) {
-    return 1.0;
-  }
-
-  // 3. For all other non-excluded routes, honor explicit parent sampling decision
+  // 2. For non-excluded routes, honor explicit parent sampling decision
   if (samplingContext?.parentSampled !== undefined) {
     return samplingContext.parentSampled;
   }
 
-  // 4. Sample targeted high-value API routes at ~10%
+  // 3. Sample targeted high-value API routes at ~10%
   if (
     TARGET_INSTRUMENTED_ROUTES.has(spanName) ||
     (normalizedRouteAttr && TARGET_API_ROUTES.has(normalizedRouteAttr))
@@ -411,7 +393,7 @@ export function serverTracesSampler(samplingContext: any): number | boolean {
     return 0.1;
   }
 
-  // 5. Default unsampled for any other route
+  // 4. Default unsampled for any other route
   return 0;
 }
 
