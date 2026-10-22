@@ -26,7 +26,11 @@ export async function GET(
         const result = await withSentryChildSpan(
           'db.query_note_by_id',
           { op: 'db', parentSpan: span },
-          () => query('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [id, user.id])
+          () =>
+            query(
+              'SELECT id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands, created_at FROM notes WHERE id = $1 AND user_id = $2',
+              [id, user.id]
+            )
         );
         const durationMs = performance.now() - startTime;
 

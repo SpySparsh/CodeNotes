@@ -61,10 +61,10 @@ describe('User Isolation & IDOR Protection (User A vs User B)', () => {
     expect(body.success).toBe(true);
     expect(body.note.id).toBe(NOTE_A_ID);
     expect(body.note.userId).toBe(USER_A_ID);
-    expect(db.query).toHaveBeenCalledWith('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [
-      NOTE_A_ID,
-      USER_A_ID,
-    ]);
+    expect(db.query).toHaveBeenCalledWith(
+      'SELECT id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands, created_at FROM notes WHERE id = $1 AND user_id = $2',
+      [NOTE_A_ID, USER_A_ID]
+    );
   });
 
   it('User B is denied access when attempting to retrieve User A note (GET /api/notes/[id] -> 404)', async () => {
@@ -86,10 +86,10 @@ describe('User Isolation & IDOR Protection (User A vs User B)', () => {
     expect(response.status).toBe(404);
     const body = await response.json();
     expect(body).toEqual({ error: 'Note not found' });
-    expect(db.query).toHaveBeenCalledWith('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [
-      NOTE_A_ID,
-      USER_B_ID,
-    ]);
+    expect(db.query).toHaveBeenCalledWith(
+      'SELECT id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands, created_at FROM notes WHERE id = $1 AND user_id = $2',
+      [NOTE_A_ID, USER_B_ID]
+    );
   });
 
   it('User B is denied from deleting User A note (DELETE /api/notes/[id] -> 404)', async () => {

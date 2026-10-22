@@ -81,10 +81,61 @@ describe('GET /api/notes/[id]', () => {
       createdAt: '2026-09-23T12:00:00Z',
     });
 
-    expect(db.query).toHaveBeenCalledWith('SELECT * FROM notes WHERE id = $1 AND user_id = $2', [
-      'note-uuid-1234',
-      mockUserId,
-    ]);
+    expect(db.query).toHaveBeenCalledWith(
+      'SELECT id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands, created_at FROM notes WHERE id = $1 AND user_id = $2',
+      ['note-uuid-1234', mockUserId]
+    );
+  });
+
+  it('preserves exact response contract and does not leak unexpected database columns', async () => {
+    vi.mocked(auth.requireUser).mockResolvedValueOnce({ id: mockUserId } as any);
+
+    const mockRow = {
+      id: 'note-uuid-5678',
+      user_id: mockUserId,
+      video_id: 'vid56789012',
+      video_title: 'TypeScript Deep Dive',
+      video_url: 'https://www.youtube.com/watch?v=vid56789012',
+      thumbnail_url: null,
+      overview: 'Deep dive into advanced TypeScript types.',
+      key_concepts: ['Generics', 'Conditional Types'],
+      detailed_notes: '## Content',
+      shorthands: ['Use satisfies'],
+      created_at: '2026-10-01T00:00:00Z',
+      // Extra database column that should NOT be passed through
+      internal_secret_column: 'hidden_val',
+      unmapped_future_field: 12345,
+    };
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [mockRow],
+      rowCount: 1,
+      command: 'SELECT',
+      oid: 0,
+      fields: [],
+    } as any);
+
+    const request = new Request('http://localhost:3000/api/notes/note-uuid-5678');
+    const response = await GET(request, { params: Promise.resolve({ id: 'note-uuid-5678' }) });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.note).toEqual({
+      id: 'note-uuid-5678',
+      userId: mockUserId,
+      videoId: 'vid56789012',
+      videoTitle: 'TypeScript Deep Dive',
+      videoUrl: 'https://www.youtube.com/watch?v=vid56789012',
+      thumbnailUrl: null,
+      overview: 'Deep dive into advanced TypeScript types.',
+      keyConcepts: ['Generics', 'Conditional Types'],
+      detailedNotes: '## Content',
+      shorthands: ['Use satisfies'],
+      createdAt: '2026-10-01T00:00:00Z',
+    });
+    expect(body.note).not.toHaveProperty('internal_secret_column');
+    expect(body.note).not.toHaveProperty('unmapped_future_field');
   });
 
   it('should return 404 when note is not found or owned by another user (IDOR protection)', async () => {
