@@ -248,6 +248,8 @@ describe('Log Privacy Remediation & Leakage Prevention', () => {
         status: 'healthy',
         timestamp: expect.any(String),
         database: 'connected',
+        commit: null,
+        environment: null,
       });
 
       const healthLog = loggedEntries.find((e) => e.event === 'health_check_passed');

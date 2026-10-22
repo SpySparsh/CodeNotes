@@ -8,6 +8,9 @@ export async function GET(request?: Request) {
   const startTime = performance.now();
   const requestId = getRequestId(request);
 
+  const commit = process.env.VERCEL_GIT_COMMIT_SHA?.trim() || null;
+  const environment = process.env.VERCEL_ENV?.trim() || null;
+
   try {
     await query('SELECT 1');
     const durationMs = performance.now() - startTime;
@@ -27,6 +30,8 @@ export async function GET(request?: Request) {
         status: 'healthy',
         timestamp: new Date().toISOString(),
         database: 'connected',
+        commit,
+        environment,
       },
       {
         status: 200,
@@ -51,6 +56,8 @@ export async function GET(request?: Request) {
         status: 'unhealthy',
         timestamp: new Date().toISOString(),
         database: 'disconnected',
+        commit,
+        environment,
       },
       {
         status: 503,
