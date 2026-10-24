@@ -1,5 +1,15 @@
 # CodeNotes AI — Implementation Plan
 
+> [!WARNING]
+> **Historical Scaffolding Document (Deprecated)**:
+> This document is an initial exploratory implementation plan created during the project's early scaffolding phase. It references an obsolete architecture (including local SQLite via `better-sqlite3`, synchronous execution, and early prototype component layouts).
+>
+> **Do not use this plan as an authoritative reference.** The active architecture, database schema, and operational procedures are documented in:
+> - [README.md](README.md) — System overview, quickstart, and operational boundaries.
+> - [docs/architecture.md](docs/architecture.md) — Authoritative PostgreSQL schema, Supabase RLS, Inngest durable pipelines, and security model.
+> - [docs/development.md](docs/development.md) — Development setup, migrations, and testing runbook.
+> - [docs/observability.md](docs/observability.md) — Logging, Prometheus metrics, Grafana dashboards, and health checks.
+
 Build a local web app that takes a YouTube URL, fetches its transcript, and uses Gemini AI to generate structured study notes with code extraction.
 
 ## User Review Required

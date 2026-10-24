@@ -32,7 +32,8 @@ cp .env.example .env.local
 | `SUPADATA_API_KEY` | Optional | Supadata API key for primary transcript retrieval (falls back to scraper if unset or failed) | Get from [Supadata.ai](https://supadata.ai/) |
 | `INNGEST_EVENT_KEY` | Optional | Inngest event sending key (for cloud event dispatch; not needed for local dev server) | `mock-event-key` |
 | `INNGEST_SIGNING_KEY` | Optional | Inngest webhook signature verification key | `mock-signing-key` |
-| `TEST_DATABASE_URL` | For RLS tests | Dedicated, isolated local PostgreSQL database used strictly for RLS migration & policy tests | `postgresql://postgres:postgrespassword@localhost:5432/codenotes_test` |
+| `METRICS_SECRET` | Optional locally, **Required** in Preview/Prod | Secret Bearer token for authenticating Prometheus scrapes to `/api/metrics`. In local dev, leave unset for unauthenticated scraping. In Preview/Prod, missing secret fails closed with HTTP 503. | `your-metrics-secret` |
+| `TEST_DATABASE_URL` | For RLS tests | Dedicated, isolated local PostgreSQL database used strictly for RLS migration & policy tests (must point to `codenotes_test` on `localhost`) | `postgresql://postgres:postgrespassword@localhost:5432/codenotes_test` |
 | `SENTRY_DSN` | Optional | Server runtime Sentry DSN (safe to leave unset; Sentry initializes disabled with 0 outbound requests) | `https://examplePublicKey@o0.ingest.sentry.io/0` |
 | `NEXT_PUBLIC_SENTRY_DSN` | Optional | Client/browser Sentry DSN (safe to leave unset) | `https://examplePublicKey@o0.ingest.sentry.io/0` |
 | `SENTRY_AUTH_TOKEN` | Optional | Sentry authentication token for sourcemap uploads during production build | `sntrys_...` |
@@ -41,6 +42,10 @@ cp .env.example .env.local
 | `DATABASE_CA_CERT` | Optional | PostgreSQL Root CA Certificate (PEM string format) for SSL connections | `-----BEGIN CERTIFICATE-----...` |
 | `E2E_USER_EMAIL` | Optional | Email for Playwright authenticated live smoke tests (mock auth used by default) | `test-user@example.com` |
 | `E2E_USER_PASSWORD` | Optional | Password for Playwright authenticated live smoke tests | `test-password-123` |
+
+> [!NOTE]
+> **Platform-Provided Runtime Metadata (Vercel)**:
+> `VERCEL_GIT_COMMIT_SHA` and `VERCEL_ENV` are automatically provided by the Vercel hosting platform. They are consumed at runtime by `/api/health` to expose release metadata and by GitHub Actions post-deployment smoke tests. Developers should not define these variables manually in `.env.local`.
 
 > [!CAUTION]
 > Never commit `.env`, `.env.local`, or any actual credentials to git. The repository enforces `.gitignore` patterns for all private environment files.
@@ -56,6 +61,18 @@ To apply the schema to the database pointed to by `DATABASE_URL`:
 ```bash
 npm run db:migrate
 ```
+
+### Migration Safeguards & Concurrency Controls
+1. **Transaction-Scoped Advisory Lock**:
+   Immediately after opening an atomic transaction (`BEGIN`), the migration acquires PostgreSQL advisory lock key `7892348912734912`:
+   ```sql
+   SELECT pg_advisory_xact_lock(7892348912734912::bigint);
+   ```
+   This serializes concurrent migration processes, preventing race conditions or deadlock between multiple migration runners. The lock is released automatically by PostgreSQL when the transaction commits or rolls back.
+2. **Phase 1 Legacy Data Safeguard**:
+   Before enforcing `NOT NULL` on `user_id` columns in `notes` and `generation_idempotency`, the migration asserts that zero unowned legacy records exist. If unowned rows are detected, the migration immediately aborts with an exception to prevent silent data loss or unintended schema breakage.
+3. **Manual Execution Requirement**:
+   **Migrations do NOT run automatically during `npm run build` or the Vercel deployment pipeline.** When deploying database schema changes, operators must execute `npm run db:migrate` manually against the target environment database.
 
 This creates or updates the required tables:
 - `notes`: User study notes protected by PostgreSQL RLS.
@@ -166,12 +183,12 @@ npm run build
 
 ---
 
-## 6. Continuous Integration (CI)
+## 6. Continuous Integration (CI) & Deployment Workflows
 
-All quality gates run automatically in GitHub Actions on every push and pull request targeting `main` ([`.github/workflows/ci.yml`](file:///d:/unstuckstudy/.github/workflows/ci.yml)):
+All quality gates run automatically in GitHub Actions on every push and pull request targeting `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)):
 
 ```text
-GitHub Actions Workflow:
+GitHub Actions Workflow (CI):
   ├── 1. Setup Node.js 20 & install dependencies (npm ci --legacy-peer-deps)
   ├── 2. Spin up containerized PostgreSQL 16 service (codenotes_test)
   ├── 3. Unit & Integration tests (npm test)
@@ -183,3 +200,56 @@ GitHub Actions Workflow:
   ├── 9. Production Next.js build (npm run build)
   └── 10. Playwright Chromium deterministic E2E tests (npm run test:e2e)
 ```
+
+### Post-Deployment Smoke Testing ([`.github/workflows/post-deploy-smoke.yml`](../.github/workflows/post-deploy-smoke.yml))
+Following a successful CI run on a push to `main`, GitHub Actions triggers an automated end-to-end smoke test against the live production deployment:
+
+- **Trigger Condition**:
+  ```yaml
+  on:
+    workflow_run:
+      workflows: ["CI"]
+      types: [completed]
+      branches: [main]
+  ```
+  Runs only when `github.event.workflow_run.conclusion == 'success'` and `github.event.workflow_run.event == 'push'`.
+- **Target URL**: `https://my-code-note.vercel.app/api/health`
+- **Polling Loop & Budgets**:
+  - Total Timeout Budget: 10 minutes (`600000ms`, step timeout 11m, job timeout 12m).
+  - Polling Interval: 15 seconds (`15000ms`).
+  - Request Timeout: 10 seconds (`10000ms`).
+- **Verified Assertions**:
+  On every poll attempt, the smoke script verifies five distinct properties:
+  1. **HTTP Status**: Exactly `200 OK`.
+  2. **Active Commit**: `body.commit === EXPECTED_SHA` (matches the exact full 40-character git commit SHA of the push that triggered the workflow).
+  3. **Environment**: `body.environment === 'production'`.
+  4. **Health Status**: `body.status === 'healthy'`.
+  5. **Database Connectivity**: `body.database === 'connected'`.
+
+If any assertion fails or if the target deployment does not reflect the new commit within the 10-minute deadline, the smoke test job fails with non-zero exit code `1`.
+
+### Manual Release Verification Procedure
+Developers and operators can verify deployed production health and confirm the active release commit manually using curl:
+
+```bash
+curl -i https://my-code-note.vercel.app/api/health
+```
+
+Expected output:
+```http
+HTTP/2 200
+x-request-id: <uuid>
+content-type: application/json
+
+{
+  "status": "healthy",
+  "timestamp": "2026-10-24T18:00:00.000Z",
+  "database": "connected",
+  "commit": "<full-40-character-commit-sha>",
+  "environment": "production"
+}
+```
+
+> [!NOTE]
+> **Repository CI Checks vs. External Branch Protection**:
+> The CI quality gates (`CI / Run Quality Checks & End-to-End Tests`) and post-deployment smoke tests are defined in repository workflow files. However, mandatory status check enforcement and merge restrictions on branch `main` are managed by GitHub repository Branch Protection settings. These protection rules are configured externally via GitHub.com and cannot be verified from repository files alone.
