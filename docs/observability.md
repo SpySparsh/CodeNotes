@@ -9,23 +9,35 @@ CodeNotes includes a comprehensive, multi-layered observability stack combining 
 ```text
 Application Events & Requests
   │
-  ├── 1. Structured JSON Logs (stdout) ───► CloudWatch / Datadog / Console
+  ├── 1. Structured JSON Logs (stdout/stderr) ──► Terminal Console (custom JSON logger, no Pino)
   │
-  ├── 2. In-Memory Registry (prom-client) ─► /api/metrics ──► Scraped by Prometheus (every 15s)
-  │                                                                 │
-  │                                                                 ├── Evaluates Alerts (alerts.yml)
-  │                                                                 └── Visualized in Grafana (codenotes.json)
+  ├── 2. In-Memory Registry (prom-client) ──────► /api/metrics (Bearer auth via METRICS_SECRET)
+  │                                                 │
+  │                                                 ├── Scraped by Prometheus (every 15s)
+  │                                                 │     │
+  │                                                 │     ├── Evaluates Alerts (alerts.yml)
+  │                                                 │     └── Visualized in Grafana (codenotes.json)
   │
-  ├── 3. Health Probe ───────────────────► /api/health (SELECT 1 DB probe)
+  ├── 3. Health Probe ──────────────────────────► /api/health (SELECT 1 DB probe, release metadata)
   │
-  └── 4. Sentry SDK (with Sanitizer) ─────► Strips PII / Tokens ──► Sentry Ingest (Terminal errors only)
+  └── 4. Sentry SDK (with Sanitizer) ───────────► Strips PII / Tokens ──► Sentry Ingest (Terminal errors)
 ```
+
+### Application Logging Architecture ([`src/lib/logger.ts`](../src/lib/logger.ts))
+- **Custom JSON Logger**: Application logging is implemented with a lightweight custom logger emitting newline-delimited JSON. **Pino is not installed** in this project.
+- **Log Outputs**:
+  - `info` logs are emitted to `stdout` via `console.log`.
+  - `warn` logs are emitted to `stderr` via `console.warn`.
+  - `error` logs are emitted to `stderr` via `console.error`.
+- **Log Entry Schema**: Each log entry contains `timestamp` (ISO string), `level` (`info` | `warn` | `error`), `event` name, optional correlation `requestId`, optional `durationMs` (rounded to 2 decimal places), and contextual metadata.
+- **Log Inspection**: In local development, logs are inspected directly in the terminal where `npm run dev` is running.
+- **Grafana Data Source Boundary**: The local Grafana instance is provisioned with **Prometheus metrics as its only data source**. Grafana does **not** ingest or query application log lines (no Loki, Vector, or Promtail pipeline exists). Metrics and logs are correlated manually by matching timestamps and request IDs between the Grafana panels and terminal logs.
 
 ---
 
 ## 2. Prometheus Metrics (`/api/metrics`)
 
-The application registers and exposes Prometheus metrics at `/api/metrics` via a dedicated, curated registry in [`src/lib/metrics.ts`](file:///d:/unstuckstudy/src/lib/metrics.ts). Default Node.js process metrics are excluded to keep telemetry focused and low-noise.
+The application registers and exposes Prometheus metrics at `/api/metrics` via a dedicated, curated registry in [`src/lib/metrics.ts`](../src/lib/metrics.ts). Default Node.js process metrics are excluded to keep telemetry focused and low-noise.
 
 ### Complete Metrics Catalog
 
@@ -48,6 +60,22 @@ The application registers and exposes Prometheus metrics at `/api/metrics` via a
 All metrics use bounded, low-cardinality labels:
 - Dynamic paths are normalized (e.g., `/api/notes/[id]`, not `/api/notes/c3f4a0b...`).
 - Video IDs, user UUIDs, idempotency keys, and YouTube URLs are strictly excluded from metric labels.
+- **Metrics vs. Logs**: Prometheus metric labels strictly use low-cardinality enumerations (e.g., `status: 'success' | 'error' | 'malformed_output'`). Internal error messages and failure details are **never** stored in Prometheus metrics; they are emitted to stderr as structured JSON logs (`logger.error`) with fields such as `errorMessage` and `status`.
+
+### Metrics Scraping & Authentication (`METRICS_SECRET`)
+The endpoint at `/api/metrics` enforces authentication based on deployment environment:
+- **Preview & Production Environments** (`NODE_ENV === 'production'`, `VERCEL_ENV === 'production'`, or `VERCEL_ENV === 'preview'`):
+  - Every scrape request must provide the header: `Authorization: Bearer <METRICS_SECRET>`.
+  - Constant-time string comparison (`crypto.timingSafeEqual`) is used to protect against timing attacks.
+  - If `METRICS_SECRET` is unset or blank in preview/production, the endpoint **fails closed** with HTTP `503 Service Unavailable`.
+  - If the header is missing, malformed, or provides an incorrect token, the endpoint returns HTTP `401 Unauthorized`.
+- **Local Development**:
+  - If `METRICS_SECRET` is unset or blank, `/api/metrics` is publicly accessible without Bearer auth, allowing local Docker Prometheus to scrape out of the box.
+  - If `METRICS_SECRET` is configured in `.env.local`, Bearer authentication is enforced locally as well.
+- **Scrape Interval**: The Prometheus scraper ([`prometheus/prometheus.yml`](../prometheus/prometheus.yml)) scrapes `/api/metrics` every 15 seconds.
+
+### Cumulative Counters vs. Rate-Based Dashboards
+Prometheus counters (such as `http_requests_total` and `codenotes_generation_jobs_total`) are cumulative, monotonically increasing counters that reset to zero whenever the application process restarts. The Grafana dashboard panels calculate per-second rates using PromQL rate functions (e.g., `rate(http_requests_total[5m])`), ensuring panels reflect ongoing traffic and handle process restarts smoothly without anomalous cumulative spikes.
 
 ---
 
@@ -65,11 +93,45 @@ All metrics use bounded, low-cardinality labels:
 
 ## 4. Health Checks (`/api/health`)
 
-CodeNotes exposes `/api/health` ([`src/app/api/health/route.ts`](file:///d:/unstuckstudy/src/app/api/health/route.ts)) for uptime monitors and container liveness probes:
+CodeNotes exposes `/api/health` ([`src/app/api/health/route.ts`](../src/app/api/health/route.ts)) for uptime monitors, container liveness probes, and post-deployment release verification:
 - Executes an active probe against PostgreSQL (`SELECT 1`).
 - Measures database round-trip duration in milliseconds.
-- Returns `200 OK` with JSON `{ status: "ok", database: "healthy", durationMs: 1.2 }` when connected.
-- Returns `503 Service Unavailable` with JSON `{ status: "degraded", database: "unhealthy", errorMessage: "..." }` if the database is unreachable or connection pools are saturated.
+- Always returns an `x-request-id` response header for distributed tracing and request correlation.
+
+### Response Payloads
+
+#### Healthy Response (`200 OK`)
+Returned when PostgreSQL is reachable and `SELECT 1` succeeds:
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-10-24T18:00:00.000Z",
+  "database": "connected",
+  "commit": "<full-40-character-commit-sha>",
+  "environment": "production"
+}
+```
+
+#### Unhealthy Response (`503 Service Unavailable`)
+Returned when PostgreSQL is unreachable or connection pools are exhausted:
+```json
+{
+  "status": "unhealthy",
+  "timestamp": "2026-10-24T18:00:00.000Z",
+  "database": "disconnected",
+  "commit": "<full-40-character-commit-sha>",
+  "environment": "production"
+}
+```
+
+### Metadata and Information Disclosure Protections
+- **Release Metadata**: `commit` exposes `VERCEL_GIT_COMMIT_SHA` as the full 40-character Git commit SHA in deployed environments (or `null` in local development when unset) and `environment` exposes `VERCEL_ENV` (trimmed, or `null` if unset).
+- **Sensitive Detail Redaction**:
+  To prevent leaking internal latency figures or database credentials/connection strings, **`durationMs` and `errorMessage` are never returned in the JSON response body**.
+- **Diagnostic Destinations**:
+  - `durationMs` is recorded in Prometheus metrics via `http_request_duration_seconds`.
+  - On success, `logger.info('health_check_passed', { requestId, durationMs, database: 'healthy', ... })` is logged to `stdout`.
+  - On failure, `logger.error('health_check_failed', { requestId, durationMs, errorMessage, ... })` is logged to `stderr`.
 
 > [!NOTE]
 > **Scrape Availability vs. Database Health**:
@@ -189,3 +251,57 @@ To safeguard user privacy and prevent data leakage:
 | `note_viewed` | Note page loaded (`/notes/[id]`) | *(none)* | Deduplicated to fire once per unique note ID; no `note_id` |
 | `code_copied` | Copy code clicked (`CodeBlock`) | `language` (bounded string) | Language name only; code snippet content excluded |
 | `note_deleted` | Note removed (`/library`) | *(none)* | Only on successful deletion; no `note_id` transmitted |
+
+---
+
+## 9. Local Observability Setup & Safe Troubleshooting
+
+The local monitoring stack is provisioned using Docker Compose in [`docker-compose.prometheus.yml`](../docker-compose.prometheus.yml).
+
+### Starting the Stack
+```bash
+docker compose -f docker-compose.prometheus.yml up -d
+```
+- **Prometheus UI**: [http://localhost:9090](http://localhost:9090)
+- **Grafana UI**: [http://localhost:3001](http://localhost:3001) (default credentials: `admin` / `admin`)
+- **Dashboard**: "CodeNotes Overview" is auto-provisioned under General dashboards.
+- **Datasource**: Pre-configured Prometheus datasource (`http://prometheus:9090`, UID `PBFA97CFB590B2093`).
+
+### Handling Local Port Collisions
+By default, Prometheus scrapes `http://host.docker.internal:3000/api/metrics`. If port `3000` is already in use by another local service on your machine:
+
+1. **Run Next.js on an Alternate Port**:
+   ```bash
+   npm run dev -- -p 3100
+   ```
+2. **Point Prometheus to the Alternate Port**:
+   To avoid modifying tracked repository files (`prometheus/prometheus.yml`), create an untracked temporary Prometheus scrape configuration or Docker Compose volume override that updates the scrape target to `host.docker.internal:3100`.
+
+### Restricting Published Ports to Loopback (`127.0.0.1`)
+In [`docker-compose.prometheus.yml`](../docker-compose.prometheus.yml), host port bindings default to all network interfaces (`0.0.0.0:9090` and `0.0.0.0:3001`). To restrict Prometheus and Grafana strictly to loopback (`127.0.0.1`) and prevent LAN exposure:
+
+1. Create a local Compose override file (kept outside git tracking or gitignored, e.g. `docker-compose.loopback.yml`):
+   ```yaml
+   services:
+     prometheus:
+       ports: !override
+         - "127.0.0.1:9090:9090"
+     grafana:
+       ports: !override
+         - "127.0.0.1:3001:3000"
+   ```
+2. Launch with the override applied:
+   ```bash
+   docker compose -f docker-compose.prometheus.yml -f docker-compose.loopback.yml up -d
+   ```
+3. Inspect resolved bindings to confirm loopback restriction:
+   ```bash
+   docker compose -f docker-compose.prometheus.yml -f docker-compose.loopback.yml config
+   ```
+
+### Validating Monitoring Configuration
+To verify the dashboard queries, Prometheus alert rules, and Docker Compose volume mount paths:
+```bash
+npm run validate:observability
+```
+This runs [`tests/observability-config.test.ts`](../tests/observability-config.test.ts) to statically check that all dashboard metrics and alerting rules conform to the approved metrics catalog.
