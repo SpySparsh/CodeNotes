@@ -67,7 +67,15 @@ Detailed technical documentation is available in the `docs/` directory:
 - **PostgreSQL**: `16.x` (local instance or Supabase)
 - **Docker Compose**: Required for running the Prometheus/Grafana stack and RLS test containers
 
-### 2. Environment Configuration
+### 2. Install Dependencies
+Due to a peer dependency requirement between Vitest 5 and `@types/node 20`, install dependencies using `--legacy-peer-deps`:
+```bash
+npm install --legacy-peer-deps
+# or for clean CI installations
+npm ci --legacy-peer-deps
+```
+
+### 3. Environment Configuration
 Copy `.env.example` to `.env.local`:
 ```bash
 cp .env.example .env.local
@@ -79,15 +87,20 @@ NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
 GEMINI_API_KEY=your-gemini-api-key
 SUPADATA_API_KEY=your-optional-supadata-key
+# METRICS_SECRET is optional locally (leave unset or commented out for unauthenticated local Prometheus scraping)
+# METRICS_SECRET=your-metrics-secret
 ```
 
-### 3. Run Database Migrations
-Apply the idempotent schema migration:
+### 4. Run Database Migrations
+Apply the atomic schema migration:
 ```bash
 npm run db:migrate
 ```
 
-### 4. Start Development Servers
+> [!NOTE]
+> Database migrations acquire a transaction-scoped PostgreSQL advisory lock (`7892348912734912`) to serialize concurrent migration runs safely, and abort if unowned legacy records are detected. Migrations are executed manually and do not run automatically during Vercel builds. See [docs/development.md](docs/development.md) for details.
+
+### 5. Start Development Servers
 In separate terminal sessions:
 
 ```bash
@@ -145,8 +158,61 @@ npm run build
 | `GET` | `/api/notes` | List saved notes with keyset cursor pagination, search, and sorting |
 | `GET` | `/api/notes/[id]` | Retrieve a single note by UUID (authenticated, RLS-scoped) |
 | `DELETE` | `/api/notes/[id]` | Delete a note by UUID (authenticated, RLS-scoped) |
-| `GET` | `/api/health` | Active database liveness probe (`SELECT 1`) returning connection latency |
-| `GET` | `/api/metrics` | Prometheus metrics endpoint exposing HTTP, pipeline, and AI inference telemetry |
+| `GET` | `/api/health` | Active database probe (`SELECT 1`) returning connectivity and release metadata |
+| `GET` | `/api/metrics` | Prometheus metrics endpoint (requires `METRICS_SECRET` Bearer auth in Preview/Production) |
+
+### Health Probe & Release Metadata (`/api/health`)
+
+CodeNotes exposes an active database liveness probe at `/api/health` returning an `x-request-id` header:
+
+- **Healthy (`200 OK`)**:
+  ```json
+  {
+    "status": "healthy",
+    "timestamp": "2026-10-24T18:00:00.000Z",
+    "database": "connected",
+    "commit": "<full-40-character-commit-sha>",
+    "environment": "production"
+  }
+  ```
+- **Unhealthy (`503 Service Unavailable`)**:
+  ```json
+  {
+    "status": "unhealthy",
+    "timestamp": "2026-10-24T18:00:00.000Z",
+    "database": "disconnected",
+    "commit": "<full-40-character-commit-sha>",
+    "environment": "production"
+  }
+  ```
+
+> [!IMPORTANT]
+> - `commit` exposes the full 40-character Git commit SHA from `VERCEL_GIT_COMMIT_SHA` in deployed environments (or `null` in local development when unset).
+> - To prevent sensitive information disclosure, database query latency (`durationMs`) and internal error details (`errorMessage`) are **never returned in the JSON response body**.
+> - Query latency is recorded in Prometheus metrics (`http_request_duration_seconds`), and failures are emitted with structured error fields (including `errorMessage` and `status`) to stderr via JSON logs (`logger.error`). Prometheus records only low-cardinality status codes and labels; it does not store internal error strings.
+
+### Metrics Scraping & Authentication (`/api/metrics`)
+
+The Prometheus metrics endpoint exposes HTTP, pipeline, and AI telemetry:
+- **Preview & Production**: Requires `Authorization: Bearer <METRICS_SECRET>`. Missing or invalid tokens return HTTP `401 Unauthorized`. If `METRICS_SECRET` is unset or blank in preview/production, the endpoint fails closed with HTTP `503 Service Unavailable`.
+- **Local Development**: If `METRICS_SECRET` is unset or blank, `/api/metrics` allows unauthenticated scraping to simplify local Docker Prometheus development.
+
+---
+
+## Deployment & Verification Workflows
+
+1. **Automated Post-Deployment Smoke Verification**:
+   The GitHub Actions workflow [`.github/workflows/post-deploy-smoke.yml`](.github/workflows/post-deploy-smoke.yml) triggers automatically on `workflow_run` after CI completes successfully on pushes to `main`. It polls `https://my-code-note.vercel.app/api/health` every 15 seconds for up to 10 minutes, asserting:
+   - HTTP status code is `200`.
+   - `commit` matches the exact full 40-character Git commit SHA that triggered the workflow.
+   - `environment` equals `'production'`.
+   - `status` equals `'healthy'`.
+   - `database` equals `'connected'`.
+2. **Manual Release Verification**:
+   Inspect active health and the deployed full commit SHA via curl:
+   ```bash
+   curl -i https://my-code-note.vercel.app/api/health
+   ```
 
 ---
 
@@ -154,4 +220,5 @@ npm run build
 
 1. **Process-Local Prometheus Metrics**: The in-memory Prometheus registry in `/api/metrics` reflects metrics for the local Node.js process. In distributed or serverless multi-instance deployments (such as Vercel), scraping process-local memory does not provide global aggregation without an external aggregator like Prometheus Pushgateway or an OpenTelemetry Collector.
 2. **Scrape Availability vs. Database Health**: Prometheus `up{job="codenotes"}` proves only that the HTTP server is responsive and scrapable; active database availability must be verified via the `/api/health` endpoint.
-3. **Optional Error Reporting**: Sentry error tracking is completely optional. If `SENTRY_DSN` is unset, the SDK initializes disabled with zero outbound network calls, and any captured exceptions resolve as safe no-ops.
+3. **Structured Application Logging vs. Prometheus Metrics**: Structured JSON logs are emitted directly to stdout/stderr via a lightweight custom logger (`src/lib/logger.ts`). Pino is not installed, and no log ingestion pipeline is configured in the default local stack. Application logs are inspected in the terminal; Grafana visualizes Prometheus metrics only. Prometheus records aggregate counters and latency histograms with bounded labels, and never stores internal error messages.
+4. **Optional Error Reporting**: Sentry error tracking is completely optional. If `SENTRY_DSN` is unset, the SDK initializes disabled with zero outbound network calls, and any captured exceptions resolve as safe no-ops.
