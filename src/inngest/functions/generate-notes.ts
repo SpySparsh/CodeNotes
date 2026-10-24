@@ -8,7 +8,7 @@ import {
   validateYouTubeUrl,
   TranscriptError,
 } from '@/lib/transcript';
-import { generateNotes, GeneratedNotes } from '@/lib/gemini';
+import { generateAiNotes, GeneratedNotes, AiClientError } from '@/lib/ai-client';
 import { query, withUserTransaction } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import {
@@ -29,6 +29,14 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
   }
 
   if (error instanceof TranscriptError) {
+    return {
+      isUnrecoverable: !error.isRetryable,
+      code: error.code,
+      message: error.message,
+    };
+  }
+
+  if (error instanceof AiClientError || error?.name === 'AiClientError') {
     return {
       isUnrecoverable: !error.isRetryable,
       code: error.code,
@@ -345,7 +353,7 @@ export const generateNotesFunction = inngest.createFunction(
       }
     });
 
-    // Step 3: AI Generation with Gemini (Outside DB transaction)
+    // Step 3: AI Generation with FastAPI AI Service (Outside DB transaction)
     const generatedNotes = await step.run('generate-ai-notes', async () => {
       const stageStart = performance.now();
       try {
@@ -355,7 +363,9 @@ export const generateNotesFunction = inngest.createFunction(
           if (!mediaData.transcriptText) {
             throw new NonRetriableError('Transcript text is required for AI note generation.');
           }
-          aiNotes = await generateNotes(mediaData.transcriptText, mediaData.videoTitle);
+          aiNotes = await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
+            requestId: idempotencyKey,
+          });
         } catch (err: any) {
           const classification = classifyError(err);
           if (classification.isUnrecoverable) {
