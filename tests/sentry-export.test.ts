@@ -289,11 +289,16 @@ describe('Sentry API Tracing Span Export Integration (Step 10J)', () => {
     );
     const duration = performance.now() - start;
 
-    // Response returns immediately without blocking on flush execution
+    // Response returns immediately without blocking on flush execution.
+    // Rationale: A blocking flush takes timeoutMs = 2,000ms. A 250ms threshold easily
+    // catches any implementation that awaits the 2,000ms flush while accommodating CPU
+    // scheduling variability on Windows when 30 parallel Vitest workers run concurrently.
+    // Furthermore, non-blocking behavior is structurally verified below by confirming that
+    // receivedEnvelopes remains 0 until afterState.scheduledCallback() is explicitly triggered.
     expect(response.status).toBe(200);
     expect(response.data).toBe('fast-response');
     expect(afterState.scheduledCallback).not.toBeNull();
-    expect(duration).toBeLessThan(50);
+    expect(duration).toBeLessThan(250);
 
     // Envelopes have not yet been sent to transport prior to background after() task execution
     expect(receivedEnvelopes.length).toBe(0);

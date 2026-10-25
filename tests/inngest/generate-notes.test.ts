@@ -26,6 +26,7 @@ import {
 } from '@/inngest/functions/generate-notes';
 import * as transcript from '@/lib/transcript';
 import * as gemini from '@/lib/gemini';
+import * as aiClient from '@/lib/ai-client';
 import * as db from '@/lib/db';
 import { registry } from '@/lib/metrics';
 
@@ -53,6 +54,30 @@ vi.mock('@/lib/transcript', () => ({
       this.code = code;
       this.isRetryable = isRetryable;
       this.provider = provider;
+    }
+  },
+}));
+
+vi.mock('@/lib/ai-client', () => ({
+  generateAiNotes: vi.fn(),
+  AiClientError: class AiClientError extends Error {
+    readonly code: string;
+    readonly isRetryable: boolean;
+    readonly statusCode?: number;
+    readonly requestId?: string;
+    constructor(options: {
+      code: string;
+      message: string;
+      isRetryable: boolean;
+      statusCode?: number;
+      requestId?: string;
+    }) {
+      super(options.message);
+      this.name = 'AiClientError';
+      this.code = options.code;
+      this.isRetryable = options.isRetryable;
+      this.statusCode = options.statusCode;
+      this.requestId = options.requestId;
     }
   },
 }));
@@ -150,6 +175,61 @@ describe('Inngest Error Classification (classifyError)', () => {
     expect(result.isUnrecoverable).toBe(false);
     expect(result.code).toBe('DB_TRANSIENT_ERROR');
   });
+
+  it('classifies AiClientError RATE_LIMITED as retryable', () => {
+    const error = new (aiClient as any).AiClientError({
+      code: 'RATE_LIMITED',
+      message: 'Rate limit exceeded',
+      isRetryable: true,
+    });
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(false);
+    expect(result.code).toBe('RATE_LIMITED');
+  });
+
+  it('classifies AiClientError TIMEOUT as retryable', () => {
+    const error = new (aiClient as any).AiClientError({
+      code: 'TIMEOUT',
+      message: 'Timed out',
+      isRetryable: true,
+    });
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(false);
+    expect(result.code).toBe('TIMEOUT');
+  });
+
+  it('classifies AiClientError UPSTREAM_ERROR as retryable', () => {
+    const error = new (aiClient as any).AiClientError({
+      code: 'UPSTREAM_ERROR',
+      message: 'Upstream provider error',
+      isRetryable: true,
+    });
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(false);
+    expect(result.code).toBe('UPSTREAM_ERROR');
+  });
+
+  it('classifies AiClientError MALFORMED_AI_OUTPUT as unrecoverable', () => {
+    const error = new (aiClient as any).AiClientError({
+      code: 'MALFORMED_AI_OUTPUT',
+      message: 'Malformed output',
+      isRetryable: false,
+    });
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(true);
+    expect(result.code).toBe('MALFORMED_AI_OUTPUT');
+  });
+
+  it('classifies AiClientError CONFIG_ERROR as unrecoverable', () => {
+    const error = new (aiClient as any).AiClientError({
+      code: 'CONFIG_ERROR',
+      message: 'Configuration missing',
+      isRetryable: false,
+    });
+    const result = classifyError(error);
+    expect(result.isUnrecoverable).toBe(true);
+    expect(result.code).toBe('CONFIG_ERROR');
+  });
 });
 
 describe('Inngest generateNotesFunction', () => {
@@ -225,8 +305,8 @@ describe('Inngest generateNotesFunction', () => {
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(mockTitle);
 
-    // Step 3: Gemini inference
-    vi.mocked(gemini.generateNotes).mockResolvedValueOnce(mockAiNotes);
+    // Step 3: AI Generation via FastAPI service
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
 
     // Step 4: withUserTransaction queries (check lock -> insert note -> update completed)
     vi.mocked(db.query).mockResolvedValueOnce({
@@ -256,7 +336,10 @@ describe('Inngest generateNotesFunction', () => {
     ]);
 
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
-    expect(gemini.generateNotes).toHaveBeenCalledWith(mockTranscript, mockTitle);
+    expect(aiClient.generateAiNotes).toHaveBeenCalledWith(mockTranscript, mockTitle, {
+      requestId: mockKey,
+    });
+    expect(gemini.generateNotes).not.toHaveBeenCalled();
     expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
   });
 
@@ -277,7 +360,7 @@ describe('Inngest generateNotesFunction', () => {
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Test Title');
 
-    vi.mocked(gemini.generateNotes).mockResolvedValueOnce({
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce({
       overview: 'Overview',
       keyConcepts: ['Concept'],
       detailedNotes: 'Notes',
@@ -467,7 +550,7 @@ describe('Inngest generateNotesFunction', () => {
       cached: false,
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
-    vi.mocked(gemini.generateNotes).mockResolvedValueOnce(mockAiNotes);
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
@@ -492,7 +575,7 @@ describe('Inngest generateNotesFunction', () => {
       cached: true,
     });
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
-    vi.mocked(gemini.generateNotes).mockResolvedValueOnce(mockAiNotes);
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
@@ -524,6 +607,7 @@ describe('Inngest generateNotesFunction', () => {
     expect(executedSteps).toEqual(['claim-generation-processing']);
 
     expect(transcript.acquireTranscript).not.toHaveBeenCalled();
+    expect(aiClient.generateAiNotes).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
     expect(db.withUserTransaction).not.toHaveBeenCalled();
   });
@@ -545,6 +629,7 @@ describe('Inngest generateNotesFunction', () => {
     expect(executedSteps).toEqual(['claim-generation-processing']);
 
     expect(transcript.acquireTranscript).not.toHaveBeenCalled();
+    expect(aiClient.generateAiNotes).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
   });
 
@@ -574,6 +659,7 @@ describe('Inngest generateNotesFunction', () => {
     // Verify direct video fallback is NEVER called
     expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
     expect(gemini.generateNotes).not.toHaveBeenCalled();
+    expect(aiClient.generateAiNotes).not.toHaveBeenCalled();
   });
 
   it('throws NonRetriableError on payload mismatch', async () => {

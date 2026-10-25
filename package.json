@@ -11,6 +11,7 @@
     "test:watch": "vitest",
     "test:integration:rls": "vitest run --config vitest.integration.config.ts",
     "validate:observability": "vitest run tests/observability-config.test.ts",
+    "test:fastapi-boundary": "node scripts/verify-fastapi-boundary.mjs",
     "test:e2e": "node scripts/run-e2e.js",
     "test:e2e:auth-smoke": "playwright test e2e/auth-smoke.spec.ts",
     "test:e2e:all": "playwright test",

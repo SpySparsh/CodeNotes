@@ -26,9 +26,10 @@ Browser Tier (React 19 / TanStack Query)
   └── 2. Polling /api/generate/status                               ▼
                                                         Inngest Serverless Engine (/api/inngest)
                                                                     │
-                                                                    ├── Step 1: Claim 15-min lease
+                                                                    ├── Step 1: Claim 15-min lease (PostgreSQL)
                                                                     ├── Step 2: Fetch transcript (Cache / Supadata / Scraper)
-                                                                    ├── Step 3: Gemini 2.5 Flash inference
+                                                                    ├── Step 3: Invoke FastAPI AI Generator
+                                                                    │          (POST /api/v1/generate ──► Gemini 2.5 Flash)
                                                                     └── Step 4: Atomic RLS commit (notes table)
 ```
 
@@ -86,6 +87,10 @@ DATABASE_URL=postgresql://postgres:postgrespassword@localhost:5432/codenotes
 NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
 GEMINI_API_KEY=your-gemini-api-key
+FASTAPI_SERVICE_URL=http://127.0.0.1:8000
+FASTAPI_SERVICE_SECRET=your-fastapi-service-secret
+# FASTAPI_VERCEL_PROTECTION_BYPASS is required only when calling a Vercel-protected FastAPI Preview deployment:
+# FASTAPI_VERCEL_PROTECTION_BYPASS=your-vercel-protection-bypass-secret
 SUPADATA_API_KEY=your-optional-supadata-key
 # METRICS_SECRET is optional locally (leave unset or commented out for unauthenticated local Prometheus scraping)
 # METRICS_SECRET=your-metrics-secret
@@ -110,13 +115,26 @@ npm run dev
 # Terminal 2: Inngest Local Dev Server
 npm run inngest:dev
 
-# Terminal 3 (Optional): Prometheus & Grafana Monitoring Stack
+# Terminal 3: FastAPI AI Generator Microservice
+cd services/ai-generator
+# Windows:
+.\.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Terminal 4 (Optional): Prometheus & Grafana Monitoring Stack
 docker compose -f docker-compose.prometheus.yml up -d
 ```
-- **App**: [http://localhost:3000](http://localhost:3000)
+
+- **Next.js Web App**: [http://localhost:3000](http://localhost:3000)
 - **Inngest Dashboard**: [http://localhost:8288](http://localhost:8288)
+- **FastAPI AI Service**: [http://localhost:8000/health](http://localhost:8000/health)
 - **Prometheus**: [http://localhost:9090](http://localhost:9090)
 - **Grafana**: [http://localhost:3001](http://localhost:3001) (`admin` / `admin`)
+
+> [!TIP]
+> **Native Execution vs. Docker Compose**: For local development, running Next.js, Inngest, and FastAPI natively on the host machine provides the fastest hot-reload feedback, sub-second Turbopack compilation, and instant Python reloads without container translation overhead. Docker Compose is recommended for supporting background infrastructure (Prometheus/Grafana) or isolated staging runs.
 
 ---
 
@@ -125,24 +143,34 @@ docker compose -f docker-compose.prometheus.yml up -d
 CodeNotes enforces automated quality checks covering the full testing pyramid:
 
 ```bash
-# 1. Run all unit, integration, and sanitizer tests (Vitest)
+# 1. Run all Node.js unit and integration tests (Vitest)
 npm test
 
-# 2. Run PostgreSQL Row Level Security (RLS) integration tests
+# 2. Run real loopback cross-process FastAPI boundary verification
+npm run test:fastapi-boundary
+
+# 3. Run Python unit and integration tests (Pytest)
+cd services/ai-generator && pytest && cd ../..
+
+# 4. Check Python linting and formatting (Ruff)
+ruff check services/ai-generator
+ruff format --check services/ai-generator
+
+# 5. Run PostgreSQL Row Level Security (RLS) integration tests
 # (Requires TEST_DATABASE_URL pointing to isolated local 'codenotes_test' database)
 npm run test:integration:rls
 
-# 3. Validate Prometheus config, alert rules, and Grafana dashboard queries
+# 6. Validate Prometheus config, alert rules, and Grafana dashboard queries
 npm run validate:observability
 
-# 4. Run deterministic Playwright end-to-end tests
+# 7. Run deterministic Playwright end-to-end tests
 npm run test:e2e
 
-# 5. Linting and TypeScript type checking
+# 8. Linting and TypeScript type checking
 npm run lint
 npx tsc --noEmit
 
-# 6. Production Next.js build compilation
+# 9. Production Next.js build compilation
 npm run build
 ```
 
