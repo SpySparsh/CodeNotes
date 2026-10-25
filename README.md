@@ -105,9 +105,8 @@ npm run db:migrate
 > [!NOTE]
 > Database migrations acquire a transaction-scoped PostgreSQL advisory lock (`7892348912734912`) to serialize concurrent migration runs safely, and abort if unowned legacy records are detected. Migrations are executed manually and do not run automatically during Vercel builds. See [docs/development.md](docs/development.md) for details.
 
-### 5. Start Development Servers (Multi-Service Workflow)
-
-To develop with live AI generation, start the multi-service stack in separate terminals:
+### 5. Start Development Servers
+In separate terminal sessions:
 
 ```bash
 # Terminal 1: Next.js Web App (Turbopack)
@@ -230,25 +229,14 @@ The Prometheus metrics endpoint exposes HTTP, pipeline, and AI telemetry:
 
 ## Deployment & Verification Workflows
 
-CodeNotes uses a multi-project deployment architecture on Vercel:
-
-1. **Next.js Web Application (Project Root: `.`)**:
-   - Deployed at `https://my-code-note.vercel.app` (or custom domain).
-   - Manages frontend UI, Supabase authentication, rate limiting, and Inngest durable workflows.
-   - Points to the FastAPI service via `FASTAPI_SERVICE_URL` (`https://...`) and `FASTAPI_SERVICE_SECRET`.
-2. **FastAPI AI Generator (Project Root: `services/ai-generator`)**:
-   - Deployed as an independent Vercel project linked to the same Git repository.
-   - Configured with `[tool.vercel] entrypoint = "app.main:app"`, `.python-version` (3.13), and `maxDuration: 90` in `vercel.json` (within the 300s Hobby maximum when Fluid Compute is enabled, or up to 800s on Pro/Enterprise; verify project Fluid Compute settings).
-   - Recommended region is `iad1` as a provisional default; confirm against actual Next.js and Supabase project regions in the respective cloud dashboards to minimize network latency.
-   - Complete setup and environment variable instructions are documented in [services/ai-generator/README.md](services/ai-generator/README.md#9-vercel-deployment-configuration-separate-project).
-3. **Automated Post-Deployment Smoke Verification**:
+1. **Automated Post-Deployment Smoke Verification**:
    The GitHub Actions workflow [`.github/workflows/post-deploy-smoke.yml`](.github/workflows/post-deploy-smoke.yml) triggers automatically on `workflow_run` after CI completes successfully on pushes to `main`. It polls `https://my-code-note.vercel.app/api/health` every 15 seconds for up to 10 minutes, asserting:
    - HTTP status code is `200`.
    - `commit` matches the exact full 40-character Git commit SHA that triggered the workflow.
    - `environment` equals `'production'`.
    - `status` equals `'healthy'`.
    - `database` equals `'connected'`.
-4. **Manual Release Verification**:
+2. **Manual Release Verification**:
    Inspect active health and the deployed full commit SHA via curl:
    ```bash
    curl -i https://my-code-note.vercel.app/api/health
@@ -262,15 +250,3 @@ CodeNotes uses a multi-project deployment architecture on Vercel:
 2. **Scrape Availability vs. Database Health**: Prometheus `up{job="codenotes"}` proves only that the HTTP server is responsive and scrapable; active database availability must be verified via the `/api/health` endpoint.
 3. **Structured Application Logging vs. Prometheus Metrics**: Structured JSON logs are emitted directly to stdout/stderr via a lightweight custom logger (`src/lib/logger.ts`). Pino is not installed, and no log ingestion pipeline is configured in the default local stack. Application logs are inspected in the terminal; Grafana visualizes Prometheus metrics only. Prometheus records aggregate counters and latency histograms with bounded labels, and never stores internal error messages.
 4. **Optional Error Reporting**: Sentry error tracking is completely optional. If `SENTRY_DSN` is unset, the SDK initializes disabled with zero outbound network calls, and any captured exceptions resolve as safe no-ops.
-5. **Distributed Log Correlation & Tracing**: Every inbound generation request receives or generates a correlation ID. The Node.js client sanitizes this to `^[a-zA-Z0-9_\-\.]{1,64}$` (`ai_client_request_id_normalized`) and transmits it via `X-Request-ID`. FastAPI validates the header in `RequestIdMiddleware`, logs all events with this ID, and echoes it in response headers. To trace a specific generation across Node.js and FastAPI logs, grep for the correlation ID:
-   ```bash
-   # Search Node.js and Inngest logs
-   grep "c8b3e51b-5903-4862-b80e-31ac0b7dec51" app.log
-   # Search FastAPI service logs
-   grep "c8b3e51b-5903-4862-b80e-31ac0b7dec51" fastapi.log
-   ```
-6. **Authentication & Secret Fail-Closed Safeguards**: If `FASTAPI_SERVICE_SECRET` is unset, blank, or retains default placeholder text (`change_me_to_a_secure_random_string` / `your_fastapi_service_secret_here`), both Node.js and FastAPI fail closed immediately with a non-retryable `CONFIG_ERROR` / HTTP 503, preventing unauthenticated access or accidental unencrypted transmissions.
-7. **Transport Security**: The Node.js client permits plain HTTP only when connecting to loopback targets (`localhost`, `127.0.0.1`, `::1`). Any remote non-local destination configured in `FASTAPI_SERVICE_URL` MUST use `https:` to protect service credentials in transit.
-8. **Single-Secret Rotation & In-Flight Interruption**: Authentication relies on a single shared `FASTAPI_SERVICE_SECRET`. Token mismatches return HTTP 401, mapped in Node.js to `CONFIG_ERROR` and handled in Inngest as a `NonRetriableError` (no automatic retries). Secret rotations must be conducted during a scheduled maintenance window when no generation jobs are running to avoid terminating in-flight jobs. Dual-secret rotation is tracked as a future enhancement.
-9. **Timeout Hierarchy**: Outbound Gemini inference timeout is 75s (`GEMINI_TIMEOUT_MS=75000`), the Node.js client abort timer is 85s (`DEFAULT_AI_TIMEOUT_MS=85000`), and the Vercel serverless function `maxDuration` is 90s. With Fluid Compute enabled, 90s is within Vercel's limits (Hobby maximum 300s, Pro/Enterprise maximum 800s; if Fluid Compute is disabled, Hobby is capped at 60s). Operators must verify Fluid Compute configuration in the Vercel dashboard prior to deployment. This staged hierarchy guarantees that internal application layers return clean structured errors before higher-level infrastructure proxies terminate the connection.
-10. **Vercel Preview Deployment Protection**: When calling a Vercel-protected FastAPI Preview deployment, Next.js transmits the platform bypass token in the `x-vercel-protection-bypass` header (`FASTAPI_VERCEL_PROTECTION_BYPASS`) while continuing to authenticate service requests with the internal Bearer token (`FASTAPI_SERVICE_SECRET`). If `FASTAPI_VERCEL_PROTECTION_BYPASS` is omitted in protected preview environments, the client fails closed with a non-retryable `CONFIG_ERROR`. Neither secret is logged.
