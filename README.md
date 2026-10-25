@@ -89,6 +89,8 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
 GEMINI_API_KEY=your-gemini-api-key
 FASTAPI_SERVICE_URL=http://127.0.0.1:8000
 FASTAPI_SERVICE_SECRET=your-fastapi-service-secret
+# FASTAPI_VERCEL_PROTECTION_BYPASS is required only when calling a Vercel-protected FastAPI Preview deployment:
+# FASTAPI_VERCEL_PROTECTION_BYPASS=your-vercel-protection-bypass-secret
 SUPADATA_API_KEY=your-optional-supadata-key
 # METRICS_SECRET is optional locally (leave unset or commented out for unauthenticated local Prometheus scraping)
 # METRICS_SECRET=your-metrics-secret
@@ -271,3 +273,4 @@ CodeNotes uses a multi-project deployment architecture on Vercel:
 7. **Transport Security**: The Node.js client permits plain HTTP only when connecting to loopback targets (`localhost`, `127.0.0.1`, `::1`). Any remote non-local destination configured in `FASTAPI_SERVICE_URL` MUST use `https:` to protect service credentials in transit.
 8. **Single-Secret Rotation & In-Flight Interruption**: Authentication relies on a single shared `FASTAPI_SERVICE_SECRET`. Token mismatches return HTTP 401, mapped in Node.js to `CONFIG_ERROR` and handled in Inngest as a `NonRetriableError` (no automatic retries). Secret rotations must be conducted during a scheduled maintenance window when no generation jobs are running to avoid terminating in-flight jobs. Dual-secret rotation is tracked as a future enhancement.
 9. **Timeout Hierarchy**: Outbound Gemini inference timeout is 75s (`GEMINI_TIMEOUT_MS=75000`), the Node.js client abort timer is 85s (`DEFAULT_AI_TIMEOUT_MS=85000`), and the Vercel serverless function `maxDuration` is 90s. With Fluid Compute enabled, 90s is within Vercel's limits (Hobby maximum 300s, Pro/Enterprise maximum 800s; if Fluid Compute is disabled, Hobby is capped at 60s). Operators must verify Fluid Compute configuration in the Vercel dashboard prior to deployment. This staged hierarchy guarantees that internal application layers return clean structured errors before higher-level infrastructure proxies terminate the connection.
+10. **Vercel Preview Deployment Protection**: When calling a Vercel-protected FastAPI Preview deployment, Next.js transmits the platform bypass token in the `x-vercel-protection-bypass` header (`FASTAPI_VERCEL_PROTECTION_BYPASS`) while continuing to authenticate service requests with the internal Bearer token (`FASTAPI_SERVICE_SECRET`). If `FASTAPI_VERCEL_PROTECTION_BYPASS` is omitted in protected preview environments, the client fails closed with a non-retryable `CONFIG_ERROR`. Neither secret is logged.

@@ -26,6 +26,8 @@ export interface GenerateAiNotesOptions {
   serviceUrl?: string;
   serviceSecret?: string;
   model?: string;
+  vercelProtectionBypass?: string;
+  requireVercelProtectionBypass?: boolean;
 }
 
 /**
@@ -59,18 +61,22 @@ export class AiClientError extends Error {
 
 /**
  * Validates and resolves FastAPI configuration settings.
- * Fails closed if settings are missing or if non-local destinations use unencrypted HTTP.
+ * Fails closed if settings are missing, if non-local destinations use unencrypted HTTP,
+ * or if the Vercel protection bypass token is missing in protected preview configurations.
  */
 export function getAiClientConfig(options?: GenerateAiNotesOptions): {
   serviceUrl: string;
   serviceSecret: string;
   timeoutMs: number;
+  vercelProtectionBypass?: string;
 } {
   const serviceUrl = options?.serviceUrl || process.env.FASTAPI_SERVICE_URL;
   const serviceSecret = options?.serviceSecret || process.env.FASTAPI_SERVICE_SECRET;
   const timeoutMs =
     options?.timeoutMs ??
     (process.env.FASTAPI_TIMEOUT_MS ? parseInt(process.env.FASTAPI_TIMEOUT_MS, 10) : DEFAULT_AI_TIMEOUT_MS);
+  const vercelProtectionBypass =
+    options?.vercelProtectionBypass || process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
 
   if (!serviceUrl || serviceUrl.trim().length === 0) {
     throw new AiClientError({
@@ -128,10 +134,42 @@ export function getAiClientConfig(options?: GenerateAiNotesOptions): {
     });
   }
 
+  const isBypassPlaceholder =
+    vercelProtectionBypass === 'your_vercel_protection_bypass_secret_here' ||
+    vercelProtectionBypass === 'your_bypass_secret_here' ||
+    vercelProtectionBypass === 'change_me_to_a_secure_random_string';
+
+  if (vercelProtectionBypass && isBypassPlaceholder) {
+    throw new AiClientError({
+      code: 'CONFIG_ERROR',
+      message: 'FASTAPI_VERCEL_PROTECTION_BYPASS is configured as a placeholder.',
+      isRetryable: false,
+    });
+  }
+
+  const isProtectedPreview =
+    options?.requireVercelProtectionBypass === true ||
+    process.env.FASTAPI_REQUIRE_VERCEL_PROTECTION_BYPASS === 'true' ||
+    (!isLocalhost &&
+      (process.env.VERCEL_ENV === 'preview' ||
+        (parsed.hostname.endsWith('.vercel.app') &&
+          (parsed.hostname.includes('-git-') || parsed.hostname.includes('preview')))));
+
+  if (isProtectedPreview) {
+    if (!vercelProtectionBypass || vercelProtectionBypass.trim().length === 0) {
+      throw new AiClientError({
+        code: 'CONFIG_ERROR',
+        message: 'FASTAPI_VERCEL_PROTECTION_BYPASS is required for Vercel protected preview deployments.',
+        isRetryable: false,
+      });
+    }
+  }
+
   return {
     serviceUrl: serviceUrl.replace(/\/+$/, ''),
     serviceSecret,
     timeoutMs,
+    vercelProtectionBypass: vercelProtectionBypass?.trim() || undefined,
   };
 }
 
@@ -197,7 +235,7 @@ export async function generateAiNotes(
     });
   }
 
-  const { serviceUrl, serviceSecret, timeoutMs } = getAiClientConfig(options);
+  const { serviceUrl, serviceSecret, timeoutMs, vercelProtectionBypass } = getAiClientConfig(options);
   const endpoint = `${serviceUrl}/api/v1/generate`;
   const startTime = performance.now();
 
@@ -219,13 +257,19 @@ export async function generateAiNotes(
 
     let response: Response;
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${serviceSecret}`,
+        'X-Request-ID': requestId,
+      };
+
+      if (vercelProtectionBypass) {
+        headers['x-vercel-protection-bypass'] = vercelProtectionBypass;
+      }
+
       response = await fetch(endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${serviceSecret}`,
-          'X-Request-ID': requestId,
-        },
+        headers,
         body: JSON.stringify({
           transcript,
           videoTitle,

@@ -10,9 +10,11 @@ import {
   DEFAULT_AI_MODEL,
 } from '@/lib/ai-client';
 import { registry } from '@/lib/metrics';
+import { logger } from '@/lib/logger';
 
 describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
   const originalFetch = globalThis.fetch;
+  const originalEnv = { ...process.env };
   const mockTranscript = 'In this tutorial we learn interfaces and generics in TypeScript.';
   const mockTitle = 'TypeScript Generics Masterclass';
   const validServiceUrl = 'http://127.0.0.1:8000';
@@ -28,12 +30,17 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registry.resetMetrics();
+    process.env = { ...originalEnv };
     process.env.FASTAPI_SERVICE_URL = validServiceUrl;
     process.env.FASTAPI_SERVICE_SECRET = validSecret;
+    delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+    delete process.env.FASTAPI_REQUIRE_VERCEL_PROTECTION_BYPASS;
+    delete process.env.VERCEL_ENV;
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    process.env = { ...originalEnv };
   });
 
   describe('Configuration & Security Validation', () => {
@@ -614,6 +621,199 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
         // Client error adopted the server-returned trace ID
         expect(err.requestId).toBe(serverId);
       }
+    });
+  });
+
+  describe('Vercel Deployment Protection Bypass Header & Security', () => {
+    const validBypassSecret = 'mock-vercel-bypass-token-777';
+
+    it('sends both Authorization: Bearer and x-vercel-protection-bypass headers when bypass is configured', async () => {
+      process.env.FASTAPI_VERCEL_PROTECTION_BYPASS = validBypassSecret;
+      let capturedInit: RequestInit | undefined;
+
+      globalThis.fetch = vi.fn(async (_url: any, init: any) => {
+        capturedInit = init;
+        return new Response(JSON.stringify(sampleValidResponse), { status: 200 });
+      });
+
+      await generateAiNotes(mockTranscript, mockTitle, {
+        requestId: 'trace-both-headers-123',
+      });
+
+      const headers = capturedInit?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${validSecret}`);
+      expect(headers['x-vercel-protection-bypass']).toBe(validBypassSecret);
+      expect(headers['X-Request-ID']).toBe('trace-both-headers-123');
+      expect(headers['Content-Type']).toBe('application/json');
+    });
+
+    it('does not send x-vercel-protection-bypass header when bypass is unset in standard environment', async () => {
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+      let capturedInit: RequestInit | undefined;
+
+      globalThis.fetch = vi.fn(async (_url: any, init: any) => {
+        capturedInit = init;
+        return new Response(JSON.stringify(sampleValidResponse), { status: 200 });
+      });
+
+      await generateAiNotes(mockTranscript, mockTitle);
+
+      const headers = capturedInit?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${validSecret}`);
+      expect(headers['x-vercel-protection-bypass']).toBeUndefined();
+    });
+
+    it('allows passing vercelProtectionBypass explicitly in options', async () => {
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+      let capturedInit: RequestInit | undefined;
+
+      globalThis.fetch = vi.fn(async (_url: any, init: any) => {
+        capturedInit = init;
+        return new Response(JSON.stringify(sampleValidResponse), { status: 200 });
+      });
+
+      await generateAiNotes(mockTranscript, mockTitle, {
+        vercelProtectionBypass: 'explicit-option-bypass-secret',
+      });
+
+      const headers = capturedInit?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${validSecret}`);
+      expect(headers['x-vercel-protection-bypass']).toBe('explicit-option-bypass-secret');
+    });
+
+    it('throws CONFIG_ERROR when FASTAPI_VERCEL_PROTECTION_BYPASS is a placeholder string', () => {
+      process.env.FASTAPI_VERCEL_PROTECTION_BYPASS = 'your_vercel_protection_bypass_secret_here';
+      expect(() => getAiClientConfig()).toThrowError(AiClientError);
+      try {
+        getAiClientConfig();
+      } catch (err: any) {
+        expect(err.code).toBe('CONFIG_ERROR');
+        expect(err.isRetryable).toBe(false);
+        expect(err.message).toContain('placeholder');
+      }
+
+      process.env.FASTAPI_VERCEL_PROTECTION_BYPASS = 'change_me_to_a_secure_random_string';
+      expect(() => getAiClientConfig()).toThrowError(AiClientError);
+    });
+
+    it('throws CONFIG_ERROR in Vercel preview environment when bypass secret is missing for remote target', () => {
+      process.env.VERCEL_ENV = 'preview';
+      process.env.FASTAPI_SERVICE_URL = 'https://codenotes-ai-generator.vercel.app';
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+
+      expect(() => getAiClientConfig()).toThrowError(AiClientError);
+      try {
+        getAiClientConfig();
+      } catch (err: any) {
+        expect(err.code).toBe('CONFIG_ERROR');
+        expect(err.isRetryable).toBe(false);
+        expect(err.message).toContain('FASTAPI_VERCEL_PROTECTION_BYPASS is required');
+      }
+    });
+
+    it('throws CONFIG_ERROR when FASTAPI_REQUIRE_VERCEL_PROTECTION_BYPASS is true and bypass is missing', () => {
+      process.env.FASTAPI_REQUIRE_VERCEL_PROTECTION_BYPASS = 'true';
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+
+      expect(() => getAiClientConfig()).toThrowError(AiClientError);
+      try {
+        getAiClientConfig();
+      } catch (err: any) {
+        expect(err.code).toBe('CONFIG_ERROR');
+        expect(err.isRetryable).toBe(false);
+        expect(err.message).toContain('FASTAPI_VERCEL_PROTECTION_BYPASS is required');
+      }
+    });
+
+    it('throws CONFIG_ERROR when options.requireVercelProtectionBypass is true and bypass is missing', () => {
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+
+      expect(() => getAiClientConfig({ requireVercelProtectionBypass: true })).toThrowError(AiClientError);
+      try {
+        getAiClientConfig({ requireVercelProtectionBypass: true });
+      } catch (err: any) {
+        expect(err.code).toBe('CONFIG_ERROR');
+        expect(err.isRetryable).toBe(false);
+        expect(err.message).toContain('FASTAPI_VERCEL_PROTECTION_BYPASS is required');
+      }
+    });
+
+    it('throws CONFIG_ERROR when target URL matches Vercel preview branch pattern and bypass is missing', () => {
+      process.env.FASTAPI_SERVICE_URL = 'https://codenotes-ai-generator-git-feat-preview.vercel.app';
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+
+      expect(() => getAiClientConfig()).toThrowError(AiClientError);
+      try {
+        getAiClientConfig();
+      } catch (err: any) {
+        expect(err.code).toBe('CONFIG_ERROR');
+        expect(err.isRetryable).toBe(false);
+        expect(err.message).toContain('FASTAPI_VERCEL_PROTECTION_BYPASS is required');
+      }
+    });
+
+    it('does not require bypass secret for local development targets even if VERCEL_ENV is set', () => {
+      process.env.VERCEL_ENV = 'preview';
+      process.env.FASTAPI_SERVICE_URL = 'http://127.0.0.1:8000';
+      delete process.env.FASTAPI_VERCEL_PROTECTION_BYPASS;
+
+      expect(() => getAiClientConfig()).not.toThrow();
+    });
+
+    it('strictly protects secrets: never emits FASTAPI_SERVICE_SECRET or FASTAPI_VERCEL_PROTECTION_BYPASS to logs', async () => {
+      const sensitiveServiceSecret = 'super-secret-service-token-999-xyz';
+      const sensitiveBypassSecret = 'super-secret-bypass-token-888-abc';
+
+      process.env.FASTAPI_SERVICE_SECRET = sensitiveServiceSecret;
+      process.env.FASTAPI_VERCEL_PROTECTION_BYPASS = sensitiveBypassSecret;
+
+      const loggedCalls: string[] = [];
+      const captureLog = (...args: any[]) => {
+        loggedCalls.push(JSON.stringify(args));
+      };
+
+      const infoSpy = vi.spyOn(logger, 'info').mockImplementation(captureLog as any);
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(captureLog as any);
+      const errorSpy = vi.spyOn(logger, 'error').mockImplementation(captureLog as any);
+
+      // 1. Success case
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(JSON.stringify(sampleValidResponse), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'x-request-id': 'req-ok' },
+        });
+      });
+      await generateAiNotes(mockTranscript, mockTitle);
+
+      // 2. HTTP 401 error case
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Auth failed' } }),
+          { status: 401 }
+        );
+      });
+      await expect(generateAiNotes(mockTranscript, mockTitle)).rejects.toThrow();
+
+      // 3. Network error case
+      globalThis.fetch = vi.fn(async () => {
+        throw new Error('Connection reset by peer');
+      });
+      await expect(generateAiNotes(mockTranscript, mockTitle)).rejects.toThrow();
+
+      // 4. Schema validation failure case
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(JSON.stringify({ malformed: true }), { status: 200 });
+      });
+      await expect(generateAiNotes(mockTranscript, mockTitle)).rejects.toThrow();
+
+      // Verify neither secret is in any logged payload
+      const allLogs = loggedCalls.join('\n');
+      expect(allLogs).not.toContain(sensitiveServiceSecret);
+      expect(allLogs).not.toContain(sensitiveBypassSecret);
+
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
     });
   });
 });

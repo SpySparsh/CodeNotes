@@ -281,8 +281,18 @@ Configure the following variables in the FastAPI project settings under **Settin
 | `FASTAPI_SERVICE_SECRET` | Preview, Production | High-entropy shared secret (minimum 32 random characters) |
 | `ENVIRONMENT` | Preview: `preview`, Production: `production` | Runtime environment name |
 
+### Vercel Deployment Protection & Automation Bypass (Preview Deployments)
+
+When Vercel Deployment Protection (Vercel Authentication or Password Protection) is active on Preview deployments:
+- Inbound requests to the FastAPI preview deployment from automated clients (e.g. Next.js Preview or CI smoke tests) must include the `x-vercel-protection-bypass` header containing the bypass secret configured in **Vercel Dashboard -> Project Settings -> Deployment Protection -> Protection Bypass for Automation**.
+- In the Next.js calling application, this secret is configured as `FASTAPI_VERCEL_PROTECTION_BYPASS`.
+- **Two Distinct Secrets**:
+  - `FASTAPI_SERVICE_SECRET`: Application-level secret sent via `Authorization: Bearer <FASTAPI_SERVICE_SECRET>` to authenticate directly with FastAPI.
+  - `FASTAPI_VERCEL_PROTECTION_BYPASS`: Platform-level secret sent via `x-vercel-protection-bypass: <FASTAPI_VERCEL_PROTECTION_BYPASS>` to bypass Vercel deployment protection on preview URLs.
+  - Both headers are sent simultaneously by the Node.js client (`src/lib/ai-client.ts`). Neither secret is ever logged.
+
 > [!WARNING]
-> Deploying FastAPI in a separate Vercel project does **not** create private VPC networking. The deployment produces a public HTTPS URL (e.g. `https://codenotes-ai-generator-xxx.vercel.app`). All communication is protected by HTTPS and the shared Bearer token (`FASTAPI_SERVICE_SECRET`).
+> Deploying FastAPI in a separate Vercel project does **not** create private VPC networking. The deployment produces a public HTTPS URL (e.g. `https://codenotes-ai-generator-xxx.vercel.app`). All communication is protected by HTTPS, Vercel Deployment Protection, and the shared Bearer token (`FASTAPI_SERVICE_SECRET`).
 
 ---
 

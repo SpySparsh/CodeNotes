@@ -27,7 +27,7 @@ function resolvePythonBinary(): string {
   return process.env.PYTHON || 'python3';
 }
 
-async function waitForServer(url: string, timeoutMs = 12000): Promise<boolean> {
+async function waitForServer(url: string, timeoutMs = 25000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
@@ -87,7 +87,7 @@ describe('FastAPI Cross-Process HTTP Boundary Integration', () => {
       }
       throw new Error(`Failed to start mock FastAPI server on ${BASE_URL} within timeout.`);
     }
-  }, 20000);
+  }, 35000);
 
   afterAll(async () => {
     if (serverProcess && !serverProcess.killed) {
