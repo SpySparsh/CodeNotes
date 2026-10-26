@@ -11,18 +11,20 @@ Standalone FastAPI microservice responsible for generating structured technical 
              │
              │  POST /api/v1/generate
              │  Header: Authorization: Bearer <FASTAPI_SERVICE_SECRET>
+             │  Header: X-Request-ID: <trace-id>
              ▼
 [ FastAPI AI Generator Service ]
-   ├── Verify Service Bearer Token
+   ├── Verify Service Bearer Token (constant-time compare)
    ├── Validate Input Payload (transcript, videoTitle)
    ├── Construct Technical Content Architect Prompt
-   ├── Invoke Google Gemini (gemini-2.5-flash) via google-genai SDK
+   ├── Invoke Google Gemini (gemini-2.5-flash) via google-genai SDK (75s timeout)
    ├── Parse & Validate JSON into Pydantic schema
    └── Return camelCase response: { overview, keyConcepts, detailedNotes, shorthands }
 ```
 
-- **Scope**: The AI generator service is stateless and isolated.
-- **Out of Scope**: Does **not** connect to PostgreSQL, authenticate end users, handle Supabase sessions, or ingest raw video URLs. All workflow orchestration, rate-limiting, and note persistence remain in Node.js.
+- **Scope**: The AI generator service is a **stateless compute microservice**.
+- **Boundaries**: It does **not** connect to PostgreSQL, authenticate end users, handle Supabase sessions, or persist notes. All workflow orchestration, rate-limiting, and note persistence remain in Node.js.
+- **Deduplication Reality**: The service does **not** maintain an idempotency cache. Passing an `X-Request-ID` binds that identifier to request logging and response headers for distributed tracing, but does **not** deduplicate inference requests on FastAPI.
 
 ---
 
@@ -30,7 +32,7 @@ Standalone FastAPI microservice responsible for generating structured technical 
 
 ### `GET /health`
 
-Minimal health-check endpoint. Does not invoke Gemini or expose configuration.
+Minimal passive health-check endpoint. Does not invoke Gemini or expose configuration.
 
 - **Authentication**: None required.
 - **Response**: HTTP 200 OK
@@ -51,6 +53,7 @@ Generates premium structured technical study notes.
   - `Content-Type: application/json`
   - `Authorization: Bearer <FASTAPI_SERVICE_SECRET>`
   - `X-Request-ID: <optional-trace-id>`: Caller-provided trace identifier. Validated against `^[a-zA-Z0-9_\-\.]{1,64}$`. If omitted, oversized (>64 chars), or containing unsafe/newline characters, it is safely replaced with a server-generated UUID4.
+  - `x-vercel-protection-bypass: <secret>`: Required only when targeting a Vercel-protected Preview deployment.
 
 #### Request Payload
 
@@ -163,7 +166,7 @@ uv sync
 # Or using standard pip with editable install:
 python -m venv .venv
 # Windows:
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 # Linux/macOS:
 source .venv/bin/activate
 
@@ -242,22 +245,20 @@ This starts `tests/mock_server.py` on loopback port `18088`/`18090`, verifies `/
    - **Gemini Outbound API Timeout**: `75 seconds` (`GEMINI_TIMEOUT_MS=75000`). If Gemini takes longer than 75s to complete generation, FastAPI's internal client cancels the request and returns structured HTTP 504 `TIMEOUT`.
    - **Node.js Client Abort Timeout**: `85 seconds` (`DEFAULT_AI_TIMEOUT_MS=85000` in `src/lib/ai-client.ts`). The Node.js client grants FastAPI 10 seconds of headroom beyond Gemini's 75s limit to format and transmit its structured HTTP 504 error response before an `AbortError` cuts the socket.
    - **Vercel Serverless Function `maxDuration`**: `90 seconds` (configured in `vercel.json`). This 90s execution envelope gives a 15-second buffer beyond Gemini and 5 seconds beyond the Node.js client abort timer, preventing Vercel's edge proxy from abruptly cutting the connection with a generic reverse proxy error.
-   - **Vercel Duration Limits & Fluid Compute**:
-     - When **Fluid Compute is enabled**, the maximum duration is **300 seconds on Hobby** and **800 seconds on Pro/Enterprise**. Configured at 90 seconds, the function is well within the 300-second Hobby ceiling when Fluid Compute is active.
-     - When **Fluid Compute is disabled**, duration limits differ, including a **60-second Hobby maximum**.
-     - **Pre-deployment Verification**: Account settings must not be assumed without checking. The operator must confirm in the Vercel project dashboard whether Fluid Compute is enabled for the project to ensure the 90s timeout is accepted.
-4. **Local Development vs. Containerization**:
-   Running `uvicorn` natively in the `.venv` environment is recommended for local development. Docker Compose is optional and reserved for staging or CI workflows.
+4. **Stateless Compute & The Ambiguous-Success Edge Case**:
+   - FastAPI possesses no persistent storage or database.
+   - If a network drop occurs after Gemini finishes inference but before Inngest durably memoizes the HTTP response, Inngest will retry Step 3, resulting in a second call to Gemini.
+   - Database row-level locking on `generation_idempotency` in Node.js prevents duplicate note writes in PostgreSQL.
 
 ---
 
 ## 9. Vercel Deployment Configuration (Separate Project)
 
-The FastAPI AI Generator is designed to be deployed as an independent Vercel project pointing to the `services/ai-generator/` subdirectory of the existing CodeNotes repository.
+The FastAPI AI Generator is designed to be deployed as an independent Vercel project pointing to the `services/ai-generator/` subdirectory of the CodeNotes repository.
 
 ### Project Settings in Vercel Dashboard
 
-When creating the second Vercel project:
+When creating the separate Vercel project:
 
 | Setting | Value | Notes |
 | :--- | :--- | :--- |
@@ -266,8 +267,7 @@ When creating the second Vercel project:
 | **Framework Preset** | Other / FastAPI | Automatically detected |
 | **Runtime / Python** | Python 3.13 | Explicitly pinned in `.python-version` and `pyproject.toml` |
 | **Entrypoint** | `app.main:app` | Configured via `[tool.vercel]` in `pyproject.toml` |
-| **Function Timeout** | 90 seconds | Configured via `vercel.json` (`maxDuration: 90`). Within Hobby limits when Fluid Compute is enabled (max 300s; Pro/Enterprise max 800s). If Fluid Compute is disabled, Hobby caps at 60s. Verify Fluid Compute setting in Vercel project dashboard. |
-| **Region** | `iad1` (Washington, D.C.) | **Provisional recommendation**. The repository does not define Next.js or Supabase regions in code (managed externally in dashboards). Confirm against Vercel and Supabase project dashboards to minimize cross-region latency. |
+| **Function Timeout** | 90 seconds | Configured via `vercel.json` (`maxDuration: 90`). |
 
 ### Environment Variables for Vercel Project
 
@@ -281,6 +281,13 @@ Configure the following variables in the FastAPI project settings under **Settin
 | `FASTAPI_SERVICE_SECRET` | Preview, Production | High-entropy shared secret (minimum 32 random characters) |
 | `ENVIRONMENT` | Preview: `preview`, Production: `production` | Runtime environment name |
 
+### Stable Production URL Requirement
+
+> [!IMPORTANT]
+> The main CodeNotes Production application must be configured with the **canonical Production URL** of the FastAPI service (e.g. `https://codenotes-ai-generator.vercel.app`), **never** a temporary Preview deployment URL.
+>
+> Preview URLs are tied to specific Git branches or pull requests and are removed or broken when branches are deleted or merged.
+
 ### Vercel Deployment Protection & Automation Bypass (Preview Deployments)
 
 When Vercel Deployment Protection (Vercel Authentication or Password Protection) is active on Preview deployments:
@@ -289,18 +296,13 @@ When Vercel Deployment Protection (Vercel Authentication or Password Protection)
 - **Two Distinct Secrets**:
   - `FASTAPI_SERVICE_SECRET`: Application-level secret sent via `Authorization: Bearer <FASTAPI_SERVICE_SECRET>` to authenticate directly with FastAPI.
   - `FASTAPI_VERCEL_PROTECTION_BYPASS`: Platform-level secret sent via `x-vercel-protection-bypass: <FASTAPI_VERCEL_PROTECTION_BYPASS>` to bypass Vercel deployment protection on preview URLs.
-  - Both headers are sent simultaneously by the Node.js client (`src/lib/ai-client.ts`). Neither secret is ever logged.
-
-> [!WARNING]
-> Deploying FastAPI in a separate Vercel project does **not** create private VPC networking. The deployment produces a public HTTPS URL (e.g. `https://codenotes-ai-generator-xxx.vercel.app`). All communication is protected by HTTPS, Vercel Deployment Protection, and the shared Bearer token (`FASTAPI_SERVICE_SECRET`).
+  - These are separate secrets protecting different ingress boundaries and must never be mixed up with the Inngest deployment protection bypass key.
 
 ---
 
 ## 10. Shared Secret Generation & Rotation
 
 ### Generating a Secure Shared Secret
-
-Generate a cryptographically secure random secret token using Node.js or OpenSSL:
 
 ```bash
 # Using OpenSSL:
@@ -310,43 +312,12 @@ openssl rand -hex 32
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-### Secret Rotation Procedure & Downtime Analysis
+### Single-Secret Maintenance Window Rotation
 
-> [!WARNING]
-> **Single-Secret Implementation & In-Flight Interruption**:
-> The current service verifies credentials against a single `FASTAPI_SERVICE_SECRET` (`services/ai-generator/app/auth.py`). Mismatched tokens immediately return HTTP 401 `UNAUTHORIZED`.
-> In the Node.js client (`src/lib/ai-client.ts`), HTTP 401 is mapped to `CONFIG_ERROR` with `isRetryable: false`. Inngest (`src/inngest/functions/generate-notes.ts`) interprets this as `isUnrecoverable: true` and throws a `NonRetriableError`.
-> **Inngest does not retry HTTP 401 errors.** Rotating the secret while jobs are running will abruptly terminate in-flight note generations. True zero-downtime rotation is not possible with a single secret.
+The current service verifies credentials against a single `FASTAPI_SERVICE_SECRET`. Mismatched tokens immediately return HTTP 401 `UNAUTHORIZED`.
+In the Node.js client (`src/lib/ai-client.ts`), HTTP 401 is mapped to `CONFIG_ERROR` with `isRetryable: false`. Inngest halts immediately via `NonRetriableError`.
 
-#### Maintenance Window Rotation Procedure
-
-Because rotating the single shared secret causes a temporary credential mismatch during Vercel deployment propagation (~30–60 seconds), secret rotations must be executed during a **scheduled maintenance window** or when no background generations are active:
-
-1. **Step 1: Drain or Pause Generation Activity**:
-   - Verify in the Inngest dashboard (`/api/inngest`) that no active `notes/generate.requested` runs are in flight.
-2. **Step 2: Generate a New High-Entropy Secret**:
-   ```bash
-   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-   ```
-3. **Step 3: Staging / Preview Validation (Recommended)**:
-   - Apply the new secret to the FastAPI and Next.js Preview environments first.
-   - Run boundary integration tests: `npm run test:fastapi-boundary`.
-4. **Step 4: Production Deployment**:
-   - Update `FASTAPI_SERVICE_SECRET` in the `codenotes-ai-generator` Vercel production project and deploy.
-   - Immediately update `FASTAPI_SERVICE_SECRET` in the main `codenotes` Next.js Vercel production project and deploy.
-5. **Step 5: Verification & Traffic Resumption**:
-   - Confirm `GET /health` returns HTTP 200.
-   - Confirm unauthenticated `POST /api/v1/generate` returns HTTP 401.
-   - Run a test note generation through the Next.js UI or API to verify end-to-end authentication with the new secret.
-
-#### Dual-Secret Rotation (Future Architectural Enhancement)
-
-To support true zero-downtime rotation without maintenance windows or risk to in-flight jobs, the architecture would need dual-credential support:
-- FastAPI accepting both an active primary secret and a deprecated secondary secret (`FASTAPI_SERVICE_SECRET_FALLBACK`).
-- Next.js cutting over to the new primary secret while existing workers drain using either secret.
-- The secondary secret being revoked only after all in-flight requests and deployments have concluded.
-
-Dual-secret rotation is tracked as a separate future enhancement requiring schema, auth middleware, and test modifications across both repositories.
+Secret rotations must be executed during a **scheduled maintenance window** when no background generation jobs are running. For complete step-by-step procedures, consult the [FastAPI Production Runbook](../../docs/fastapi-production-runbook.md).
 
 ---
 
@@ -383,14 +354,6 @@ When a preview deployment is created in Vercel:
    # Expected: HTTP 422 Unprocessable Entity, {"error": {"code": "INVALID_REQUEST"}}
    ```
 5. **Log Privacy Audit**:
-   - Inspect Vercel Runtime Logs for the test requests.
+   - Inspect Vercel Runtime Logs for test requests.
    - Confirm transcripts, prompts, and `Authorization` Bearer tokens are **never logged**.
    - Confirm structured JSON logs contain `requestId`, `level`, and `timestamp`.
-6. **Deliberate Live AI Smoke Test (Incurs API usage, run only when ready)**:
-   ```bash
-   curl -i -X POST https://<preview-domain>.vercel.app/api/v1/generate \
-     -H "Content-Type: application/json" \
-     -H "Authorization: Bearer <FASTAPI_SERVICE_SECRET>" \
-     -d '{"transcript": "In this short video we demonstrate that interfaces in TypeScript define object contracts.", "videoTitle": "TypeScript Smoke Test"}'
-   # Expected: HTTP 200 OK, full camelCase notes object
-   ```

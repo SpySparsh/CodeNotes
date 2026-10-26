@@ -1,6 +1,6 @@
 # CodeNotes Development & Testing Guide
 
-This guide covers local environment setup, configuration, database migrations, running the development services, and executing the complete automated test suites.
+This guide covers local environment setup, configuration, database migrations, running the development services across Node.js and Python, and executing the complete automated test suites.
 
 ---
 
@@ -8,6 +8,8 @@ This guide covers local environment setup, configuration, database migrations, r
 
 - **Node.js**: `v20.x` or higher (LTS recommended).
 - **npm**: `v10.x` or higher.
+- **Python**: `3.13` (minimum 3.12, pinned to `3.13` via `services/ai-generator/.python-version`).
+- **uv**: `v0.13.x` or higher (strongly recommended for Python dependency management and lockfile consistency; alternative: Python `venv` + `pip`).
 - **PostgreSQL**: `16.x` (local instance or Supabase project).
 - **Docker & Docker Compose**: Required for running the Prometheus/Grafana monitoring stack and for local PostgreSQL test containers.
 
@@ -15,37 +17,54 @@ This guide covers local environment setup, configuration, database migrations, r
 
 ## 2. Environment Configuration
 
-Copy the example environment template to `.env.local`:
+The CodeNotes monorepo contains two distinct runtime environments:
+1. **Next.js Web Application & Inngest**: Configured via `.env.local` in the repository root.
+2. **FastAPI AI Generator Service**: Configured via `.env` in `services/ai-generator/`.
 
+### A. CodeNotes Application Environment (`.env.local`)
+
+Copy the template from the repository root:
 ```bash
 cp .env.example .env.local
 ```
 
-### Environment Variables Reference
-
 | Variable | Required | Description | Example / Default |
 | :--- | :---: | :--- | :--- |
-| `DATABASE_URL` | **Yes** | Connection string for primary PostgreSQL database | `postgresql://postgres:postgrespassword@localhost:5432/codenotes` |
-| `NEXT_PUBLIC_SUPABASE_URL` | **Yes** | Supabase project API URL (used for client & server auth) | `http://127.0.0.1:54321` or `https://<ref>.supabase.co` |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Yes** | Supabase public anonymous API key | `mock-anon-key` or your project anon key |
-| `GEMINI_API_KEY` | **Yes** | Google Gemini API key for structured study-notes generation | Get from [Google AI Studio](https://aistudio.google.com/) |
-| `SUPADATA_API_KEY` | Optional | Supadata API key for primary transcript retrieval (falls back to scraper if unset or failed) | Get from [Supadata.ai](https://supadata.ai/) |
+| `DATABASE_URL` | **Yes** | Primary PostgreSQL connection string | `postgresql://postgres:postgrespassword@localhost:5432/codenotes` |
+| `NEXT_PUBLIC_SUPABASE_URL` | **Yes** | Supabase project API URL (client & server auth) | `https://<project-ref>.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Yes** | Supabase anonymous API key | `your-supabase-anon-key` |
+| `FASTAPI_SERVICE_URL` | **Yes** | Base URL of the FastAPI AI generator service. In local dev: `http://127.0.0.1:8000`. Non-local / prod **must use `https://`**. | `http://127.0.0.1:8000` |
+| `FASTAPI_SERVICE_SECRET` | **Yes** | Shared Bearer secret token for authenticating calls to FastAPI. Must match `services/ai-generator/.env`. | `your-secure-random-secret-token` |
+| `FASTAPI_VERCEL_PROTECTION_BYPASS` | Preview Only | Platform secret to bypass Vercel Deployment Protection on FastAPI Preview deployments. Leave unset in local and production. | `your-vercel-bypass-secret` |
+| `SUPADATA_API_KEY` | Optional | Supadata API key for primary transcript retrieval (falls back to scraper if unset or failed) | `your-supadata-key` |
 | `INNGEST_EVENT_KEY` | Optional | Inngest event sending key (for cloud event dispatch; not needed for local dev server) | `mock-event-key` |
 | `INNGEST_SIGNING_KEY` | Optional | Inngest webhook signature verification key | `mock-signing-key` |
 | `METRICS_SECRET` | Optional locally, **Required** in Preview/Prod | Secret Bearer token for authenticating Prometheus scrapes to `/api/metrics`. In local dev, leave unset for unauthenticated scraping. In Preview/Prod, missing secret fails closed with HTTP 503. | `your-metrics-secret` |
 | `TEST_DATABASE_URL` | For RLS tests | Dedicated, isolated local PostgreSQL database used strictly for RLS migration & policy tests (must point to `codenotes_test` on `localhost`) | `postgresql://postgres:postgrespassword@localhost:5432/codenotes_test` |
 | `SENTRY_DSN` | Optional | Server runtime Sentry DSN (safe to leave unset; Sentry initializes disabled with 0 outbound requests) | `https://examplePublicKey@o0.ingest.sentry.io/0` |
 | `NEXT_PUBLIC_SENTRY_DSN` | Optional | Client/browser Sentry DSN (safe to leave unset) | `https://examplePublicKey@o0.ingest.sentry.io/0` |
-| `SENTRY_AUTH_TOKEN` | Optional | Sentry authentication token for sourcemap uploads during production build | `sntrys_...` |
-| `SENTRY_ORG` | Optional | Sentry organization identifier for sourcemap uploads | `my-org` |
-| `SENTRY_PROJECT` | Optional | Sentry project identifier for sourcemap uploads | `codenotes` |
 | `DATABASE_CA_CERT` | Optional | PostgreSQL Root CA Certificate (PEM string format) for SSL connections | `-----BEGIN CERTIFICATE-----...` |
 | `E2E_USER_EMAIL` | Optional | Email for Playwright authenticated live smoke tests (mock auth used by default) | `test-user@example.com` |
 | `E2E_USER_PASSWORD` | Optional | Password for Playwright authenticated live smoke tests | `test-password-123` |
 
-> [!NOTE]
-> **Platform-Provided Runtime Metadata (Vercel)**:
-> `VERCEL_GIT_COMMIT_SHA` and `VERCEL_ENV` are automatically provided by the Vercel hosting platform. They are consumed at runtime by `/api/health` to expose release metadata and by GitHub Actions post-deployment smoke tests. Developers should not define these variables manually in `.env.local`.
+### B. FastAPI Microservice Environment (`services/ai-generator/.env`)
+
+Copy the template in `services/ai-generator`:
+```bash
+cd services/ai-generator
+cp .env.example .env
+cd ../..
+```
+
+| Variable | Required | Description | Example / Default |
+| :--- | :---: | :--- | :--- |
+| `FASTAPI_SERVICE_SECRET` | **Yes** | Shared Bearer token. Must match `FASTAPI_SERVICE_SECRET` in `.env.local`. | `your-secure-random-secret-token` |
+| `GEMINI_API_KEY` | **Yes** | Google Gemini API key from [Google AI Studio](https://aistudio.google.com/). | `AIza...` |
+| `GEMINI_MODEL` | No | Model name for note generation. Default: `gemini-2.5-flash`. | `gemini-2.5-flash` |
+| `GEMINI_TIMEOUT_MS` | No | Outbound Gemini API timeout in milliseconds. Default: `75000` (75s). | `75000` |
+| `HOST` | No | Bind host. Default: `0.0.0.0`. | `0.0.0.0` |
+| `PORT` | No | Bind port. Default: `8000`. | `8000` |
+| `ENVIRONMENT` | No | Runtime environment name. | `development` |
 
 > [!CAUTION]
 > Never commit `.env`, `.env.local`, or any actual credentials to git. The repository enforces `.gitignore` patterns for all private environment files.
@@ -54,7 +73,7 @@ cp .env.example .env.local
 
 ## 3. Database Setup & Migrations
 
-The database schema is defined as an idempotent SQL migration script in [`scripts/migrate.js`](file:///d:/unstuckstudy/scripts/migrate.js).
+The database schema is defined as an idempotent SQL migration script in [`scripts/migrate.js`](../scripts/migrate.js).
 
 To apply the schema to the database pointed to by `DATABASE_URL`:
 
@@ -91,13 +110,13 @@ npm run db:seed
 
 ## 4. Running the Development Environment
 
-CodeNotes requires two processes in local development: the Next.js development server and the Inngest local development server.
+Running CodeNotes locally requires three processes (or four with optional monitoring):
 
 ### Terminal 1: Next.js Web Application
 ```bash
 npm run dev
 ```
-Starts the Next.js server with Turbopack at [http://localhost:3000](http://localhost:3000).
+Starts Next.js with Turbopack at [http://localhost:3000](http://localhost:3000).
 
 ### Terminal 2: Inngest Local Dev Server
 ```bash
@@ -105,76 +124,98 @@ npm run inngest:dev
 ```
 Starts the local Inngest development runtime at [http://localhost:8288](http://localhost:8288). It automatically connects to the Next.js app's `/api/inngest` endpoint, enabling live inspection of durable step runs, event triggers, retries, and step logs.
 
-### Terminal 3 (Optional): Local Observability Stack
+### Terminal 3: FastAPI AI Generator Microservice
+Using `uv` (recommended):
+```bash
+uv run --project services/ai-generator uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+Or using an activated virtual environment:
+```bash
+cd services/ai-generator
+# Windows:
+.\.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+- Health probe: [http://localhost:8000/health](http://localhost:8000/health)
+
+### Terminal 4 (Optional): Local Observability Stack
 ```bash
 docker compose -f docker-compose.prometheus.yml up -d
 ```
 Starts:
 - **Prometheus** at [http://localhost:9090](http://localhost:9090) (scraping `http://host.docker.internal:3000/api/metrics`).
-- **Grafana** at [http://localhost:3001](http://localhost:3001) (default login: `admin` / `admin`) with the pre-provisioned CodeNotes dashboard.
+- **Grafana** at [http://localhost:3001](http://localhost:3001) (`admin` / `admin`) with the pre-provisioned CodeNotes dashboard.
 
 ---
 
-### Manual Verification & Smoke Testing
+## 5. Automated Test Suites & Quality Gates
 
-To manually verify generation, transcript caching, and idempotency replay in a live or local environment:
+CodeNotes enforces automated quality checks covering the full testing pyramid:
 
-1. **Initial Generation (Cache Miss)**:
-   Submit a YouTube URL from the web UI (`/`). The client generates a fresh `Idempotency-Key` UUID. Background execution fetches the transcript (calling Supadata or scraper), runs Gemini 2.5 inference, and persists the note.
-2. **Transcript Caching vs. Note Deduplication**:
-   Submitting the same video URL again from the UI generates a *new* `Idempotency-Key` UUID. The system reuses the cached transcript from `youtube_transcripts` (avoiding external caption calls), but runs Gemini inference again and creates an independent note. Separate UUIDs do not deduplicate notes.
-3. **Idempotency Replay**:
-   To test idempotency replay (`200 OK` with `cached: true`):
-   - **Replay of a UI submission**: Re-send the request with the exact same `Idempotency-Key: <original-uuid>` header used by the UI.
-   - **Deterministic hash replay**: Submit `POST /api/generate` with `{ "url": "..." }` and *omit* the `Idempotency-Key` header entirely across both initial and replay requests. The server derives `sha256(userId:videoId)`. Replaying that headerless request returns the completed note without re-running Gemini. A request without the header does not match a UUID-based UI job.
-
----
-
-## 5. Automated Test Suites
-
-CodeNotes maintains a comprehensive testing pyramid across unit, integration, RLS policy, observability, and end-to-end suites.
-
-### A. Unit & Integration Tests (Vitest)
+### 1. Node.js Unit & Integration Tests (Vitest)
 Executes all unit tests, route handlers, error classifiers, Inngest durable step retries, Prometheus metrics, and Sentry sanitizer tests:
-
 ```bash
 npm test
 ```
 
-### B. PostgreSQL Row Level Security (RLS) Integration Tests
-Validates real multi-tenant PostgreSQL security policies using direct SQL transactions:
+### 2. Cross-Process FastAPI Boundary Verification
+Starts a local mock server and executes end-to-end loopback HTTP assertions against real network endpoints without calling live Gemini APIs (zero API cost):
+```bash
+npm run test:fastapi-boundary
+```
+Asserts `/health` (200), unauthenticated rejection (401), schema validation (422), camelCase note deserialization, `X-Request-ID` correlation preservation, upstream rate-limit mapping (429), and timeout enforcement.
 
+### 3. Python Service Test Suite (Pytest)
+Executes 60+ unit and integration tests covering prompt generation, Pydantic schema validation, error mapping, and authentication against mocked Gemini SDK responses:
+```bash
+# Using uv directly:
+uv run --project services/ai-generator pytest services/ai-generator/tests -v
+
+# Or from within services/ai-generator with active venv:
+cd services/ai-generator && pytest && cd ../..
+```
+
+### 4. Python Linting & Formatting (Ruff)
+Checks Python style, import sorting, and syntax formatting:
+```bash
+uv run --project services/ai-generator ruff check services/ai-generator
+uv run --project services/ai-generator ruff format --check services/ai-generator
+```
+
+### 5. Python Dependency & Lockfile Consistency (uv)
+Validates that `services/ai-generator/pyproject.toml` and `uv.lock` are perfectly synchronized:
+```bash
+uv lock --check --project services/ai-generator
+```
+
+### 6. PostgreSQL Row Level Security (RLS) Integration Tests
+Validates real multi-tenant PostgreSQL security policies using direct SQL transactions:
 ```bash
 npm run test:integration:rls
 ```
+*Requires `TEST_DATABASE_URL` pointing strictly to local `codenotes_test` on `localhost`.*
 
-#### Strict Safety Guardrails for RLS Testing:
-The RLS test suite ([`tests/integration/rls.integration.test.ts`](file:///d:/unstuckstudy/tests/integration/rls.integration.test.ts)) contains an automated pre-flight security assertion:
-1. `TEST_DATABASE_URL` **must** be set explicitly.
-2. The hostname **must** resolve to `localhost`, `127.0.0.1`, or `::1`.
-3. The database name **must** strictly be `codenotes_test`.
-4. Remote, staging, or production databases (e.g. Supabase, AWS RDS, Neon) are unconditionally rejected to prevent accidental table truncation or policy overwrites.
-
-### C. Observability Configuration Validation
-Statically validates the Grafana dashboard JSON, verifies every panel query against the approved Prometheus metrics whitelist, and verifies alert rules and Docker Compose bind mounts:
-
+### 7. Observability Configuration Validation
+Statically validates the Grafana dashboard JSON, verifies panel queries against the approved metrics catalog, and verifies alert rules and Docker Compose bind mounts:
 ```bash
 npm run validate:observability
 ```
 
-### D. Playwright Deterministic End-to-End Tests
-Executes the headless browser testing suite covering user authentication, generation form submission, async status transitions, keyset pagination, and multi-user isolation:
-
+### 8. Playwright Deterministic End-to-End Tests
+Executes headless browser tests covering authentication, generation submission, async polling transitions, and multi-user isolation:
 ```bash
 npm run test:e2e
 ```
 
-### E. Code Quality & Type Checks
+### 9. TypeScript Compilation & ESLint
 ```bash
 # Run ESLint across src/
 npm run lint
 
-# Strict TypeScript compiler typecheck
+# Strict TypeScript type check
 npx tsc --noEmit
 
 # Production Next.js build compilation
@@ -183,73 +224,26 @@ npm run build
 
 ---
 
-## 6. Continuous Integration (CI) & Deployment Workflows
+## 6. Safe Local Smoke Testing (Zero Gemini Billing)
 
-All quality gates run automatically in GitHub Actions on every push and pull request targeting `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)):
+You can verify the entire local pipeline without calling Google Gemini or consuming API quota:
 
-```text
-GitHub Actions Workflow (CI):
-  ├── 1. Setup Node.js 20 & install dependencies (npm ci --legacy-peer-deps)
-  ├── 2. Spin up containerized PostgreSQL 16 service (codenotes_test)
-  ├── 3. Unit & Integration tests (npm test)
-  ├── 4. PostgreSQL RLS integration tests (npm run test:integration:rls)
-  ├── 5. Promtool check config & rules (prom/prometheus:v2.54.1 container)
-  ├── 6. Docker Compose validation (docker compose -f docker-compose.prometheus.yml config)
-  ├── 7. ESLint (npm run lint)
-  ├── 8. TypeScript typecheck (npx tsc --noEmit)
-  ├── 9. Production Next.js build (npm run build)
-  └── 10. Playwright Chromium deterministic E2E tests (npm run test:e2e)
-```
+1. **Verify FastAPI Health**:
+   ```bash
+   curl -i http://localhost:8000/health
+   # Expected: HTTP/1.1 200 OK, {"status": "healthy"}, x-request-id present
+   ```
+2. **Verify Bearer Authentication Rejection**:
+   ```bash
+   curl -i -X POST http://localhost:8000/api/v1/generate \
+     -H "Content-Type: application/json" \
+     -d '{"transcript": "test", "videoTitle": "test"}'
+   # Expected: HTTP/1.1 401 Unauthorized, {"error": {"code": "UNAUTHORIZED"}}
+   ```
+3. **Run Boundary Integration Test Suite**:
+   ```bash
+   npm run test:fastapi-boundary
+   ```
+   This automatically verifies the Node.js client (`src/lib/ai-client.ts`) communicating with a loopback server, asserting header propagation, authentication, and error translation.
 
-### Post-Deployment Smoke Testing ([`.github/workflows/post-deploy-smoke.yml`](../.github/workflows/post-deploy-smoke.yml))
-Following a successful CI run on a push to `main`, GitHub Actions triggers an automated end-to-end smoke test against the live production deployment:
-
-- **Trigger Condition**:
-  ```yaml
-  on:
-    workflow_run:
-      workflows: ["CI"]
-      types: [completed]
-      branches: [main]
-  ```
-  Runs only when `github.event.workflow_run.conclusion == 'success'` and `github.event.workflow_run.event == 'push'`.
-- **Target URL**: `https://my-code-note.vercel.app/api/health`
-- **Polling Loop & Budgets**:
-  - Total Timeout Budget: 10 minutes (`600000ms`, step timeout 11m, job timeout 12m).
-  - Polling Interval: 15 seconds (`15000ms`).
-  - Request Timeout: 10 seconds (`10000ms`).
-- **Verified Assertions**:
-  On every poll attempt, the smoke script verifies five distinct properties:
-  1. **HTTP Status**: Exactly `200 OK`.
-  2. **Active Commit**: `body.commit === EXPECTED_SHA` (matches the exact full 40-character git commit SHA of the push that triggered the workflow).
-  3. **Environment**: `body.environment === 'production'`.
-  4. **Health Status**: `body.status === 'healthy'`.
-  5. **Database Connectivity**: `body.database === 'connected'`.
-
-If any assertion fails or if the target deployment does not reflect the new commit within the 10-minute deadline, the smoke test job fails with non-zero exit code `1`.
-
-### Manual Release Verification Procedure
-Developers and operators can verify deployed production health and confirm the active release commit manually using curl:
-
-```bash
-curl -i https://my-code-note.vercel.app/api/health
-```
-
-Expected output:
-```http
-HTTP/2 200
-x-request-id: <uuid>
-content-type: application/json
-
-{
-  "status": "healthy",
-  "timestamp": "2026-10-24T18:00:00.000Z",
-  "database": "connected",
-  "commit": "<full-40-character-commit-sha>",
-  "environment": "production"
-}
-```
-
-> [!NOTE]
-> **Repository CI Checks vs. External Branch Protection**:
-> The CI quality gates (`CI / Run Quality Checks & End-to-End Tests`) and post-deployment smoke tests are defined in repository workflow files. However, mandatory status check enforcement and merge restrictions on branch `main` are managed by GitHub repository Branch Protection settings. These protection rules are configured externally via GitHub.com and cannot be verified from repository files alone.
+For production deployment instructions, troubleshooting runbooks, and rollback procedures, see the [FastAPI Production Runbook](fastapi-production-runbook.md).

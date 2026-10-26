@@ -33,6 +33,19 @@ Application Events & Requests
 - **Log Inspection**: In local development, logs are inspected directly in the terminal where `npm run dev` is running.
 - **Grafana Data Source Boundary**: The local Grafana instance is provisioned with **Prometheus metrics as its only data source**. Grafana does **not** ingest or query application log lines (no Loki, Vector, or Promtail pipeline exists). Metrics and logs are correlated manually by matching timestamps and request IDs between the Grafana panels and terminal logs.
 
+### Cross-Service Distributed Tracing (`X-Request-ID`)
+When an AI note generation job executes, correlation is preserved across the distributed boundary:
+1. **Entrypoint Generation**: `POST /api/generate` accepts or derives an `idempotencyKey` and passes it in the Inngest event payload (`notes/generate.requested`).
+2. **Outbound Transmission**: In Inngest Step 3 (`generate-ai-notes`), [`src/lib/ai-client.ts`](../src/lib/ai-client.ts) normalizes the ID to `^[a-zA-Z0-9_\-\.]{1,64}$` and transmits it in the HTTP header:
+   ```http
+   X-Request-ID: <idempotencyKey>
+   ```
+3. **FastAPI Middleware**: The Python microservice's `RequestIdMiddleware` ([`services/ai-generator/app/main.py`](../services/ai-generator/app/main.py)) sanitizes or adopts the header, binds it to `request.state.request_id`, attaches it to all Python structured log events, and returns it in the response header `x-request-id`.
+4. **Log Correlation Across Vercel Projects**:
+   To trace a job across both services in production:
+   - Query Vercel Runtime Logs for `codenotes` searching by `requestId` (e.g. `ai_client_request_started`).
+   - Query Vercel Runtime Logs for `codenotes-ai-generator` using the identical `requestId` to inspect token generation duration, Pydantic validation, or upstream Gemini errors.
+
 ---
 
 ## 2. Prometheus Metrics (`/api/metrics`)
@@ -46,7 +59,7 @@ The application registers and exposes Prometheus metrics at `/api/metrics` via a
 | `http_requests_total` | Counter | `method`, `route`, `status` | Total incoming HTTP requests across normalized static routes |
 | `http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request execution latency (buckets: 5ms to 10s) |
 | `codenotes_generation_jobs_total` | Counter | `status` (`started`, `completed`, `failed`, `replayed`) | Lifecycle counts of background note generation jobs |
-| `codenotes_generation_stage_duration_seconds` | Histogram | `stage` (`claim`, `transcript_fetch`, `gemini_inference`, `db_persist`) | Execution latency of individual durable pipeline stages |
+| `codenotes_generation_stage_duration_seconds` | Histogram | `stage` (`claim`, `transcript_fetch`, `gemini_inference`, `db_persist`) | Execution latency of individual durable pipeline stages (`gemini_inference` measures the full Step 3 round-trip to the FastAPI service) |
 | `codenotes_generation_duration_seconds` | Histogram | `status` (`completed`, `failed`) | End-to-end duration of the entire generation pipeline |
 | `codenotes_transcript_requests_total` | Counter | `source` (`cache_hit`, `supadata`, `youtube_transcript_fallback`), `status` (`success`, `error`) | Transcript acquisition attempts by provider and outcome |
 | `codenotes_transcript_duration_seconds` | Histogram | `provider` (`supadata`, `youtube_transcript`) | Upstream transcript provider network latency |
@@ -305,3 +318,5 @@ To verify the dashboard queries, Prometheus alert rules, and Docker Compose volu
 npm run validate:observability
 ```
 This runs [`tests/observability-config.test.ts`](../tests/observability-config.test.ts) to statically check that all dashboard metrics and alerting rules conform to the approved metrics catalog.
+
+For production deployment instructions, troubleshooting runbooks, and rollback procedures, see the [FastAPI Production Runbook](fastapi-production-runbook.md).
