@@ -7,6 +7,7 @@ import { inngest } from '@/inngest/client';
 import { sanitizeText } from '@/lib/sentry/sanitizer';
 
 export const TRACER_NAME = 'codenotes';
+export { SpanStatusCode };
 
 const globalForTracing = globalThis as unknown as {
   tracingInitialized?: boolean;
@@ -68,6 +69,8 @@ export function isProhibitedAttribute(key: string): boolean {
  * to dynamically record prohibited attributes (identifiers, credentials, payloads).
  */
 export function createSafeSpan(span: Span): Span {
+  let explicitStatusCode: SpanStatusCode | undefined;
+
   return new Proxy(span, {
     get(target, prop, receiver) {
       if (prop === 'setAttribute') {
@@ -87,6 +90,26 @@ export function createSafeSpan(span: Span): Span {
           }
           return receiver;
         };
+      }
+      if (prop === 'setStatus') {
+        return (status: { code: SpanStatusCode; message?: string }) => {
+          if (status && typeof status.code === 'number') {
+            explicitStatusCode = status.code;
+            const sanitizedStatus = {
+              code: status.code,
+              message: status.message ? sanitizeErrorMessage(status.message) : undefined,
+            };
+            target.setStatus(sanitizedStatus);
+          }
+          return receiver;
+        };
+      }
+      if (prop === 'status') {
+        const baseStatus = (target as any).status;
+        if (explicitStatusCode !== undefined) {
+          return { ...baseStatus, code: explicitStatusCode };
+        }
+        return baseStatus;
       }
       const val = Reflect.get(target, prop, receiver);
       return typeof val === 'function' ? val.bind(target) : val;
@@ -198,7 +221,10 @@ export async function withSpan<T>(
 
     try {
       const result = await fn(safeSpan);
-      safeSpan.setStatus({ code: SpanStatusCode.OK });
+      const currentStatus = (safeSpan as any).status ?? (span as any).status;
+      if (currentStatus?.code !== SpanStatusCode.ERROR) {
+        safeSpan.setStatus({ code: SpanStatusCode.OK });
+      }
       return result;
     } catch (error: any) {
       const safeCode = typeof error?.code === 'string' ? error.code : (error?.name || 'Error');

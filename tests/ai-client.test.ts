@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from 'vitest';
 import {
   generateAiNotes,
   getAiClientConfig,
@@ -11,6 +11,9 @@ import {
 } from '@/lib/ai-client';
 import { registry } from '@/lib/metrics';
 import { logger } from '@/lib/logger';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { initTracing, TRACER_NAME } from '@/lib/tracing';
 
 describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
   const originalFetch = globalThis.fetch;
@@ -814,6 +817,124 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
       infoSpy.mockRestore();
       warnSpy.mockRestore();
       errorSpy.mockRestore();
+    });
+  });
+
+  describe('Nested OpenTelemetry Tracing Integration', () => {
+    beforeAll(() => {
+      initTracing();
+    });
+
+    it('creates child span fastapi.http_request nested under ai.generate_notes on successful request', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(JSON.stringify(sampleValidResponse), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'x-request-id': 'trace-req-001' },
+        });
+      });
+
+      const result = await generateAiNotes(mockTranscript, mockTitle, { requestId: 'trace-req-001' });
+      expect(result).toBeDefined();
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      const aiSpan = spans.find((s) => s.name === 'ai.generate_notes');
+      const httpSpan = spans.find((s) => s.name === 'fastapi.http_request');
+
+      expect(aiSpan).toBeDefined();
+      expect(httpSpan).toBeDefined();
+
+      // Parent-child relationship
+      const getParentId = (s: any) => s?.parentSpanContext?.spanId ?? s?.parentSpanId;
+      expect(getParentId(httpSpan)).toBe(aiSpan?.spanContext().spanId);
+      expect(httpSpan?.spanContext().traceId).toBe(aiSpan?.spanContext().traceId);
+
+      // Low-risk HTTP attributes
+      expect(httpSpan?.attributes['http.request.method']).toBe('POST');
+      expect(httpSpan?.attributes['http.route']).toBe('/api/v1/generate');
+      expect(httpSpan?.attributes['http.response.status_code']).toBe(200);
+      expect(httpSpan?.status.code).toBe(SpanStatusCode.OK);
+
+      // Privacy: no secrets or transcripts in attributes
+      expect(httpSpan?.attributes['token']).toBeUndefined();
+      expect(httpSpan?.attributes['secret']).toBeUndefined();
+      expect(httpSpan?.attributes['authorization']).toBeUndefined();
+      expect(httpSpan?.attributes['transcript']).toBeUndefined();
+    });
+
+    it('records http.response.status_code on non-200 responses and propagates error mapping', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Rate limited' } }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      await expect(generateAiNotes(mockTranscript, mockTitle)).rejects.toThrowError(AiClientError);
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      const aiSpan = spans.find((s) => s.name === 'ai.generate_notes');
+      const httpSpan = spans.find((s) => s.name === 'fastapi.http_request');
+
+      expect(aiSpan).toBeDefined();
+      expect(httpSpan).toBeDefined();
+
+      const getParentId = (s: any) => s?.parentSpanContext?.spanId ?? s?.parentSpanId;
+      expect(getParentId(httpSpan)).toBe(aiSpan?.spanContext().spanId);
+      expect(httpSpan?.attributes['http.response.status_code']).toBe(429);
+      expect(httpSpan?.status.code).toBe(SpanStatusCode.ERROR);
+      expect(httpSpan?.status.message).toBe('HTTP 429');
+      expect(aiSpan?.status.code).toBe(SpanStatusCode.ERROR);
+    });
+
+    it('records error status on child span when network throws before HTTP response is received', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      const connError = new Error('ECONNREFUSED');
+      (connError as any).code = 'ECONNREFUSED';
+      globalThis.fetch = vi.fn(async () => {
+        throw connError;
+      });
+
+      await expect(generateAiNotes(mockTranscript, mockTitle)).rejects.toThrowError(AiClientError);
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      const aiSpan = spans.find((s) => s.name === 'ai.generate_notes');
+      const httpSpan = spans.find((s) => s.name === 'fastapi.http_request');
+
+      expect(aiSpan).toBeDefined();
+      expect(httpSpan).toBeDefined();
+
+      const getParentId = (s: any) => s?.parentSpanContext?.spanId ?? s?.parentSpanId;
+      expect(getParentId(httpSpan)).toBe(aiSpan?.spanContext().spanId);
+      expect(httpSpan?.status.code).toBe(SpanStatusCode.ERROR);
+      expect(httpSpan?.events.some((e) => e.name === 'exception')).toBe(true);
+      expect(httpSpan?.ended).toBe(true);
+      expect(aiSpan?.ended).toBe(true);
     });
   });
 });
