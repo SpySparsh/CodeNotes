@@ -70,6 +70,7 @@ export function isProhibitedAttribute(key: string): boolean {
  */
 export function createSafeSpan(span: Span): Span {
   let explicitStatusCode: SpanStatusCode | undefined;
+  let explicitStatusMessage: string | undefined;
 
   return new Proxy(span, {
     get(target, prop, receiver) {
@@ -95,9 +96,10 @@ export function createSafeSpan(span: Span): Span {
         return (status: { code: SpanStatusCode; message?: string }) => {
           if (status && typeof status.code === 'number') {
             explicitStatusCode = status.code;
+            explicitStatusMessage = status.message ? sanitizeErrorMessage(status.message) : undefined;
             const sanitizedStatus = {
               code: status.code,
-              message: status.message ? sanitizeErrorMessage(status.message) : undefined,
+              message: explicitStatusMessage,
             };
             target.setStatus(sanitizedStatus);
           }
@@ -107,7 +109,7 @@ export function createSafeSpan(span: Span): Span {
       if (prop === 'status') {
         const baseStatus = (target as any).status;
         if (explicitStatusCode !== undefined) {
-          return { ...baseStatus, code: explicitStatusCode };
+          return { ...baseStatus, code: explicitStatusCode, message: explicitStatusMessage ?? baseStatus?.message };
         }
         return baseStatus;
       }
@@ -230,10 +232,13 @@ export async function withSpan<T>(
       const safeCode = typeof error?.code === 'string' ? error.code : (error?.name || 'Error');
       const safeMessage = sanitizeErrorMessage(error?.message);
 
-      safeSpan.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: safeMessage,
-      });
+      const currentStatus = (safeSpan as any).status ?? (span as any).status;
+      if (currentStatus?.code !== SpanStatusCode.ERROR || !currentStatus?.message) {
+        safeSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: safeMessage,
+        });
+      }
 
       // Record bounded, sanitized exception event without exposing raw stack or unscrubbed message
       safeSpan.recordException({
