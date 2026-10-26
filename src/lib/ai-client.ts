@@ -2,7 +2,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { logger } from '@/lib/logger';
 import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
-import { withSpan } from '@/lib/tracing';
+import { withSpan, SpanStatusCode } from '@/lib/tracing';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
 export const DEFAULT_AI_MODEL = 'gemini-2.5-flash';
@@ -267,14 +267,28 @@ export async function generateAiNotes(
         headers['x-vercel-protection-bypass'] = vercelProtectionBypass;
       }
 
-      response = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          transcript,
-          videoTitle,
-        }),
-        signal: abortController.signal,
+      response = await withSpan('fastapi.http_request', async (httpSpan) => {
+        httpSpan.setAttribute('http.request.method', 'POST');
+        httpSpan.setAttribute('http.route', '/api/v1/generate');
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            transcript,
+            videoTitle,
+          }),
+          signal: abortController.signal,
+        });
+
+        httpSpan.setAttribute('http.response.status_code', res.status);
+        if (!res.ok) {
+          httpSpan.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: `HTTP ${res.status}`,
+          });
+        }
+        return res;
       });
     } catch (networkError: any) {
       clearTimeout(timer);
