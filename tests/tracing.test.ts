@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import { trace, context, SpanStatusCode } from '@opentelemetry/api';
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { AsyncHooksContextManager } from '@opentelemetry/context-async-hooks';
+import { Inngest } from 'inngest';
 import { InngestSpanProcessor } from 'inngest/experimental';
+import crypto from 'crypto';
 import { inngest } from '@/inngest/client';
 import { initTracing, withSpan, getTracer, TRACER_NAME, flushTracing } from '@/lib/tracing';
 import { generateAiNotes } from '@/lib/ai-client';
@@ -917,16 +919,19 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       expect(httpSpan?.ended).toBe(true);
     });
 
-    it('associates direct fastapi.http_request span with active Inngest step context via InngestSpanProcessor', async () => {
-      const als = await getAsyncLocalStorage();
-      const mockApp = {
-        apiBaseUrl: new URL('http://localhost:8288'),
-        headers: {},
-        signingKey: 'signkey-test',
+    it('associates fastapi.http_request span with Inngest step using real createExecution and step.run engine', async () => {
+      const stepId = 'generate-ai-notes';
+      const stepHash = crypto.createHash('sha1').update(stepId).digest('hex');
+      const expectedParentSpanId = deterministicSpanID(stepHash);
+
+      const testApp = new Inngest({ id: 'codenotes-test-app', isDev: true });
+      (testApp as any)['inngestApi'] = {
+        checkpointNewRun: async () => ({ data: { app_id: 'test-app', fn_id: 'test-fn', token: 'test-token' } }),
+        checkpointSteps: async () => ({}),
       };
 
       const capturedSpans: any[] = [];
-      const testProcessor = new InngestSpanProcessor(inngest);
+      const testProcessor = new InngestSpanProcessor(testApp);
       const originalTrackSpan = (testProcessor as any).trackSpan.bind(testProcessor);
       vi.spyOn(testProcessor as any, 'trackSpan').mockImplementation((...args: any[]) => {
         capturedSpans.push(args[1]);
@@ -942,47 +947,221 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       globalThis.fetch = vi.fn(async () => {
         return new Response(JSON.stringify(sampleValidResponse), {
           status: 200,
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-request-id': 'inngest-exec-001' },
         });
       });
 
-      await als.run({ app: mockApp, execution: {} }, async () => {
-        const rootSpan = testTracer.startSpan('inngest.execution');
-        const rootSpanId = rootSpan.spanContext().spanId;
-        const traceId = rootSpan.spanContext().traceId;
-        const traceparent = `00-${traceId}-${rootSpanId}-01`;
+      const testFn = testApp.createFunction(
+        { id: 'test-generate-notes', triggers: [{ event: 'notes/generate.requested' }] },
+        async ({ step }) => {
+          return await step.run('generate-ai-notes', async () => {
+            return await withSpan('fastapi.http_request', async (span) => {
+              return await generateAiNotes('Test transcript text for Inngest step', 'Integration Title', {
+                requestId: 'inngest-exec-001',
+                span,
+              });
+            });
+          });
+        }
+      );
 
-        testProcessor.declareStartingSpan({
-          span: rootSpan,
-          runId: 'run-prod-sim-123',
-          traceparent,
-          tracestate: undefined,
-        });
-
-        const stepId = 'generate-ai-notes';
-        const stepHash = 'hash-generate-ai-notes-step-456';
-        testProcessor.declareStepExecution(rootSpanId, stepId, 2, stepHash, 0);
-
-        await context.with(trace.setSpan(context.active(), rootSpan), async () => {
-          await generateAiNotes('Test transcript for generative AI', 'Generative AI Title');
-        });
-
-        rootSpan.end();
-
-        const expectedParentSpanId = deterministicSpanID(stepHash);
-        const httpSpan = capturedSpans.find((s) => s.name === 'fastapi.http_request');
-
-        expect(httpSpan).toBeDefined();
-        expect(httpSpan.attributes['inngest.step.id']).toBe('generate-ai-notes');
-        expect(httpSpan.attributes['inngest.step.hash']).toBe(stepHash);
-        expect(httpSpan.attributes['inngest.step.parentSpanId']).toBe(expectedParentSpanId);
-        expect(httpSpan.attributes['http.request.method']).toBe('POST');
-        expect(httpSpan.attributes['http.route']).toBe('/api/v1/generate');
-        expect(httpSpan.attributes['http.response.status_code']).toBe(200);
-        expect(httpSpan.attributes['status']).toBe('success');
+      const execution = (testFn as any).createExecution({
+        partialOptions: {
+          client: testApp,
+          runId: 'run-engine-test-123',
+          data: { event: { name: 'notes/generate.requested', data: {} } },
+          stepState: {},
+          stepCompletionOrder: [],
+          headers: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+          stepMode: 'sync',
+          createResponse: (res: any) => res,
+        } as any,
       });
 
+      const result = await execution.start();
       tracerSpy.mockRestore();
+
+      expect(result).toBeDefined();
+
+      const httpSpans = capturedSpans.filter((s) => s.name === 'fastapi.http_request');
+      expect(httpSpans.length).toBe(1);
+
+      const httpSpan = httpSpans[0];
+      expect(httpSpan.attributes['inngest.step.id']).toBe('generate-ai-notes');
+      expect(httpSpan.attributes['inngest.step.hash']).toBe(stepHash);
+      expect(httpSpan.attributes['inngest.step.parentSpanId']).toBe(expectedParentSpanId);
+      expect(httpSpan.attributes['http.request.method']).toBe('POST');
+      expect(httpSpan.attributes['http.route']).toBe('/api/v1/generate');
+      expect(httpSpan.attributes['http.response.status_code']).toBe(200);
+      expect(httpSpan.attributes['status']).toBe('success');
+      expect(httpSpan.attributes['transcript']).toBeUndefined();
+      expect(httpSpan.attributes['secret']).toBeUndefined();
+      expect(httpSpan.attributes['authorization']).toBeUndefined();
+    });
+
+    it('records SpanStatusCode.ERROR and preserves error classification in Inngest execution engine on HTTP 429', async () => {
+      const stepId = 'generate-ai-notes';
+      const stepHash = crypto.createHash('sha1').update(stepId).digest('hex');
+      const expectedParentSpanId = deterministicSpanID(stepHash);
+
+      const testApp = new Inngest({ id: 'codenotes-test-app-429', isDev: true });
+      (testApp as any)['inngestApi'] = {
+        checkpointNewRun: async () => ({ data: { app_id: 'test-app', fn_id: 'test-fn', token: 'test-token' } }),
+        checkpointSteps: async () => ({}),
+      };
+
+      const capturedSpans: any[] = [];
+      const testProcessor = new InngestSpanProcessor(testApp);
+      const originalTrackSpan = (testProcessor as any).trackSpan.bind(testProcessor);
+      vi.spyOn(testProcessor as any, 'trackSpan').mockImplementation((...args: any[]) => {
+        capturedSpans.push(args[1]);
+        return (originalTrackSpan as any)(...args);
+      });
+
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [testProcessor],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Rate limited by Gemini' } }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      let thrownError: any;
+      const testFn = testApp.createFunction(
+        { id: 'test-generate-notes-429', triggers: [{ event: 'notes/generate.requested' }] },
+        async ({ step }) => {
+          return await step.run('generate-ai-notes', async () => {
+            try {
+              return await withSpan('fastapi.http_request', async (span) => {
+                return await generateAiNotes('Test transcript text', 'Integration Title', {
+                  requestId: 'inngest-exec-429',
+                  span,
+                });
+              });
+            } catch (err) {
+              thrownError = err;
+              throw err;
+            }
+          });
+        }
+      );
+
+      const execution = (testFn as any).createExecution({
+        partialOptions: {
+          client: testApp,
+          runId: 'run-engine-test-429',
+          data: { event: { name: 'notes/generate.requested', data: {} } },
+          stepState: {},
+          stepCompletionOrder: [],
+          headers: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+          stepMode: 'sync',
+          createResponse: (res: any) => res,
+        } as any,
+      });
+
+      await execution.start();
+      tracerSpy.mockRestore();
+
+      expect(thrownError).toBeDefined();
+      expect(thrownError.code).toBe('RATE_LIMITED');
+      expect(thrownError.isRetryable).toBe(true);
+
+      const httpSpans = capturedSpans.filter((s) => s.name === 'fastapi.http_request');
+      expect(httpSpans.length).toBe(1);
+
+      const httpSpan = httpSpans[0];
+      expect(httpSpan.attributes['inngest.step.id']).toBe('generate-ai-notes');
+      expect(httpSpan.attributes['inngest.step.parentSpanId']).toBe(expectedParentSpanId);
+      expect(httpSpan.attributes['http.response.status_code']).toBe(429);
+      expect(httpSpan.status.code).toBe(SpanStatusCode.ERROR);
+      expect(httpSpan.status.message).toBe('HTTP 429');
+    });
+
+    it('records SpanStatusCode.ERROR and sanitized exception event in Inngest execution engine on network failure', async () => {
+      const stepId = 'generate-ai-notes';
+      const stepHash = crypto.createHash('sha1').update(stepId).digest('hex');
+      const expectedParentSpanId = deterministicSpanID(stepHash);
+
+      const testApp = new Inngest({ id: 'codenotes-test-app-neterr', isDev: true });
+      (testApp as any)['inngestApi'] = {
+        checkpointNewRun: async () => ({ data: { app_id: 'test-app', fn_id: 'test-fn', token: 'test-token' } }),
+        checkpointSteps: async () => ({}),
+      };
+
+      const capturedSpans: any[] = [];
+      const testProcessor = new InngestSpanProcessor(testApp);
+      const originalTrackSpan = (testProcessor as any).trackSpan.bind(testProcessor);
+      vi.spyOn(testProcessor as any, 'trackSpan').mockImplementation((...args: any[]) => {
+        capturedSpans.push(args[1]);
+        return (originalTrackSpan as any)(...args);
+      });
+
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [testProcessor],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      const netErr = new Error('connect ECONNREFUSED 127.0.0.1:8000?secret=super_secret_token');
+      (netErr as any).code = 'ECONNREFUSED';
+      globalThis.fetch = vi.fn(async () => {
+        throw netErr;
+      });
+
+      let thrownError: any;
+      const testFn = testApp.createFunction(
+        { id: 'test-generate-notes-neterr', triggers: [{ event: 'notes/generate.requested' }] },
+        async ({ step }) => {
+          return await step.run('generate-ai-notes', async () => {
+            try {
+              return await withSpan('fastapi.http_request', async (span) => {
+                return await generateAiNotes('Test transcript text', 'Integration Title', {
+                  requestId: 'inngest-exec-neterr',
+                  span,
+                });
+              });
+            } catch (err) {
+              thrownError = err;
+              throw err;
+            }
+          });
+        }
+      );
+
+      const execution = (testFn as any).createExecution({
+        partialOptions: {
+          client: testApp,
+          runId: 'run-engine-test-neterr',
+          data: { event: { name: 'notes/generate.requested', data: {} } },
+          stepState: {},
+          stepCompletionOrder: [],
+          headers: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+          stepMode: 'sync',
+          createResponse: (res: any) => res,
+        } as any,
+      });
+
+      await execution.start();
+      tracerSpy.mockRestore();
+
+      expect(thrownError).toBeDefined();
+      expect(thrownError.code).toBe('NETWORK_ERROR');
+      expect(thrownError.isRetryable).toBe(true);
+
+      const httpSpans = capturedSpans.filter((s) => s.name === 'fastapi.http_request');
+      expect(httpSpans.length).toBe(1);
+
+      const httpSpan = httpSpans[0];
+      expect(httpSpan.attributes['inngest.step.id']).toBe('generate-ai-notes');
+      expect(httpSpan.attributes['inngest.step.parentSpanId']).toBe(expectedParentSpanId);
+      expect(httpSpan.status.code).toBe(SpanStatusCode.ERROR);
+      expect(httpSpan.status.message).not.toContain('super_secret_token');
+      expect(httpSpan.events.some((e: any) => e.name === 'exception')).toBe(true);
     });
 
     it('proves nested child span under intermediate userland span lacks inngest.step.parentSpanId while direct child span receives it', async () => {

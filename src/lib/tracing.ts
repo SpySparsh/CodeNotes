@@ -7,7 +7,7 @@ import { inngest } from '@/inngest/client';
 import { sanitizeText } from '@/lib/sentry/sanitizer';
 
 export const TRACER_NAME = 'codenotes';
-export { SpanStatusCode };
+export { SpanStatusCode, type Span };
 
 const globalForTracing = globalThis as unknown as {
   tracingInitialized?: boolean;

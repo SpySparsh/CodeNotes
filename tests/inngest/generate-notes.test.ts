@@ -336,9 +336,13 @@ describe('Inngest generateNotesFunction', () => {
     ]);
 
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
-    expect(aiClient.generateAiNotes).toHaveBeenCalledWith(mockTranscript, mockTitle, {
-      requestId: mockKey,
-    });
+    expect(aiClient.generateAiNotes).toHaveBeenCalledWith(
+      mockTranscript,
+      mockTitle,
+      expect.objectContaining({
+        requestId: mockKey,
+      })
+    );
     expect(gemini.generateNotes).not.toHaveBeenCalled();
     expect(gemini.generateNotesFromVideoUrl).not.toHaveBeenCalled();
   });

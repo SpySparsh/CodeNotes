@@ -923,5 +923,84 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
       expect(httpSpan?.events.some((e) => e.name === 'exception')).toBe(true);
       expect(httpSpan?.ended).toBe(true);
     });
+
+    it('populates caller-supplied span without creating duplicate nested span', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(JSON.stringify(sampleValidResponse), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'x-request-id': 'caller-req-001' },
+        });
+      });
+
+      await testTracer.startActiveSpan('fastapi.http_request', async (callerSpan) => {
+        const result = await generateAiNotes(mockTranscript, mockTitle, {
+          requestId: 'caller-req-001',
+          span: callerSpan,
+        });
+        expect(result).toBeDefined();
+        callerSpan.end();
+      });
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      const span = spans[0];
+      expect(span.name).toBe('fastapi.http_request');
+      expect(span.attributes['http.request.method']).toBe('POST');
+      expect(span.attributes['http.route']).toBe('/api/v1/generate');
+      expect(span.attributes['model']).toBe(DEFAULT_AI_MODEL);
+      expect(span.attributes['http.response.status_code']).toBe(200);
+      expect(span.attributes['status']).toBe('success');
+      expect(span.status.code).toBe(SpanStatusCode.OK);
+    });
+
+    it('populates error status on caller-supplied span on HTTP 429 without creating duplicate span', async () => {
+      const exporter = new InMemorySpanExporter();
+      const testProvider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      const testTracer = testProvider.getTracer(TRACER_NAME);
+      const tracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue(testTracer);
+
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Rate limited' } }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      await testTracer.startActiveSpan('fastapi.http_request', async (callerSpan) => {
+        try {
+          await generateAiNotes(mockTranscript, mockTitle, {
+            requestId: 'caller-req-429',
+            span: callerSpan,
+          });
+          expect.unreachable('Should have thrown');
+        } catch (err: any) {
+          expect(err).toBeInstanceOf(AiClientError);
+          expect(err.code).toBe('RATE_LIMITED');
+        } finally {
+          callerSpan.end();
+        }
+      });
+
+      tracerSpy.mockRestore();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      const span = spans[0];
+      expect(span.name).toBe('fastapi.http_request');
+      expect(span.attributes['http.response.status_code']).toBe(429);
+      expect(span.status.code).toBe(SpanStatusCode.ERROR);
+      expect(span.status.message).toBe('HTTP 429');
+    });
   });
 });
