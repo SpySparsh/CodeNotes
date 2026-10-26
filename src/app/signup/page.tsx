@@ -8,7 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { createClient } from '@/lib/supabase/client';
 import { Video, ArrowRight, Loader2, CheckCircle2 } from 'lucide-react';
 import { signupSchema, SignupInput } from '@/lib/validations/auth';
-import { sanitizeRedirectPath } from '@/lib/auth/redirect';
+import { sanitizeRedirectPath, getAuthCallbackUrl } from '@/lib/auth/redirect';
 import { trackAuthSuccess, setOAuthFlowIntent, captureEvent } from '@/lib/analytics';
 
 function SignupForm() {
@@ -47,17 +47,28 @@ function SignupForm() {
     setSubmittedEmail(data.email);
 
     try {
-      const origin = window.location.origin;
+      const callbackUrl = getAuthCallbackUrl(next);
       const { data: authData, error: signUpError } = await supabase.auth.signUp({
         email: data.email,
         password: data.password,
         options: {
-          emailRedirectTo: `${origin}/auth/callback?next=${encodeURIComponent(next)}`,
+          emailRedirectTo: callbackUrl,
         },
       });
 
       if (signUpError) {
         setError(signUpError.message);
+        setLoading(false);
+        return;
+      }
+
+      // Check if user already exists (Supabase returns an empty identities array when email enumeration protection is active)
+      if (
+        authData.user &&
+        Array.isArray(authData.user.identities) &&
+        authData.user.identities.length === 0
+      ) {
+        setError('An account with this email already exists. Please sign in instead.');
         setLoading(false);
         return;
       }
@@ -75,8 +86,12 @@ function SignupForm() {
         return;
       }
 
-      // If Supabase requires email confirmation:
-      if (authData.user && !authData.session) {
+      // If Supabase requires email confirmation and user is newly created:
+      if (
+        authData.user &&
+        !authData.session &&
+        (!authData.user.identities || authData.user.identities.length > 0)
+      ) {
         setConfirmationSent(true);
         setLoading(false);
         return;
@@ -95,11 +110,11 @@ function SignupForm() {
     setOAuthFlowIntent('signup');
 
     try {
-      const origin = window.location.origin;
+      const callbackUrl = getAuthCallbackUrl(next);
       const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${origin}/auth/callback?next=${encodeURIComponent(next)}`,
+          redirectTo: callbackUrl,
         },
       });
 
