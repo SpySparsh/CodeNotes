@@ -247,31 +247,31 @@ export async function generateAiNotes(
     timeoutMs,
   });
 
-  return await withSpan('ai.generate_notes', async (span) => {
-    span.setAttribute('model', model);
+  return await withSpan(
+    'fastapi.http_request',
+    async (span) => {
+      span.setAttribute('http.request.method', 'POST');
+      span.setAttribute('http.route', '/api/v1/generate');
+      span.setAttribute('model', model);
 
-    const abortController = new AbortController();
-    const timer = setTimeout(() => {
-      abortController.abort();
-    }, timeoutMs);
+      const abortController = new AbortController();
+      const timer = setTimeout(() => {
+        abortController.abort();
+      }, timeoutMs);
 
-    let response: Response;
-    try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${serviceSecret}`,
-        'X-Request-ID': requestId,
-      };
+      let response: Response;
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${serviceSecret}`,
+          'X-Request-ID': requestId,
+        };
 
-      if (vercelProtectionBypass) {
-        headers['x-vercel-protection-bypass'] = vercelProtectionBypass;
-      }
+        if (vercelProtectionBypass) {
+          headers['x-vercel-protection-bypass'] = vercelProtectionBypass;
+        }
 
-      response = await withSpan('fastapi.http_request', async (httpSpan) => {
-        httpSpan.setAttribute('http.request.method', 'POST');
-        httpSpan.setAttribute('http.route', '/api/v1/generate');
-
-        const res = await fetch(endpoint, {
+        response = await fetch(endpoint, {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -281,16 +281,14 @@ export async function generateAiNotes(
           signal: abortController.signal,
         });
 
-        httpSpan.setAttribute('http.response.status_code', res.status);
-        if (!res.ok) {
-          httpSpan.setStatus({
+        span.setAttribute('http.response.status_code', response.status);
+        if (!response.ok) {
+          span.setStatus({
             code: SpanStatusCode.ERROR,
-            message: `HTTP ${res.status}`,
+            message: `HTTP ${response.status}`,
           });
         }
-        return res;
-      });
-    } catch (networkError: any) {
+      } catch (networkError: any) {
       clearTimeout(timer);
       const durationSeconds = (performance.now() - startTime) / 1000;
 
@@ -567,5 +565,9 @@ export async function generateAiNotes(
     });
 
     return validation.data;
+  }, {
+    'http.request.method': 'POST',
+    'http.route': '/api/v1/generate',
+    model,
   });
 }
