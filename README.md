@@ -2,7 +2,7 @@
 
 CodeNotes is an AI-powered technical study-notes application that transforms YouTube programming tutorials into structured, syntax-highlighted study notes. A user submits a YouTube URL; the system validates the input, authenticates via Supabase Auth, registers a durable idempotency reservation in PostgreSQL, and dispatches a background event to Inngest.
 
-Inngest durable steps fetch the video transcript using a dual-provider strategy (Supadata API primary with `youtube-transcript` fallback) and shared PostgreSQL transcript caching, invoke Google Gemini 2.5 Flash with structured schema enforcement, and atomically persist the study notes to PostgreSQL under Row Level Security (RLS) user isolation. The frontend provides live status polling and a keyset-paginated library with full search and sorting.
+Inngest durable steps fetch the video transcript using a dual-provider strategy (Supadata API primary with `youtube-transcript` fallback) and shared PostgreSQL transcript caching, dispatches to a dedicated FastAPI AI Generator microservice invoking Google Gemini 2.5 Flash with structured schema enforcement, and atomically persists the study notes to PostgreSQL under Row Level Security (RLS) user isolation. The frontend provides live status polling and a keyset-paginated library with full search and sorting.
 
 ---
 
@@ -12,6 +12,7 @@ Inngest durable steps fetch the video transcript using a dual-provider strategy 
 - **Distributed Idempotency & Processing Leases**: Guarantees zero duplicate note writes and safe retries across network drops and concurrent requests via PostgreSQL `generation_idempotency` records with 15-minute leases.
 - **Multi-Tenant PostgreSQL Row Level Security (RLS)**: Enforces complete user isolation directly at the database layer via `withUserTransaction` and transaction-local JWT claims (`SET LOCAL "request.jwt.claim.sub"`).
 - **Dual-Provider Transcript Strategy & Shared Caching**: Reuses public transcripts across users in `youtube_transcripts` while keeping generated notes strictly isolated. Falls back cleanly from Supadata to YouTube scraping.
+- **Dedicated Stateless AI Microservice**: Offloads Gemini inference and response validation to a separate Python FastAPI service deployed with sub-second health checks and Bearer token security.
 - **Crash-Safe Reconciliation**: A 5-minute Inngest cron job scans stale `pending` and `processing` records, re-dispatching dropped jobs to ensure zero orphaned user requests.
 - **Full Observability Stack**: Built-in Prometheus metrics at `/api/metrics`, Prometheus alerting rules, pre-configured Grafana dashboard, deep `/api/health` probes, and privacy-safe Sentry error sanitization.
 
@@ -45,19 +46,22 @@ For detailed component flows and sequence diagrams, see the [Architecture Docume
 | **State & Polling** | TanStack Query v5, Zustand v5, React Hook Form, Zod |
 | **Durable Execution** | Inngest (`inngest`, `inngest/next`) |
 | **Database & Auth** | PostgreSQL 16 (Supabase), Row Level Security (RLS), `pg` connection pool |
-| **AI & Transcripts** | Google Gemini 2.5 Flash (`@google/generative-ai`), Supadata API, `youtube-transcript` |
+| **AI Generator Microservice** | FastAPI, Python 3.13, `uv`, Google Gemini 2.5 Flash (`google-genai`), Pydantic v2 |
+| **Transcripts** | Supadata API, `youtube-transcript`, shared PostgreSQL cache (`youtube_transcripts`) |
 | **Observability** | Prometheus (`prom-client`), Grafana, `@sentry/nextjs`, structured JSON logging |
-| **Testing** | Vitest, Playwright, Docker Compose |
+| **Testing** | Vitest, Playwright, Pytest, Ruff, Docker Compose |
 
 ---
 
 ## Project Documentation
 
-Detailed technical documentation is available in the `docs/` directory:
+Detailed technical documentation is available in the `docs/` and `services/` directories:
 
-- 📖 **[Architecture Guide](docs/architecture.md)**: Deep dive into synchronous ingestion vs. durable execution, Mermaid architecture and sequence diagrams, database schema, RLS policies, distributed idempotency, and reconciliation.
-- 🛠️ **[Development & Testing Guide](docs/development.md)**: Prerequisites, local setup instructions, environment variables reference, migrations, and running the test suites (unit, integration, RLS, E2E, and observability).
-- 📊 **[Observability & Monitoring Guide](docs/observability.md)**: Prometheus metrics reference, alerting rules, Grafana dashboard panels, process-local scraping limitations in serverless, health checks, and Sentry PII sanitization.
+- 📖 **[Architecture Guide](docs/architecture.md)**: Deep dive into synchronous ingestion vs. durable execution, Mermaid architecture and sequence diagrams, database schema, RLS policies, distributed idempotency, error classification, and reconciliation.
+- 🚀 **[FastAPI Production Runbook](docs/fastapi-production-runbook.md)**: Authoritative production deployment, Vercel configuration, Inngest sync, end-to-end smoke verification, log correlation, troubleshooting, and rollback procedures.
+- 🛠️ **[Development & Testing Guide](docs/development.md)**: Prerequisites, local setup instructions across Node.js and Python/uv, environment variables reference, migrations, and running the test suites.
+- ⚡ **[AI Generator Service README](services/ai-generator/README.md)**: Standalone Python microservice architecture, API schemas, error codes, client lifecycle, and local `uv` commands.
+- 📊 **[Observability & Monitoring Guide](docs/observability.md)**: Prometheus metrics reference, alerting rules, Grafana dashboard panels, process-local scraping limitations in serverless, health checks, distributed tracing, and Sentry PII sanitization.
 
 ---
 
@@ -65,35 +69,43 @@ Detailed technical documentation is available in the `docs/` directory:
 
 ### 1. Prerequisites
 - **Node.js**: `v20.x` or higher
+- **npm**: `v10.x` or higher
+- **Python**: `3.13` (minimum 3.12, pinned via `services/ai-generator/.python-version`)
+- **uv**: `v0.13.x` or higher (recommended for Python package management; or standard `venv` + `pip`)
 - **PostgreSQL**: `16.x` (local instance or Supabase)
 - **Docker Compose**: Required for running the Prometheus/Grafana stack and RLS test containers
 
 ### 2. Install Dependencies
-Due to a peer dependency requirement between Vitest 5 and `@types/node 20`, install dependencies using `--legacy-peer-deps`:
 ```bash
+# Node.js dependencies (use --legacy-peer-deps due to Vitest 5 / @types/node peer resolution):
 npm install --legacy-peer-deps
-# or for clean CI installations
-npm ci --legacy-peer-deps
+
+# Python dependencies (locked environment via uv):
+uv sync --project services/ai-generator
 ```
 
 ### 3. Environment Configuration
-Copy `.env.example` to `.env.local`:
+Copy `.env.example` to `.env.local` in the root:
 ```bash
 cp .env.example .env.local
 ```
-Set your database and API keys:
+Set your database, Supabase, and FastAPI configuration in `.env.local`:
 ```env
 DATABASE_URL=postgresql://postgres:postgrespassword@localhost:5432/codenotes
 NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
-GEMINI_API_KEY=your-gemini-api-key
 FASTAPI_SERVICE_URL=http://127.0.0.1:8000
 FASTAPI_SERVICE_SECRET=your-fastapi-service-secret
-# FASTAPI_VERCEL_PROTECTION_BYPASS is required only when calling a Vercel-protected FastAPI Preview deployment:
-# FASTAPI_VERCEL_PROTECTION_BYPASS=your-vercel-protection-bypass-secret
+# FASTAPI_VERCEL_PROTECTION_BYPASS=your-optional-preview-bypass-key
 SUPADATA_API_KEY=your-optional-supadata-key
-# METRICS_SECRET is optional locally (leave unset or commented out for unauthenticated local Prometheus scraping)
-# METRICS_SECRET=your-metrics-secret
+```
+
+Configure `services/ai-generator/.env` for the Python microservice:
+```bash
+cd services/ai-generator
+cp .env.example .env
+# Set GEMINI_API_KEY and FASTAPI_SERVICE_SECRET (matching .env.local)
+cd ../..
 ```
 
 ### 4. Run Database Migrations
@@ -115,13 +127,8 @@ npm run dev
 # Terminal 2: Inngest Local Dev Server
 npm run inngest:dev
 
-# Terminal 3: FastAPI AI Generator Microservice
-cd services/ai-generator
-# Windows:
-.\.venv\Scripts\activate
-# Linux/macOS:
-source .venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+# Terminal 3: FastAPI AI Generator Microservice (using uv)
+uv run --project services/ai-generator uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 # Terminal 4 (Optional): Prometheus & Grafana Monitoring Stack
 docker compose -f docker-compose.prometheus.yml up -d
@@ -132,9 +139,6 @@ docker compose -f docker-compose.prometheus.yml up -d
 - **FastAPI AI Service**: [http://localhost:8000/health](http://localhost:8000/health)
 - **Prometheus**: [http://localhost:9090](http://localhost:9090)
 - **Grafana**: [http://localhost:3001](http://localhost:3001) (`admin` / `admin`)
-
-> [!TIP]
-> **Native Execution vs. Docker Compose**: For local development, running Next.js, Inngest, and FastAPI natively on the host machine provides the fastest hot-reload feedback, sub-second Turbopack compilation, and instant Python reloads without container translation overhead. Docker Compose is recommended for supporting background infrastructure (Prometheus/Grafana) or isolated staging runs.
 
 ---
 
@@ -149,28 +153,31 @@ npm test
 # 2. Run real loopback cross-process FastAPI boundary verification
 npm run test:fastapi-boundary
 
-# 3. Run Python unit and integration tests (Pytest)
-cd services/ai-generator && pytest && cd ../..
+# 3. Run Python unit and integration tests (Pytest via uv)
+uv run --project services/ai-generator pytest services/ai-generator/tests -v
 
 # 4. Check Python linting and formatting (Ruff)
-ruff check services/ai-generator
-ruff format --check services/ai-generator
+uv run --project services/ai-generator ruff check services/ai-generator
+uv run --project services/ai-generator ruff format --check services/ai-generator
 
-# 5. Run PostgreSQL Row Level Security (RLS) integration tests
+# 5. Check Python lockfile consistency (uv)
+uv lock --check --project services/ai-generator
+
+# 6. Run PostgreSQL Row Level Security (RLS) integration tests
 # (Requires TEST_DATABASE_URL pointing to isolated local 'codenotes_test' database)
 npm run test:integration:rls
 
-# 6. Validate Prometheus config, alert rules, and Grafana dashboard queries
+# 7. Validate Prometheus config, alert rules, and Grafana dashboard queries
 npm run validate:observability
 
-# 7. Run deterministic Playwright end-to-end tests
+# 8. Run deterministic Playwright end-to-end tests
 npm run test:e2e
 
-# 8. Linting and TypeScript type checking
+# 9. Linting and TypeScript type checking
 npm run lint
 npx tsc --noEmit
 
-# 9. Production Next.js build compilation
+# 10. Production Next.js build compilation
 npm run build
 ```
 
@@ -217,30 +224,7 @@ CodeNotes exposes an active database liveness probe at `/api/health` returning a
 > [!IMPORTANT]
 > - `commit` exposes the full 40-character Git commit SHA from `VERCEL_GIT_COMMIT_SHA` in deployed environments (or `null` in local development when unset).
 > - To prevent sensitive information disclosure, database query latency (`durationMs`) and internal error details (`errorMessage`) are **never returned in the JSON response body**.
-> - Query latency is recorded in Prometheus metrics (`http_request_duration_seconds`), and failures are emitted with structured error fields (including `errorMessage` and `status`) to stderr via JSON logs (`logger.error`). Prometheus records only low-cardinality status codes and labels; it does not store internal error strings.
-
-### Metrics Scraping & Authentication (`/api/metrics`)
-
-The Prometheus metrics endpoint exposes HTTP, pipeline, and AI telemetry:
-- **Preview & Production**: Requires `Authorization: Bearer <METRICS_SECRET>`. Missing or invalid tokens return HTTP `401 Unauthorized`. If `METRICS_SECRET` is unset or blank in preview/production, the endpoint fails closed with HTTP `503 Service Unavailable`.
-- **Local Development**: If `METRICS_SECRET` is unset or blank, `/api/metrics` allows unauthenticated scraping to simplify local Docker Prometheus development.
-
----
-
-## Deployment & Verification Workflows
-
-1. **Automated Post-Deployment Smoke Verification**:
-   The GitHub Actions workflow [`.github/workflows/post-deploy-smoke.yml`](.github/workflows/post-deploy-smoke.yml) triggers automatically on `workflow_run` after CI completes successfully on pushes to `main`. It polls `https://my-code-note.vercel.app/api/health` every 15 seconds for up to 10 minutes, asserting:
-   - HTTP status code is `200`.
-   - `commit` matches the exact full 40-character Git commit SHA that triggered the workflow.
-   - `environment` equals `'production'`.
-   - `status` equals `'healthy'`.
-   - `database` equals `'connected'`.
-2. **Manual Release Verification**:
-   Inspect active health and the deployed full commit SHA via curl:
-   ```bash
-   curl -i https://my-code-note.vercel.app/api/health
-   ```
+> - Query latency is recorded in Prometheus metrics (`http_request_duration_seconds`), and failures are emitted with structured error fields to stderr via JSON logs (`logger.error`).
 
 ---
 
@@ -248,5 +232,5 @@ The Prometheus metrics endpoint exposes HTTP, pipeline, and AI telemetry:
 
 1. **Process-Local Prometheus Metrics**: The in-memory Prometheus registry in `/api/metrics` reflects metrics for the local Node.js process. In distributed or serverless multi-instance deployments (such as Vercel), scraping process-local memory does not provide global aggregation without an external aggregator like Prometheus Pushgateway or an OpenTelemetry Collector.
 2. **Scrape Availability vs. Database Health**: Prometheus `up{job="codenotes"}` proves only that the HTTP server is responsive and scrapable; active database availability must be verified via the `/api/health` endpoint.
-3. **Structured Application Logging vs. Prometheus Metrics**: Structured JSON logs are emitted directly to stdout/stderr via a lightweight custom logger (`src/lib/logger.ts`). Pino is not installed, and no log ingestion pipeline is configured in the default local stack. Application logs are inspected in the terminal; Grafana visualizes Prometheus metrics only. Prometheus records aggregate counters and latency histograms with bounded labels, and never stores internal error messages.
+3. **Structured Application Logging vs. Prometheus Metrics**: Structured JSON logs are emitted directly to stdout/stderr via a lightweight custom logger (`src/lib/logger.ts`). Pino is not installed, and no log ingestion pipeline is configured in the default local stack. Application logs are inspected in the terminal; Grafana visualizes Prometheus metrics only.
 4. **Optional Error Reporting**: Sentry error tracking is completely optional. If `SENTRY_DSN` is unset, the SDK initializes disabled with zero outbound network calls, and any captured exceptions resolve as safe no-ops.
