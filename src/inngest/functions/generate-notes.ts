@@ -363,8 +363,11 @@ export const generateNotesFunction = inngest.createFunction(
           if (!mediaData.transcriptText) {
             throw new NonRetriableError('Transcript text is required for AI note generation.');
           }
-          aiNotes = await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
-            requestId: idempotencyKey,
+          aiNotes = await withSpan('fastapi.http_request', async (span) => {
+            return await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
+              requestId: idempotencyKey,
+              span,
+            });
           });
         } catch (err: any) {
           const classification = classifyError(err);

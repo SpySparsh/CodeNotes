@@ -2,7 +2,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { logger } from '@/lib/logger';
 import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
-import { withSpan, SpanStatusCode } from '@/lib/tracing';
+import { withSpan, SpanStatusCode, sanitizeErrorMessage, createSafeSpan, type Span } from '@/lib/tracing';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
 export const DEFAULT_AI_MODEL = 'gemini-2.5-flash';
@@ -28,6 +28,7 @@ export interface GenerateAiNotesOptions {
   model?: string;
   vercelProtectionBypass?: string;
   requireVercelProtectionBypass?: boolean;
+  span?: Span;
 }
 
 /**
@@ -247,12 +248,12 @@ export async function generateAiNotes(
     timeoutMs,
   });
 
-  return await withSpan(
-    'fastapi.http_request',
-    async (span) => {
-      span.setAttribute('http.request.method', 'POST');
-      span.setAttribute('http.route', '/api/v1/generate');
-      span.setAttribute('model', model);
+  const executeWithSpan = async (span: Span): Promise<GeneratedNotes> => {
+    const safeSpan = createSafeSpan(span);
+
+    safeSpan.setAttribute('http.request.method', 'POST');
+    safeSpan.setAttribute('http.route', '/api/v1/generate');
+    safeSpan.setAttribute('model', model);
 
       const abortController = new AbortController();
       const timer = setTimeout(() => {
@@ -281,9 +282,9 @@ export async function generateAiNotes(
           signal: abortController.signal,
         });
 
-        span.setAttribute('http.response.status_code', response.status);
+        safeSpan.setAttribute('http.response.status_code', response.status);
         if (!response.ok) {
-          span.setStatus({
+          safeSpan.setStatus({
             code: SpanStatusCode.ERROR,
             message: `HTTP ${response.status}`,
           });
@@ -291,6 +292,15 @@ export async function generateAiNotes(
       } catch (networkError: any) {
       clearTimeout(timer);
       const durationSeconds = (performance.now() - startTime) / 1000;
+
+      safeSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: sanitizeErrorMessage(networkError?.message || 'Network error'),
+      });
+      safeSpan.recordException({
+        name: typeof networkError?.code === 'string' ? networkError.code : (networkError?.name || 'NetworkError'),
+        message: sanitizeErrorMessage(networkError?.message || 'Network error'),
+      });
 
       const isTimeout =
         networkError?.name === 'AbortError' ||
@@ -554,7 +564,8 @@ export async function generateAiNotes(
     // Success metrics & span attributes
     recordAiRequest(model, 'success');
     recordAiDuration(model, durationSeconds);
-    span.setAttribute('status', 'success');
+    safeSpan.setAttribute('status', 'success');
+    safeSpan.setStatus({ code: SpanStatusCode.OK });
 
     logger.info('ai_client_request_completed', {
       requestId,
@@ -565,9 +576,21 @@ export async function generateAiNotes(
     });
 
     return validation.data;
-  }, {
-    'http.request.method': 'POST',
-    'http.route': '/api/v1/generate',
-    model,
-  });
+  };
+
+  if (options?.span) {
+    return await executeWithSpan(options.span);
+  }
+
+  return await withSpan(
+    'fastapi.http_request',
+    async (span) => {
+      return await executeWithSpan(span);
+    },
+    {
+      'http.request.method': 'POST',
+      'http.route': '/api/v1/generate',
+      model,
+    }
+  );
 }
