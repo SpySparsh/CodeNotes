@@ -2,8 +2,20 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { updateSession } from '@/lib/supabase/proxy';
 
 export async function proxy(request: NextRequest) {
-  const { supabaseResponse, user } = await updateSession(request);
   const { pathname, search } = request.nextUrl;
+
+  // Intercept unintended root or non-callback OAuth/email confirmation redirects
+  // (e.g. if Supabase fallback redirects to Site URL '/' instead of '/auth/callback')
+  if (
+    pathname !== '/auth/callback' &&
+    (request.nextUrl.searchParams.has('code') || request.nextUrl.searchParams.has('token_hash'))
+  ) {
+    const callbackUrl = new URL('/auth/callback', request.url);
+    callbackUrl.search = request.nextUrl.search;
+    return NextResponse.redirect(callbackUrl);
+  }
+
+  const { supabaseResponse, user } = await updateSession(request);
 
   // Protected pages: redirect unauthenticated users to login
   const isProtectedRoute = pathname.startsWith('/library') || pathname.startsWith('/notes');

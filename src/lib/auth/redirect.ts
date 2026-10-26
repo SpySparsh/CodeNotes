@@ -86,3 +86,61 @@ export function sanitizeRedirectPath(
     return fallback;
   }
 }
+
+/**
+ * Resolves the canonical/runtime base origin across client and server environments.
+ * Priority:
+ * 1. Client-side browser: window.location.origin (reflects the exact host/port where the user is active)
+ * 2. NEXT_PUBLIC_SITE_URL: configured production canonical domain
+ * 3. NEXT_PUBLIC_VERCEL_URL: automatic Vercel preview domain
+ * 4. VERCEL_URL: server-side Vercel deployment URL
+ * 5. Fallback: http://localhost:3000
+ */
+export function getAppUrl(): string {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin;
+  }
+
+  const rawSiteUrl = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+  if (rawSiteUrl) {
+    const formatted = rawSiteUrl.startsWith('http://') || rawSiteUrl.startsWith('https://')
+      ? rawSiteUrl
+      : `https://${rawSiteUrl}`;
+    return formatted.replace(/\/+$/, '');
+  }
+
+  const rawVercelPublic = process.env.NEXT_PUBLIC_VERCEL_URL?.trim();
+  if (rawVercelPublic) {
+    const formatted = rawVercelPublic.startsWith('http://') || rawVercelPublic.startsWith('https://')
+      ? rawVercelPublic
+      : `https://${rawVercelPublic}`;
+    return formatted.replace(/\/+$/, '');
+  }
+
+  const rawVercelServer = process.env.VERCEL_URL?.trim();
+  if (rawVercelServer) {
+    const formatted = rawVercelServer.startsWith('http://') || rawVercelServer.startsWith('https://')
+      ? rawVercelServer
+      : `https://${rawVercelServer}`;
+    return formatted.replace(/\/+$/, '');
+  }
+
+  return 'http://localhost:3000';
+}
+
+/**
+ * Constructs an absolute authentication callback URL (/auth/callback) suitable for
+ * Supabase OAuth redirectTo and email confirmation emailRedirectTo options.
+ *
+ * @param next - Optional post-authentication destination path (sanitized against open redirects)
+ * @returns Fully-qualified callback URL string (e.g. 'https://my-app.vercel.app/auth/callback?next=%2Flibrary')
+ */
+export function getAuthCallbackUrl(next?: string | null): string {
+  const base = getAppUrl();
+  const callbackUrl = new URL('/auth/callback', base);
+  if (next) {
+    const sanitizedNext = sanitizeRedirectPath(next, base, '/library');
+    callbackUrl.searchParams.set('next', sanitizedNext);
+  }
+  return callbackUrl.toString();
+}
