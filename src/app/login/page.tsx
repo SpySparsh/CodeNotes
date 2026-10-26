@@ -8,7 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { createClient } from '@/lib/supabase/client';
 import { Video, ArrowRight, Loader2 } from 'lucide-react';
 import { loginSchema, LoginInput } from '@/lib/validations/auth';
-import { sanitizeRedirectPath } from '@/lib/auth/redirect';
+import { sanitizeRedirectPath, getAuthCallbackUrl } from '@/lib/auth/redirect';
 import { trackAuthSuccess, setOAuthFlowIntent, captureEvent } from '@/lib/analytics';
 
 function LoginForm() {
@@ -76,11 +76,11 @@ function LoginForm() {
     setOAuthFlowIntent('login');
 
     try {
-      const origin = window.location.origin;
+      const callbackUrl = getAuthCallbackUrl(next);
       const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${origin}/auth/callback?next=${encodeURIComponent(next)}`,
+          redirectTo: callbackUrl,
         },
       });
 

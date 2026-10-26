@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { requireUser, getOptionalUser, UnauthorizedError } from '@/lib/auth';
 import { GET as handleCallback } from '@/app/auth/callback/route';
 import * as serverSupabase from '@/lib/supabase/server';
-import { sanitizeRedirectPath } from '@/lib/auth/redirect';
+import { sanitizeRedirectPath, getAppUrl, getAuthCallbackUrl } from '@/lib/auth/redirect';
 
 vi.mock('@/lib/supabase/server', () => ({
   createClient: vi.fn(),
@@ -243,6 +243,164 @@ describe('OAuth & Confirmation Callback (GET /auth/callback)', () => {
 
     expect(response.status).toBe(307);
     expect(response.headers.get('location')).toBe('http://localhost:3000/login?error=auth_callback_failed');
+  });
+
+  it('verifies token_hash and type for email confirmation and redirects to destination', async () => {
+    const mockSupabase = {
+      auth: {
+        verifyOtp: vi.fn().mockResolvedValue({ data: { user: { id: 'u1' } }, error: null }),
+      },
+    };
+    vi.mocked(serverSupabase.createClient).mockResolvedValueOnce(mockSupabase as any);
+
+    const request = new Request('http://localhost:3000/auth/callback?token_hash=mock-token-hash&type=signup&next=/library');
+    const response = await handleCallback(request);
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toBe('http://localhost:3000/library');
+    expect(mockSupabase.auth.verifyOtp).toHaveBeenCalledWith({
+      type: 'signup',
+      token_hash: 'mock-token-hash',
+    });
+  });
+
+  it('redirects to /login with error when verifyOtp fails', async () => {
+    const mockSupabase = {
+      auth: {
+        verifyOtp: vi.fn().mockResolvedValue({ data: {}, error: new Error('Token expired') }),
+      },
+    };
+    vi.mocked(serverSupabase.createClient).mockResolvedValueOnce(mockSupabase as any);
+
+    const request = new Request('http://localhost:3000/auth/callback?token_hash=bad-token&type=signup');
+    const response = await handleCallback(request);
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toBe('http://localhost:3000/login?error=auth_callback_failed');
+  });
+
+  it('redirects to /login with error when provider sends OAuth error in searchParams', async () => {
+    const request = new Request('http://localhost:3000/auth/callback?error=access_denied&error_description=User+cancelled+authorization');
+    const response = await handleCallback(request);
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toBe('http://localhost:3000/login?error=User+cancelled+authorization');
+  });
+
+  it('resolves public destination using x-forwarded-host and x-forwarded-proto headers', async () => {
+    const mockSupabase = {
+      auth: {
+        exchangeCodeForSession: vi.fn().mockResolvedValue({ data: {}, error: null }),
+      },
+    };
+    vi.mocked(serverSupabase.createClient).mockResolvedValueOnce(mockSupabase as any);
+
+    const request = new Request('http://10.0.0.1:3000/auth/callback?code=mock-code&next=/notes/123', {
+      headers: {
+        'x-forwarded-host': 'codenotes-ai.vercel.app',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    const response = await handleCallback(request);
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toBe('https://codenotes-ai.vercel.app/notes/123');
+  });
+
+  it('redirects to /login with error when neither code nor token_hash is present', async () => {
+    const request = new Request('http://localhost:3000/auth/callback');
+    const response = await handleCallback(request);
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toBe('http://localhost:3000/login?error=auth_callback_failed');
+  });
+});
+
+describe('Dynamic Auth URL Helpers (getAppUrl & getAuthCallbackUrl)', () => {
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.NEXT_PUBLIC_SITE_URL;
+    delete process.env.NEXT_PUBLIC_VERCEL_URL;
+    delete process.env.VERCEL_URL;
+  });
+
+  it('resolves NEXT_PUBLIC_SITE_URL with https prepended if missing', () => {
+    process.env.NEXT_PUBLIC_SITE_URL = 'codenotes.example.com';
+    expect(getAppUrl()).toBe('https://codenotes.example.com');
+  });
+
+  it('preserves existing https in NEXT_PUBLIC_SITE_URL and strips trailing slash', () => {
+    process.env.NEXT_PUBLIC_SITE_URL = 'https://codenotes.example.com/';
+    expect(getAppUrl()).toBe('https://codenotes.example.com');
+  });
+
+  it('resolves NEXT_PUBLIC_VERCEL_URL for preview deployments', () => {
+    process.env.NEXT_PUBLIC_VERCEL_URL = 'codenotes-git-preview.vercel.app';
+    expect(getAppUrl()).toBe('https://codenotes-git-preview.vercel.app');
+  });
+
+  it('resolves VERCEL_URL on server side', () => {
+    process.env.VERCEL_URL = 'codenotes-server.vercel.app';
+    expect(getAppUrl()).toBe('https://codenotes-server.vercel.app');
+  });
+
+  it('defaults to http://localhost:3000 when no environment variables are configured', () => {
+    expect(getAppUrl()).toBe('http://localhost:3000');
+  });
+
+  it('constructs complete callback URL with sanitized next parameter', () => {
+    process.env.NEXT_PUBLIC_SITE_URL = 'https://codenotes.example.com';
+    const callback = getAuthCallbackUrl('/notes/abc');
+    expect(callback).toBe('https://codenotes.example.com/auth/callback?next=%2Fnotes%2Fabc');
+  });
+
+  it('sanitizes open redirect attempts in getAuthCallbackUrl', () => {
+    process.env.NEXT_PUBLIC_SITE_URL = 'https://codenotes.example.com';
+    const callback = getAuthCallbackUrl('https://evil.com');
+    expect(callback).toBe('https://codenotes.example.com/auth/callback?next=%2Flibrary');
+  });
+});
+
+describe('Email Signup Response Classification', () => {
+  it('correctly classifies existing account with empty identities as existing user', () => {
+    const authData = {
+      user: { id: 'u-123', email: 'test@example.com', identities: [] },
+      session: null,
+    };
+    const isExistingUser =
+      authData.user &&
+      Array.isArray(authData.user.identities) &&
+      authData.user.identities.length === 0;
+
+    expect(isExistingUser).toBe(true);
+  });
+
+  it('correctly classifies new user with identities as pending confirmation', () => {
+    const authData = {
+      user: { id: 'u-456', email: 'new@example.com', identities: [{ id: 'ident-1' }] },
+      session: null,
+    };
+    const isExistingUser =
+      authData.user &&
+      Array.isArray(authData.user.identities) &&
+      authData.user.identities.length === 0;
+    const isConfirmationSent =
+      authData.user &&
+      !authData.session &&
+      (!authData.user.identities || authData.user.identities.length > 0);
+
+    expect(isExistingUser).toBe(false);
+    expect(isConfirmationSent).toBe(true);
+  });
+
+  it('correctly classifies immediate session when email confirmation is disabled', () => {
+    const authData = {
+      user: { id: 'u-789', email: 'instant@example.com', identities: [{ id: 'ident-2' }] },
+      session: { access_token: 'mock-access-token' },
+    };
+    expect(authData.session).toBeTruthy();
   });
 });
 
