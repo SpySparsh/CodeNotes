@@ -74,9 +74,13 @@ BEGIN
     -- 3. DEF-2: Genuinely prevalidate and grant role membership to migration executor without blanket suppression
     v_has_membership := pg_has_role(CURRENT_USER, 'codenotes_definer', 'MEMBER');
 
-    IF NOT v_has_membership AND NOT v_is_super THEN
-        -- Non-superusers require explicit role membership to execute ALTER FUNCTION ... OWNER TO
-        EXECUTE format('GRANT codenotes_definer TO %I', CURRENT_USER);
+    IF NOT v_is_super THEN
+        -- Non-superusers require explicit role membership with SET option to execute ALTER FUNCTION ... OWNER TO in PG16+
+        BEGIN
+            EXECUTE format('GRANT codenotes_definer TO %I WITH SET TRUE', CURRENT_USER);
+        EXCEPTION WHEN syntax_error THEN
+            EXECUTE format('GRANT codenotes_definer TO %I', CURRENT_USER);
+        END;
 
         -- Immediately re-verify effective membership
         IF NOT pg_has_role(CURRENT_USER, 'codenotes_definer', 'MEMBER') THEN
@@ -2922,19 +2926,19 @@ DECLARE
     -- 1. Exact Column Specifications: format 'name:type:typmod:notnull'
     -- typmod for varchar(N) is N + 4; -1 for unconstrained/primitive types
     v_exp_cols_idemp TEXT[] := ARRAY[
-        'user_id:uuid:-1:true',
-        'key:varchar:68:true',
-        'status:varchar:24:true',
-        'video_id:varchar:259:false',
-        'video_url:text:-1:false',
-        'note_id:uuid:-1:false',
-        'error_message:text:-1:false',
-        'error_code:varchar:104:false',
         'attempts:int4:-1:false',
-        'lease_until:timestamptz:-1:false',
-        'processing_owner:varchar:259:false',
         'created_at:timestamptz:-1:false',
-        'updated_at:timestamptz:-1:false'
+        'error_code:varchar:104:false',
+        'error_message:text:-1:false',
+        'key:varchar:68:true',
+        'lease_until:timestamptz:-1:false',
+        'note_id:uuid:-1:false',
+        'processing_owner:varchar:259:false',
+        'status:varchar:24:true',
+        'updated_at:timestamptz:-1:false',
+        'user_id:uuid:-1:true',
+        'video_id:varchar:259:false',
+        'video_url:text:-1:false'
     ];
 
     v_exp_cols_configs TEXT[] := ARRAY[
@@ -3132,8 +3136,8 @@ BEGIN
     END LOOP;
 
     -- 2. Phase 1Q: Exact Catalog Column Inventory, Data Type, typmod, and Nullability Validation
-    -- A. generation_idempotency
-    SELECT array_agg(format('%s:%s:%s:%s', a.attname, t.typname, a.atttypmod, CASE WHEN a.attnotnull THEN 'true' ELSE 'false' END) ORDER BY a.attnum)
+    -- A. generation_idempotency (ordered by attname for schema-invariant attribute ordering)
+    SELECT array_agg(format('%s:%s:%s:%s', a.attname, t.typname, a.atttypmod, CASE WHEN a.attnotnull THEN 'true' ELSE 'false' END) ORDER BY a.attname)
     INTO v_actual_cols
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid
