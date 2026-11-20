@@ -8,6 +8,18 @@ export const DEFAULT_AI_TIMEOUT_MS = 85_000;
 export const DEFAULT_AI_MODEL = 'gemini-2.5-flash';
 
 /**
+ * Token usage metadata extracted from Gemini responses.
+ */
+export const usageMetadataSchema = z.object({
+  promptTokens: z.number().int().nonnegative().default(0),
+  candidateTokens: z.number().int().nonnegative().default(0),
+  thoughtsTokens: z.number().int().nonnegative().default(0),
+  totalTokens: z.number().int().nonnegative().default(0),
+});
+
+export type UsageMetadata = z.infer<typeof usageMetadataSchema>;
+
+/**
  * Runtime Zod schema validating the structured notes contract returned by FastAPI.
  * Allows empty arrays for keyConcepts and shorthands matching the upstream specification.
  */
@@ -19,6 +31,53 @@ export const generatedNotesSchema = z.object({
 });
 
 export type GeneratedNotes = z.infer<typeof generatedNotesSchema>;
+
+/**
+ * Runtime Zod schema for single-chunk note generation responses, including token metrics.
+ */
+export const chunkGeneratedNotesSchema = z.object({
+  overview: z.string().min(1, 'overview is required and must not be empty'),
+  keyConcepts: z.array(z.string()).default([]),
+  detailedNotes: z.string().min(1, 'detailedNotes is required and must not be empty'),
+  shorthands: z.array(z.string()).default([]),
+  usage: usageMetadataSchema,
+  promptTokens: z.number().int().nonnegative().default(0),
+  candidateTokens: z.number().int().nonnegative().default(0),
+  thoughtsTokens: z.number().int().nonnegative().default(0),
+  totalTokens: z.number().int().nonnegative().default(0),
+});
+
+export type ChunkGeneratedNotes = z.infer<typeof chunkGeneratedNotesSchema>;
+
+/**
+ * Summary of an individual chunk for hierarchical synthesis input.
+ */
+export const chunkSummarySchema = z.object({
+  chunkIndex: z.number().int().nonnegative().default(0),
+  overview: z.string().min(1, 'overview is required and must not be empty'),
+  keyConcepts: z.array(z.string()).default([]),
+  shorthands: z.array(z.string()).default([]),
+});
+
+export type ChunkSummary = z.infer<typeof chunkSummarySchema>;
+
+/**
+ * Runtime Zod schema for multi-chunk hierarchical synthesis responses.
+ */
+export const synthesizedNotesSchema = z.object({
+  overview: z.string().min(1, 'overview is required and must not be empty'),
+  keyConcepts: z.array(z.string()).default([]),
+  tableOfContents: z.array(z.string()).default([]),
+  shorthands: z.array(z.string()).default([]),
+  detailedNotes: z.string().nullable().optional(),
+  usage: usageMetadataSchema,
+  promptTokens: z.number().int().nonnegative().default(0),
+  candidateTokens: z.number().int().nonnegative().default(0),
+  thoughtsTokens: z.number().int().nonnegative().default(0),
+  totalTokens: z.number().int().nonnegative().default(0),
+});
+
+export type SynthesizedNotes = z.infer<typeof synthesizedNotesSchema>;
 
 export interface GenerateAiNotesOptions {
   requestId?: string;
@@ -593,4 +652,518 @@ export async function generateAiNotes(
       model,
     }
   );
+}
+
+// -----------------------------------------------------------------------------
+// MULTI-CHUNK & SYNTHESIS CLIENT IMPLEMENTATION
+// -----------------------------------------------------------------------------
+
+interface SendFastApiRequestParams<T> {
+  route: string;
+  payload: Record<string, unknown>;
+  schema: z.ZodType<T>;
+  options?: GenerateAiNotesOptions;
+  requestId: string;
+  model: string;
+  logEventPrefix: string;
+  logMetadata?: Record<string, unknown>;
+}
+
+async function sendFastApiRequest<T>({
+  route,
+  payload,
+  schema,
+  options,
+  requestId,
+  model,
+  logEventPrefix,
+  logMetadata = {},
+}: SendFastApiRequestParams<T>): Promise<T> {
+  const { serviceUrl, serviceSecret, timeoutMs, vercelProtectionBypass } = getAiClientConfig(options);
+  const endpoint = `${serviceUrl}${route}`;
+  const startTime = performance.now();
+
+  logger.info(`${logEventPrefix}_request_started`, {
+    requestId,
+    model,
+    route,
+    timeoutMs,
+    ...logMetadata,
+  });
+
+  const executeWithSpan = async (span: Span): Promise<T> => {
+    const safeSpan = createSafeSpan(span);
+    safeSpan.setAttribute('http.request.method', 'POST');
+    safeSpan.setAttribute('http.route', route);
+    safeSpan.setAttribute('model', model);
+
+    const abortController = new AbortController();
+    const timer = setTimeout(() => {
+      abortController.abort();
+    }, timeoutMs);
+
+    let response: Response;
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${serviceSecret}`,
+        'X-Request-ID': requestId,
+      };
+
+      if (vercelProtectionBypass) {
+        headers['x-vercel-protection-bypass'] = vercelProtectionBypass;
+      }
+
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: abortController.signal,
+      });
+
+      safeSpan.setAttribute('http.response.status_code', response.status);
+      if (!response.ok) {
+        safeSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: `HTTP ${response.status}`,
+        });
+      }
+    } catch (networkError: any) {
+      clearTimeout(timer);
+      const durationSeconds = (performance.now() - startTime) / 1000;
+
+      safeSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: sanitizeErrorMessage(networkError?.message || 'Network error'),
+      });
+      safeSpan.recordException({
+        name: typeof networkError?.code === 'string' ? networkError.code : (networkError?.name || 'NetworkError'),
+        message: sanitizeErrorMessage(networkError?.message || 'Network error'),
+      });
+
+      const isTimeout =
+        networkError?.name === 'AbortError' ||
+        networkError?.name === 'TimeoutError' ||
+        networkError?.message?.includes('aborted') ||
+        networkError?.message?.includes('timeout');
+
+      if (isTimeout) {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        logger.warn(`${logEventPrefix}_request_timeout`, {
+          requestId,
+          model,
+          route,
+          timeoutMs,
+          durationMs: durationSeconds * 1000,
+        });
+        throw new AiClientError({
+          code: 'TIMEOUT',
+          message: `AI generation timed out after ${timeoutMs / 1000} seconds.`,
+          isRetryable: true,
+          requestId,
+          cause: networkError,
+        });
+      }
+
+      const causeCode = (networkError?.cause as any)?.code || networkError?.code || '';
+      const isDnsFailure = causeCode === 'ENOTFOUND';
+      const isConnectionRefused = causeCode === 'ECONNREFUSED';
+      const isConnectionReset = causeCode === 'ECONNRESET' || causeCode === 'ETIMEDOUT';
+
+      recordAiRequest(model, 'error');
+      recordAiDuration(model, durationSeconds);
+
+      logger.error(`${logEventPrefix}_network_error`, {
+        requestId,
+        model,
+        route,
+        durationMs: durationSeconds * 1000,
+        causeCode,
+        errorMessage: networkError?.message,
+      });
+
+      if (isDnsFailure) {
+        throw new AiClientError({
+          code: 'CONFIG_ERROR',
+          message: 'Failed to resolve AI generation service host.',
+          isRetryable: false,
+          requestId,
+          cause: networkError,
+        });
+      }
+
+      if (isConnectionReset) {
+        throw new AiClientError({
+          code: 'TIMEOUT',
+          message: 'Connection to AI generation service was reset or timed out. Retrying...',
+          isRetryable: true,
+          requestId,
+          cause: networkError,
+        });
+      }
+
+      throw new AiClientError({
+        code: 'NETWORK_ERROR',
+        message: isConnectionRefused
+          ? 'Connection to AI generation service was refused. Retrying...'
+          : (networkError?.message || 'Failed to communicate with AI generation service.'),
+        isRetryable: true,
+        requestId,
+        cause: networkError,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const durationSeconds = (performance.now() - startTime) / 1000;
+    const serverRequestId = response.headers.get('x-request-id');
+    const effectiveRequestId = serverRequestId || requestId;
+
+    if (serverRequestId && serverRequestId !== requestId) {
+      logger.info(`${logEventPrefix}_request_id_server_divergence`, {
+        clientRequestId: requestId,
+        serverRequestId,
+      });
+    }
+
+    if (!response.ok) {
+      let errorPayload: any = null;
+      try {
+        errorPayload = await response.json();
+      } catch {
+        // Non-JSON response
+      }
+
+      const returnedCode: string = errorPayload?.error?.code || '';
+      const returnedMessage: string = errorPayload?.error?.message || '';
+
+      logger.warn(`${logEventPrefix}_request_failed`, {
+        requestId: effectiveRequestId,
+        model,
+        route,
+        status: response.status,
+        returnedCode,
+        durationMs: durationSeconds * 1000,
+      });
+
+      if (response.status === 401) {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        throw new AiClientError({
+          code: 'CONFIG_ERROR',
+          message: 'AI generation service authentication failed.',
+          isRetryable: false,
+          statusCode: 401,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      if (response.status === 422) {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        throw new AiClientError({
+          code: 'INVALID_REQUEST',
+          message: returnedMessage || 'Invalid request payload sent to AI service.',
+          isRetryable: false,
+          statusCode: 422,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      if (response.status === 429 || returnedCode === 'RATE_LIMITED') {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        throw new AiClientError({
+          code: 'RATE_LIMITED',
+          message: returnedMessage || 'Generation service is temporarily busy. Retrying...',
+          isRetryable: true,
+          statusCode: 429,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      if (response.status === 502) {
+        if (returnedCode === 'MALFORMED_OUTPUT') {
+          recordAiRequest(model, 'malformed_output');
+          recordAiDuration(model, durationSeconds);
+          throw new AiClientError({
+            code: 'MALFORMED_AI_OUTPUT',
+            message: 'The AI model output could not be parsed into notes format.',
+            isRetryable: false,
+            statusCode: 502,
+            requestId: effectiveRequestId,
+          });
+        }
+
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        throw new AiClientError({
+          code: 'UPSTREAM_ERROR',
+          message: returnedMessage || 'Upstream AI provider error occurred. Retrying...',
+          isRetryable: true,
+          statusCode: 502,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      if (response.status === 503) {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        if (returnedCode === 'CONFIG_ERROR') {
+          throw new AiClientError({
+            code: 'CONFIG_ERROR',
+            message: returnedMessage || 'AI generation service is not properly configured.',
+            isRetryable: false,
+            statusCode: 503,
+            requestId: effectiveRequestId,
+          });
+        }
+        throw new AiClientError({
+          code: 'UPSTREAM_ERROR',
+          message: returnedMessage || 'AI generation service is temporarily unavailable. Retrying...',
+          isRetryable: true,
+          statusCode: 503,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      if (response.status === 504 || returnedCode === 'TIMEOUT') {
+        recordAiRequest(model, 'error');
+        recordAiDuration(model, durationSeconds);
+        throw new AiClientError({
+          code: 'TIMEOUT',
+          message: returnedMessage || `AI generation timed out after ${timeoutMs / 1000} seconds.`,
+          isRetryable: true,
+          statusCode: 504,
+          requestId: effectiveRequestId,
+        });
+      }
+
+      recordAiRequest(model, 'error');
+      recordAiDuration(model, durationSeconds);
+      throw new AiClientError({
+        code: 'UPSTREAM_ERROR',
+        message: returnedMessage || `AI generation service returned HTTP ${response.status}.`,
+        isRetryable: true,
+        statusCode: response.status,
+        requestId: effectiveRequestId,
+      });
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = await response.json();
+    } catch (parseError) {
+      recordAiRequest(model, 'malformed_output');
+      recordAiDuration(model, durationSeconds);
+      logger.error(`${logEventPrefix}_json_parse_failed`, {
+        requestId: effectiveRequestId,
+        model,
+        route,
+        status: response.status,
+        errorMessage: (parseError as Error).message,
+      });
+      throw new AiClientError({
+        code: 'MALFORMED_AI_OUTPUT',
+        message: 'The AI model output could not be parsed into notes format.',
+        isRetryable: false,
+        statusCode: response.status,
+        requestId: effectiveRequestId,
+        cause: parseError,
+      });
+    }
+
+    const validation = schema.safeParse(parsedJson);
+    if (!validation.success) {
+      recordAiRequest(model, 'malformed_output');
+      recordAiDuration(model, durationSeconds);
+      logger.error(`${logEventPrefix}_schema_validation_failed`, {
+        requestId: effectiveRequestId,
+        model,
+        route,
+        status: response.status,
+        errors: validation.error.format(),
+      });
+      throw new AiClientError({
+        code: 'MALFORMED_AI_OUTPUT',
+        message: 'The AI model output could not be parsed into notes format.',
+        isRetryable: false,
+        statusCode: response.status,
+        requestId: effectiveRequestId,
+        cause: validation.error,
+      });
+    }
+
+    recordAiRequest(model, 'success');
+    recordAiDuration(model, durationSeconds);
+    safeSpan.setAttribute('status', 'success');
+    safeSpan.setStatus({ code: SpanStatusCode.OK });
+
+    logger.info(`${logEventPrefix}_request_completed`, {
+      requestId,
+      model,
+      route,
+      durationMs: Math.round(durationSeconds * 1000),
+      ...logMetadata,
+    });
+
+    return validation.data;
+  };
+
+  if (options?.span) {
+    return await executeWithSpan(options.span);
+  }
+
+  return await withSpan(
+    'fastapi.http_request',
+    async (span) => {
+      return await executeWithSpan(span);
+    },
+    {
+      'http.request.method': 'POST',
+      'http.route': route,
+      model,
+    }
+  );
+}
+
+export interface GenerateChunkAiNotesOptions extends GenerateAiNotesOptions {}
+
+/**
+ * Invokes the FastAPI service to generate structured notes for a single transcript chunk.
+ * Returns ChunkGeneratedNotes including token metrics (prompt, candidate, thoughts, total).
+ */
+export async function generateChunkAiNotes(
+  chunkText: string,
+  videoTitle: string,
+  chunkIndex: number = 0,
+  totalChunks: number = 1,
+  options?: GenerateChunkAiNotesOptions
+): Promise<ChunkGeneratedNotes> {
+  const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
+  const rawRequestId = options?.requestId;
+  const requestId = normalizeRequestId(rawRequestId);
+
+  if (rawRequestId && rawRequestId !== requestId) {
+    logger.info('ai_client_chunk_request_id_normalized', {
+      originalRequestId: rawRequestId,
+      normalizedRequestId: requestId,
+    });
+  }
+
+  if (!chunkText || chunkText.trim().length === 0) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'Chunk text is required for chunk AI note generation.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  if (!videoTitle || videoTitle.trim().length === 0) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'Video title is required for chunk AI note generation.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  if (chunkIndex < 0) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'chunkIndex must be a non-negative integer.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  if (totalChunks < 1) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'totalChunks must be at least 1.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  return await sendFastApiRequest<ChunkGeneratedNotes>({
+    route: '/api/v1/generate-chunk',
+    payload: {
+      chunkText,
+      videoTitle,
+      chunkIndex,
+      totalChunks,
+    },
+    schema: chunkGeneratedNotesSchema,
+    options,
+    requestId,
+    model,
+    logEventPrefix: 'ai_client_chunk',
+    logMetadata: {
+      chunkIndex,
+      totalChunks,
+      chunkTextLength: chunkText.length,
+      videoTitleLength: videoTitle.length,
+    },
+  });
+}
+
+export interface SynthesizeSectionNotesOptions extends GenerateAiNotesOptions {}
+
+/**
+ * Invokes the FastAPI service to synthesize an executive summary, consolidated key concepts,
+ * and table of contents from multiple chunk summaries.
+ */
+export async function synthesizeSectionNotes(
+  chunkSummaries: ChunkSummary[],
+  videoTitle: string,
+  options?: SynthesizeSectionNotesOptions
+): Promise<SynthesizedNotes> {
+  const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
+  const rawRequestId = options?.requestId;
+  const requestId = normalizeRequestId(rawRequestId);
+
+  if (rawRequestId && rawRequestId !== requestId) {
+    logger.info('ai_client_synthesize_request_id_normalized', {
+      originalRequestId: rawRequestId,
+      normalizedRequestId: requestId,
+    });
+  }
+
+  if (!chunkSummaries || !Array.isArray(chunkSummaries) || chunkSummaries.length === 0) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'At least one chunk summary is required for synthesis.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  if (!videoTitle || videoTitle.trim().length === 0) {
+    throw new AiClientError({
+      code: 'INVALID_REQUEST',
+      message: 'Video title is required for synthesis.',
+      isRetryable: false,
+      requestId,
+    });
+  }
+
+  return await sendFastApiRequest<SynthesizedNotes>({
+    route: '/api/v1/synthesize',
+    payload: {
+      chunkSummaries,
+      videoTitle,
+    },
+    schema: synthesizedNotesSchema,
+    options,
+    requestId,
+    model,
+    logEventPrefix: 'ai_client_synthesize',
+    logMetadata: {
+      chunkSummariesCount: chunkSummaries.length,
+      videoTitleLength: videoTitle.length,
+    },
+  });
 }
