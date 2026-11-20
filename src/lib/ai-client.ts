@@ -5,7 +5,7 @@ import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
 import { withSpan, SpanStatusCode, sanitizeErrorMessage, createSafeSpan, type Span } from '@/lib/tracing';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
-export const DEFAULT_AI_MODEL = 'gemini-2.5-flash';
+export const DEFAULT_AI_MODEL = 'gemini-1.5-flash';
 
 /**
  * Token usage metadata extracted from Gemini responses.
