@@ -472,3 +472,138 @@ def test_sanitize_request_id_unit_behavior():
         sanitized = sanitize_request_id(forbidden)
         assert sanitized != forbidden
         assert uuid.UUID(sanitized).version == 4
+
+
+def test_generate_chunk_api_success_with_camel_case_and_tokens(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    sample_valid_notes_dict: dict,
+):
+    """POST /api/v1/generate-chunk returns 200 with camelCase fields and usage metrics."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(sample_valid_notes_dict)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = AsyncMock(
+            prompt_token_count=1450,
+            candidates_token_count=380,
+            thoughts_token_count=95,
+            total_token_count=1925,
+        )
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate-chunk",
+            headers=auth_headers,
+            json={
+                "chunkText": "This section covers TypeScript conditional types.",
+                "videoTitle": "Advanced TypeScript",
+                "chunkIndex": 1,
+                "totalChunks": 3,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "overview" in data
+        assert "keyConcepts" in data
+        assert "detailedNotes" in data
+        assert "shorthands" in data
+        assert "usage" in data
+        assert data["usage"]["thoughtsTokens"] == 95
+        assert data["thoughtsTokens"] == 95
+        assert data["promptTokens"] == 1450
+        assert data["totalTokens"] == 1925
+
+
+def test_generate_chunk_api_unauthorized_without_bearer(client: TestClient):
+    """POST /api/v1/generate-chunk without authorization header must return 401."""
+    response = client.post(
+        "/api/v1/generate-chunk",
+        json={
+            "chunkText": "Valid chunk content.",
+            "videoTitle": "Title",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_synthesize_api_success_with_camel_case_and_tokens(
+    client: TestClient,
+    auth_headers: dict[str, str],
+):
+    """POST /api/v1/synthesize returns 200 with tableOfContents and usage metrics."""
+    synth_dict = {
+        "overview": "Master synthesis of all modules.",
+        "keyConcepts": ["Architecture", "Resilience"],
+        "tableOfContents": ["1. Intro", "2. Implementation"],
+        "shorthands": ["Tip 1"],
+    }
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(synth_dict)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = AsyncMock(
+            prompt_token_count=1950,
+            candidates_token_count=490,
+            thoughts_token_count=110,
+            total_token_count=2550,
+        )
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/synthesize",
+            headers=auth_headers,
+            json={
+                "videoTitle": "Full Course",
+                "chunkSummaries": [
+                    {
+                        "chunkIndex": 0,
+                        "overview": "Summary 0",
+                        "keyConcepts": ["C0"],
+                        "shorthands": ["S0"],
+                    },
+                    {
+                        "chunkIndex": 1,
+                        "overview": "Summary 1",
+                        "keyConcepts": ["C1"],
+                        "shorthands": ["S1"],
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "overview" in data
+        assert "keyConcepts" in data
+        assert "tableOfContents" in data
+        assert "shorthands" in data
+        assert "usage" in data
+        assert data["usage"]["thoughtsTokens"] == 110
+        assert data["thoughtsTokens"] == 110
+        assert data["totalTokens"] == 2550
+
+
+def test_synthesize_api_unauthorized_without_bearer(client: TestClient):
+    """POST /api/v1/synthesize without authorization header must return 401."""
+    response = client.post(
+        "/api/v1/synthesize",
+        json={
+            "videoTitle": "Title",
+            "chunkSummaries": [
+                {"chunkIndex": 0, "overview": "Overview", "keyConcepts": [], "shorthands": []}
+            ],
+        },
+    )
+    assert response.status_code == 401

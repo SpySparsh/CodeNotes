@@ -6,8 +6,14 @@ from pydantic import ValidationError
 from app.schemas import (
     MAX_TITLE_CHARS,
     MAX_TRANSCRIPT_CHARS,
+    ChunkGeneratedNotes,
+    ChunkGenerateRequest,
+    ChunkSummary,
     GeneratedNotes,
     GenerateNotesRequest,
+    SynthesizedNotes,
+    SynthesizeRequest,
+    UsageMetadata,
 )
 
 
@@ -197,3 +203,137 @@ def test_generated_notes_json_schema_matches_typescript_contract():
     key_concepts_prop = schema["properties"]["keyConcepts"]
     assert key_concepts_prop.get("type") == "array"
     assert "minItems" not in key_concepts_prop
+
+
+def test_chunk_generate_request_accepts_camel_and_snake_case():
+    """ChunkGenerateRequest must accept both camelCase and snake_case fields."""
+    req_camel = ChunkGenerateRequest.model_validate(
+        {
+            "chunkText": "This is a valid chunk slice.",
+            "videoTitle": "TypeScript Full Course",
+            "chunkIndex": 2,
+            "totalChunks": 5,
+        }
+    )
+    assert req_camel.chunk_text == "This is a valid chunk slice."
+    assert req_camel.video_title == "TypeScript Full Course"
+    assert req_camel.chunk_index == 2
+    assert req_camel.total_chunks == 5
+
+    req_snake = ChunkGenerateRequest.model_validate(
+        {
+            "chunk_text": "This is a valid chunk slice.",
+            "video_title": "TypeScript Full Course",
+            "chunk_index": 0,
+            "total_chunks": 1,
+        }
+    )
+    assert req_snake.chunk_text == "This is a valid chunk slice."
+    assert req_snake.video_title == "TypeScript Full Course"
+    assert req_snake.chunk_index == 0
+    assert req_snake.total_chunks == 1
+
+
+def test_chunk_generate_request_fallback_from_transcript():
+    """If transcript is provided instead of chunkText, fallback populates chunk_text."""
+    req = ChunkGenerateRequest.model_validate(
+        {"transcript": "Transcript content fallback.", "videoTitle": "Course"}
+    )
+    assert req.chunk_text == "Transcript content fallback."
+    assert req.chunk_index == 0
+    assert req.total_chunks == 1
+
+
+def test_chunk_generate_request_validates_min_max_length():
+    """ChunkGenerateRequest rejects empty or oversized fields."""
+    with pytest.raises(ValidationError):
+        ChunkGenerateRequest.model_validate({"chunkText": "short", "videoTitle": "Title"})
+
+    with pytest.raises(ValidationError):
+        ChunkGenerateRequest.model_validate({"chunkText": "Valid text", "videoTitle": ""})
+
+
+def test_chunk_generated_notes_serializes_with_usage():
+    """ChunkGeneratedNotes must serialize to camelCase and include usage + flat token metrics."""
+    data = {
+        "overview": "Section overview.",
+        "keyConcepts": ["Concept A", "Concept B"],
+        "detailedNotes": "Detailed section notes with code.",
+        "shorthands": ["Tip 1"],
+        "usage": {
+            "promptTokens": 1500,
+            "candidateTokens": 400,
+            "thoughtsTokens": 80,
+            "totalTokens": 1980,
+        },
+        "promptTokens": 1500,
+        "candidateTokens": 400,
+        "thoughtsTokens": 80,
+        "totalTokens": 1980,
+    }
+    notes = ChunkGeneratedNotes.model_validate(data)
+    dumped = notes.model_dump(by_alias=True)
+
+    assert dumped["overview"] == "Section overview."
+    assert dumped["keyConcepts"] == ["Concept A", "Concept B"]
+    assert dumped["detailedNotes"] == "Detailed section notes with code."
+    assert dumped["shorthands"] == ["Tip 1"]
+    assert dumped["usage"]["thoughtsTokens"] == 80
+    assert dumped["thoughtsTokens"] == 80
+    assert dumped["promptTokens"] == 1500
+    assert dumped["totalTokens"] == 1980
+
+
+def test_synthesize_request_accepts_chunk_summaries():
+    """SynthesizeRequest must validate videoTitle and non-empty list of ChunkSummary."""
+    req = SynthesizeRequest.model_validate(
+        {
+            "videoTitle": "Full Course Title",
+            "chunkSummaries": [
+                {
+                    "chunkIndex": 0,
+                    "overview": "Intro overview",
+                    "keyConcepts": ["Basics"],
+                    "shorthands": ["Rule 1"],
+                },
+                {
+                    "chunkIndex": 1,
+                    "overview": "Advanced overview",
+                    "keyConcepts": ["Generics"],
+                    "shorthands": ["Gotcha 2"],
+                },
+            ],
+        }
+    )
+    assert req.video_title == "Full Course Title"
+    assert len(req.chunk_summaries) == 2
+    assert req.chunk_summaries[0].chunk_index == 0
+    assert req.chunk_summaries[1].key_concepts == ["Generics"]
+
+
+def test_synthesized_notes_serializes_with_table_of_contents():
+    """SynthesizedNotes serializes to camelCase with tableOfContents and usage metadata."""
+    data = {
+        "overview": "Global executive overview.",
+        "keyConcepts": ["Concept 1", "Concept 2"],
+        "tableOfContents": ["1. Introduction", "2. Core Principles", "3. Summary"],
+        "shorthands": ["Global Tip 1"],
+        "usage": {
+            "promptTokens": 2000,
+            "candidateTokens": 500,
+            "thoughtsTokens": 120,
+            "totalTokens": 2620,
+        },
+        "promptTokens": 2000,
+        "candidateTokens": 500,
+        "thoughtsTokens": 120,
+        "totalTokens": 2620,
+    }
+    synth = SynthesizedNotes.model_validate(data)
+    dumped = synth.model_dump(by_alias=True)
+
+    assert dumped["overview"] == "Global executive overview."
+    assert dumped["tableOfContents"] == ["1. Introduction", "2. Core Principles", "3. Summary"]
+    assert dumped["usage"]["thoughtsTokens"] == 120
+    assert dumped["thoughtsTokens"] == 120
+    assert dumped["totalTokens"] == 2620
