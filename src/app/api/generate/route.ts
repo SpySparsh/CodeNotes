@@ -11,7 +11,7 @@ import { generateUrlSchema } from '@/lib/validations/generate';
 import { checkRateLimit } from '@/lib/rate-limit';
 import { withSentryRouteSpan, withSentryChildSpan } from '@/lib/sentry-tracing';
 
-export const STALE_IDEMPOTENCY_THRESHOLD_MS = 120000;
+const STALE_IDEMPOTENCY_THRESHOLD_MS = 120000;
 
 export async function POST(request: Request) {
   return withSentryRouteSpan(

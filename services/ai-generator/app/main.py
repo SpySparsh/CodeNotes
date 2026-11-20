@@ -20,10 +20,14 @@ from app.errors import (
 )
 from app.generator import GeminiNoteGenerator
 from app.schemas import (
+    ChunkGeneratedNotes,
+    ChunkGenerateRequest,
     ErrorResponse,
     GeneratedNotes,
     GenerateNotesRequest,
     HealthResponse,
+    SynthesizedNotes,
+    SynthesizeRequest,
 )
 
 # Configure logging
@@ -153,6 +157,92 @@ def create_app() -> FastAPI:
         req_id = getattr(request.state, "request_id", None) or sanitize_request_id(x_request_id)
         return await generator.generate_notes(
             transcript=payload.transcript,
+            video_title=payload.video_title,
+            request_id=req_id,
+        )
+
+    @app.post(
+        "/api/v1/generate-chunk",
+        response_model=ChunkGeneratedNotes,
+        response_model_by_alias=True,
+        responses={
+            400: {"model": ErrorResponse, "description": "Bad Request"},
+            401: {"model": ErrorResponse, "description": "Unauthorized - Missing/Invalid Token"},
+            422: {
+                "model": ErrorResponse,
+                "description": "Unprocessable Entity - Schema Validation Failure",
+            },
+            429: {
+                "model": ErrorResponse,
+                "description": "Too Many Requests - Upstream Rate Limited",
+            },
+            502: {
+                "model": ErrorResponse,
+                "description": "Bad Gateway - Malformed Model Output or Upstream Failure",
+            },
+            503: {
+                "model": ErrorResponse,
+                "description": "Service Unavailable - Unconfigured Server",
+            },
+            504: {"model": ErrorResponse, "description": "Gateway Timeout - Upstream Timeout"},
+        },
+        summary="Generate Structured Technical Study Notes for a Transcript Chunk",
+        description="Generates notes for a specific transcript chunk with detailed usage metadata including thoughts tokens.",
+    )
+    async def generate_chunk_endpoint(
+        payload: ChunkGenerateRequest,
+        request: Request,
+        _auth: str = Depends(verify_service_token),
+        generator: GeminiNoteGenerator = Depends(get_generator),
+        x_request_id: str | None = Header(None),
+    ) -> ChunkGeneratedNotes:
+        req_id = getattr(request.state, "request_id", None) or sanitize_request_id(x_request_id)
+        return await generator.generate_chunk(
+            chunk_text=payload.chunk_text,
+            video_title=payload.video_title,
+            chunk_index=payload.chunk_index,
+            total_chunks=payload.total_chunks,
+            request_id=req_id,
+        )
+
+    @app.post(
+        "/api/v1/synthesize",
+        response_model=SynthesizedNotes,
+        response_model_by_alias=True,
+        responses={
+            400: {"model": ErrorResponse, "description": "Bad Request"},
+            401: {"model": ErrorResponse, "description": "Unauthorized - Missing/Invalid Token"},
+            422: {
+                "model": ErrorResponse,
+                "description": "Unprocessable Entity - Schema Validation Failure",
+            },
+            429: {
+                "model": ErrorResponse,
+                "description": "Too Many Requests - Upstream Rate Limited",
+            },
+            502: {
+                "model": ErrorResponse,
+                "description": "Bad Gateway - Malformed Model Output or Upstream Failure",
+            },
+            503: {
+                "model": ErrorResponse,
+                "description": "Service Unavailable - Unconfigured Server",
+            },
+            504: {"model": ErrorResponse, "description": "Gateway Timeout - Upstream Timeout"},
+        },
+        summary="Synthesize Master Technical Guide from Chunk Summaries",
+        description="Synthesizes multiple chunk summaries into a cohesive executive overview, key concepts, and table of contents.",
+    )
+    async def synthesize_endpoint(
+        payload: SynthesizeRequest,
+        request: Request,
+        _auth: str = Depends(verify_service_token),
+        generator: GeminiNoteGenerator = Depends(get_generator),
+        x_request_id: str | None = Header(None),
+    ) -> SynthesizedNotes:
+        req_id = getattr(request.state, "request_id", None) or sanitize_request_id(x_request_id)
+        return await generator.synthesize(
+            chunk_summaries=payload.chunk_summaries,
             video_title=payload.video_title,
             request_id=req_id,
         )

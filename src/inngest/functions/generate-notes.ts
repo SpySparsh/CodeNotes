@@ -8,7 +8,31 @@ import {
   validateYouTubeUrl,
   TranscriptError,
 } from '@/lib/transcript';
-import { generateAiNotes, GeneratedNotes, AiClientError } from '@/lib/ai-client';
+import {
+  generateAiNotes,
+  GeneratedNotes,
+  AiClientError,
+  generateChunkAiNotes,
+  synthesizeSectionNotes,
+  DEFAULT_AI_MODEL,
+  type ChunkSummary,
+} from '@/lib/ai-client';
+import {
+  planChunkManifest,
+  sliceByCodePoints,
+  getCodePointLength,
+  MAX_CHUNK_CHARS,
+  type ChunkManifest,
+} from '@/lib/chunk-planner';
+import {
+  reserveQuota,
+  markReservationDispatching,
+  completeChunkAndCommitQuota,
+  releaseQuotaReservation,
+  releaseAbortedDispatch,
+  QuotaError,
+  isRateLimitExceeded,
+} from '@/lib/quota-client';
 import { query, withUserTransaction } from '@/lib/db';
 import { logger } from '@/lib/logger';
 import {
@@ -40,6 +64,14 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
     return {
       isUnrecoverable: !error.isRetryable,
       code: error.code,
+      message: error.message,
+    };
+  }
+
+  if (error instanceof QuotaError || error?.name === 'QuotaError') {
+    return {
+      isUnrecoverable: !error.isRetryable,
+      code: error.statusCode,
       message: error.message,
     };
   }
@@ -103,7 +135,14 @@ export function classifyError(error: any): { isUnrecoverable: boolean; code: str
   }
 
   // Rate limit / Quota errors - retryable
-  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('rate limit')) {
+  if (
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('rate limit') ||
+    msg.includes('RATE_LIMIT') ||
+    msg.includes('Quota reservation failed') ||
+    isRateLimitExceeded(msg)
+  ) {
     return {
       isUnrecoverable: false,
       code: 'RATE_LIMITED',
@@ -142,7 +181,7 @@ export const generateNotesFunction = inngest.createFunction(
     name: 'Generate Notes from YouTube Video',
     triggers: [{ event: 'notes/generate.requested' }],
     retries: 2,
-    timeouts: { finish: '10m' },
+    timeouts: { finish: '30m' },
     onFailure: async ({ event, error }: { event: any; error: any }) => {
       const originalEvent = event.data?.event || event;
       const { userId, idempotencyKey, videoId } = originalEvent.data || {};
@@ -353,57 +392,413 @@ export const generateNotesFunction = inngest.createFunction(
       }
     });
 
-    // Step 3: AI Generation with FastAPI AI Service (Outside DB transaction)
-    const generatedNotes = await step.run('generate-ai-notes', async () => {
-      const stageStart = performance.now();
-      try {
-        let aiNotes: GeneratedNotes;
+    const totalCodePoints = getCodePointLength(mediaData.transcriptText);
+    const isMultiChunk = totalCodePoints > MAX_CHUNK_CHARS;
 
+    // -------------------------------------------------------------------------
+    // BRANCH A: Single-Chunk Monolithic Path (Backward Compatibility)
+    // -------------------------------------------------------------------------
+    if (!isMultiChunk) {
+      // Step 3: AI Generation with FastAPI AI Service (Outside DB transaction)
+      const generatedNotes = await step.run('generate-ai-notes', async () => {
+        const stageStart = performance.now();
         try {
-          if (!mediaData.transcriptText) {
-            throw new NonRetriableError('Transcript text is required for AI note generation.');
-          }
-          aiNotes = await withSpan('fastapi.http_request', async (span) => {
-            return await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
-              requestId: idempotencyKey,
-              span,
+          let aiNotes: GeneratedNotes;
+
+          try {
+            if (!mediaData.transcriptText) {
+              throw new NonRetriableError('Transcript text is required for AI note generation.');
+            }
+            aiNotes = await withSpan('fastapi.http_request', async (span) => {
+              return await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
+                requestId: idempotencyKey,
+                span,
+              });
             });
-          });
-        } catch (err: any) {
-          const classification = classifyError(err);
-          if (classification.isUnrecoverable) {
-            throw new NonRetriableError(classification.message);
+          } catch (err: any) {
+            const classification = classifyError(err);
+            if (classification.isUnrecoverable) {
+              throw new NonRetriableError(classification.message);
+            }
+            throw err;
           }
-          throw err;
-        }
 
-        if (!aiNotes || !aiNotes.overview) {
-          throw new NonRetriableError('AI returned malformed data.');
-        }
+          if (!aiNotes || !aiNotes.overview) {
+            throw new NonRetriableError('AI returned malformed data.');
+          }
 
-        return {
-          aiNotes,
-          generationMethod: 'transcript' as const,
-          transcriptProvider: mediaData.transcriptProvider,
-        };
-      } finally {
-        recordGenerationStageDuration('gemini_inference', (performance.now() - stageStart) / 1000);
-      }
+          return {
+            aiNotes,
+            generationMethod: 'transcript' as const,
+            transcriptProvider: mediaData.transcriptProvider,
+          };
+        } finally {
+          recordGenerationStageDuration('gemini_inference', (performance.now() - stageStart) / 1000);
+        }
+      });
+
+      // Step 4: Atomic Persistence in Database with User Transaction & RLS
+      const persistResult = await step.run('persist-notes', async () => {
+        const stageStart = performance.now();
+        try {
+          const noteId = crypto.randomUUID();
+          const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
+
+          let createdAtEpochMs: number | null = null;
+
+          await withSpan('db.persist_notes_transaction', async (span) => {
+            span.setAttribute('operation', 'persist_notes');
+            await withUserTransaction(userId, async (client) => {
+              // Re-check status inside transaction with row lock to avoid race conditions
+              const checkRes = await client.query(
+                `SELECT status, note_id, created_at FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
+                [userId, idempotencyKey]
+              );
+
+              if (checkRes.rows.length > 0) {
+                createdAtEpochMs = checkRes.rows[0].created_at ? new Date(checkRes.rows[0].created_at).getTime() : null;
+                if (checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
+                  span.setAttribute('status', 'skipped_already_completed');
+                  return;
+                }
+              }
+
+              await client.query(
+                `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [
+                  noteId,
+                  userId,
+                  mediaData.resolvedVideoId,
+                  mediaData.videoTitle,
+                  videoUrl,
+                  thumbnailUrl,
+                  generatedNotes.aiNotes.overview,
+                  generatedNotes.aiNotes.keyConcepts,
+                  generatedNotes.aiNotes.detailedNotes,
+                  generatedNotes.aiNotes.shorthands,
+                ]
+              );
+
+              await client.query(
+                `UPDATE generation_idempotency
+                 SET status = 'completed',
+                     note_id = $3,
+                     error_message = NULL,
+                     error_code = NULL,
+                     lease_until = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = $1 AND key = $2`,
+                [userId, idempotencyKey, noteId]
+              );
+            });
+            span.setAttribute('status', 'success');
+          });
+
+          recordGenerationJob('completed');
+
+          const durationSeconds = typeof createdAtEpochMs === 'number'
+            ? Math.max(0, (Date.now() - (createdAtEpochMs as number)) / 1000)
+            : (performance.now() - stageStart) / 1000;
+          recordGenerationDuration('completed', durationSeconds);
+
+          logger.info('inngest_generation_completed_successfully', {
+            userId,
+            videoId: mediaData.resolvedVideoId,
+            idempotencyKey,
+            noteId,
+            generationMethod: generatedNotes.generationMethod,
+            transcriptProvider: generatedNotes.transcriptProvider,
+            durationSeconds,
+          });
+
+          return { success: true, noteId };
+        } finally {
+          recordGenerationStageDuration('db_persist', (performance.now() - stageStart) / 1000);
+        }
+      });
+
+      return persistResult;
+    }
+
+    // -------------------------------------------------------------------------
+    // BRANCH B: Adaptive Multi-Chunk Orchestration (>1 chunk)
+    // -------------------------------------------------------------------------
+    // Step 3a: Plan Chunk Manifest
+    const manifest = await step.run('plan-chunk-manifest', async (): Promise<ChunkManifest> => {
+      logger.info('inngest_planning_chunk_manifest', {
+        userId,
+        idempotencyKey,
+        videoId: mediaData.resolvedVideoId,
+        totalCodePoints,
+      });
+      return planChunkManifest(mediaData.resolvedVideoId, mediaData.transcriptText);
     });
 
-    // Step 4: Atomic Persistence in Database with User Transaction & RLS
-    const persistResult = await step.run('persist-notes', async () => {
+    // Step 3b: Bounded Concurrency Fan-Out Generation for each chunk (max 2 concurrent to respect Gemini 15 RPM limit)
+    const CONCURRENCY_LIMIT = 2;
+    const chunkResults: any[] = [];
+    for (let i = 0; i < manifest.chunks.length; i += CONCURRENCY_LIMIT) {
+      const chunkBatch = manifest.chunks.slice(i, i + CONCURRENCY_LIMIT);
+      const batchResults = await Promise.all(
+        chunkBatch.map((chunk) => {
+          return step.run(`generate-chunk-${chunk.chunkIndex}`, async () => {
+        const workerId = crypto.randomUUID();
+        const chunkText = sliceByCodePoints(mediaData.transcriptText, chunk.startChar, chunk.endChar);
+
+        logger.info('inngest_chunk_generation_started', {
+          userId,
+          idempotencyKey,
+          chunkIndex: chunk.chunkIndex,
+          totalChunks: manifest.totalChunks,
+          codePointCount: chunk.codePointCount,
+          workerId,
+        });
+
+        // 1. Reserve Quota with backoff on rate limiting
+        let reserveRes: any;
+        for (let attempt = 0; attempt < 15; attempt++) {
+          try {
+            reserveRes = await reserveQuota({
+              userId,
+              parentKey: idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              projectId: 'codenotes',
+              quotaScope: DEFAULT_AI_MODEL,
+              modelName: DEFAULT_AI_MODEL,
+              workerId,
+              estimatedTokens: chunk.estimatedTokens,
+              leaseDurationInterval: '300 seconds',
+            });
+          } catch (resErr: any) {
+            logger.error('inngest_quota_reservation_call_error', {
+              userId,
+              idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              errorMessage: resErr?.message,
+            });
+            throw resErr;
+          }
+
+          if (reserveRes.allowed || reserveRes.statusCode === 'ALREADY_COMMITTED') {
+            break;
+          }
+
+          if (reserveRes.statusCode?.startsWith('RATE_LIMIT_EXCEEDED_')) {
+            logger.info('inngest_quota_rate_limited_waiting', {
+              chunkIndex: chunk.chunkIndex,
+              attempt,
+              statusCode: reserveRes.statusCode,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 2000 + Math.random() * 1000));
+            continue;
+          }
+
+          break;
+        }
+
+        if (reserveRes.statusCode === 'ALREADY_COMMITTED') {
+          logger.info('inngest_chunk_already_committed', {
+            userId,
+            idempotencyKey,
+            chunkIndex: chunk.chunkIndex,
+          });
+          const existingChunk = await query(
+            `SELECT chunk_notes, prompt_tokens, candidate_tokens, thoughts_tokens, total_tokens
+             FROM public.chunk_generations
+             WHERE user_id = $1 AND parent_key = $2 AND chunk_index = $3`,
+            [userId, idempotencyKey, chunk.chunkIndex]
+          );
+          if (existingChunk.rows.length > 0) {
+            const row = existingChunk.rows[0];
+            return {
+              chunkIndex: chunk.chunkIndex,
+              overview: row.chunk_notes.overview,
+              keyConcepts: row.chunk_notes.keyConcepts || [],
+              shorthands: row.chunk_notes.shorthands || [],
+              detailedNotes: row.chunk_notes.detailedNotes,
+              tokens: {
+                promptTokens: row.prompt_tokens,
+                candidateTokens: row.candidate_tokens,
+                thoughtsTokens: row.thoughts_tokens,
+                totalTokens: row.total_tokens,
+              },
+            };
+          }
+        }
+
+        if (!reserveRes.allowed || !reserveRes.reservationToken || !reserveRes.leaseToken) {
+          logger.warn('inngest_quota_reservation_rejected', {
+            userId,
+            idempotencyKey,
+            chunkIndex: chunk.chunkIndex,
+            statusCode: reserveRes.statusCode,
+          });
+          throw new Error(`Quota reservation failed: ${reserveRes.statusCode}`);
+        }
+
+        const reservationToken = reserveRes.reservationToken;
+        const leaseToken = reserveRes.leaseToken;
+        const generation = reserveRes.generation ?? 1;
+
+        // 2. Mark Dispatching
+        const dispatchRes = await markReservationDispatching({
+          reservationToken,
+          leaseToken,
+          workerId,
+          generation,
+          leaseDurationInterval: '300 seconds',
+        });
+
+        if (!dispatchRes.success) {
+          await releaseQuotaReservation({
+            reservationToken,
+            leaseToken,
+            workerId,
+            generation,
+          }).catch((relErr) => {
+            logger.error('inngest_release_reservation_error', { err: relErr?.message });
+          });
+          throw new Error(`Mark reservation dispatching failed: ${dispatchRes.statusCode}`);
+        }
+
+        // 3. Generate Chunk AI Notes (with retry on transient provider 429)
+        let chunkNotes: any;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            chunkNotes = await generateChunkAiNotes(
+              chunkText,
+              mediaData.videoTitle,
+              chunk.chunkIndex,
+              manifest.totalChunks,
+              {
+                requestId: `${idempotencyKey}-chunk-${chunk.chunkIndex}-att${attempt}`,
+              }
+            );
+            break;
+          } catch (genErr: any) {
+            if (genErr?.isRetryable && attempt < 4) {
+              logger.warn('inngest_chunk_ai_generation_retry', {
+                chunkIndex: chunk.chunkIndex,
+                attempt,
+                errorMessage: genErr.message,
+              });
+              await new Promise((resolve) => setTimeout(resolve, 5000 * (attempt + 1)));
+              continue;
+            }
+            logger.error('inngest_chunk_ai_generation_failed', {
+              userId,
+              idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              errorMessage: genErr?.message,
+            });
+            await releaseAbortedDispatch({
+              reservationToken,
+              leaseToken,
+              workerId,
+              generation,
+              reason: genErr?.message || 'Chunk AI generation failure',
+            }).catch((relErr) => {
+              logger.error('inngest_release_aborted_dispatch_error', { err: relErr?.message });
+            });
+            throw genErr;
+          }
+        }
+
+        // 4. Complete Chunk and Commit Quota
+        const commitRes = await completeChunkAndCommitQuota({
+          userId,
+          parentKey: idempotencyKey,
+          chunkIndex: chunk.chunkIndex,
+          reservationToken,
+          leaseToken,
+          workerId,
+          fencingGeneration: generation,
+          chunkNotes: {
+            overview: chunkNotes.overview,
+            keyConcepts: chunkNotes.keyConcepts,
+            detailedNotes: chunkNotes.detailedNotes,
+            shorthands: chunkNotes.shorthands,
+          },
+          totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
+          promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
+          candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
+          thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
+          modelName: DEFAULT_AI_MODEL,
+        });
+
+        if (!commitRes.success) {
+          throw new Error(`Complete chunk and commit quota failed: ${commitRes.statusCode}`);
+        }
+
+        logger.info('inngest_chunk_committed_successfully', {
+          userId,
+          idempotencyKey,
+          chunkIndex: chunk.chunkIndex,
+        });
+
+        return {
+          chunkIndex: chunk.chunkIndex,
+          overview: chunkNotes.overview,
+          keyConcepts: chunkNotes.keyConcepts,
+          shorthands: chunkNotes.shorthands,
+          detailedNotes: chunkNotes.detailedNotes,
+          tokens: {
+            promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
+            candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
+            thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
+            totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
+          },
+        };
+      });
+    })
+  );
+  chunkResults.push(...batchResults);
+}
+
+    // Step 3c: Hierarchical Synthesis
+    const synthesizedNotes = await step.run('hierarchical-synthesis', async () => {
+      const summaries: ChunkSummary[] = chunkResults
+        .sort((a, b) => a.chunkIndex - b.chunkIndex)
+        .map((cr) => ({
+          chunkIndex: cr.chunkIndex,
+          overview: cr.overview,
+          keyConcepts: cr.keyConcepts,
+          shorthands: cr.shorthands,
+        }));
+
+      logger.info('inngest_synthesizing_master_guide', {
+        userId,
+        idempotencyKey,
+        chunkSummariesCount: summaries.length,
+      });
+
+      return await synthesizeSectionNotes(summaries, mediaData.videoTitle, {
+        requestId: `${idempotencyKey}-synthesis`,
+      });
+    });
+
+    // Step 3d: Persist Adaptive Notes
+    const persistResult = await step.run('persist-adaptive-notes', async () => {
       const stageStart = performance.now();
       try {
         const noteId = crypto.randomUUID();
         const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
 
+        // Assemble ordered detailed notes from all chunks
+        const sortedChunks = [...chunkResults].sort((a, b) => a.chunkIndex - b.chunkIndex);
+        const combinedDetailedNotes = sortedChunks
+          .map((cr, idx) => {
+            const sectionTitle = synthesizedNotes.tableOfContents[idx] || `Part ${idx + 1}`;
+            return `## ${sectionTitle}\n\n${cr.detailedNotes}`;
+          })
+          .join('\n\n---\n\n');
+
         let createdAtEpochMs: number | null = null;
 
-        await withSpan('db.persist_notes_transaction', async (span) => {
-          span.setAttribute('operation', 'persist_notes');
+        await withSpan('db.persist_adaptive_notes_transaction', async (span) => {
+          span.setAttribute('operation', 'persist_adaptive_notes');
           await withUserTransaction(userId, async (client) => {
-            // Re-check status inside transaction with row lock to avoid race conditions
             const checkRes = await client.query(
               `SELECT status, note_id, created_at FROM generation_idempotency WHERE user_id = $1 AND key = $2 FOR UPDATE`,
               [userId, idempotencyKey]
@@ -427,10 +822,10 @@ export const generateNotesFunction = inngest.createFunction(
                 mediaData.videoTitle,
                 videoUrl,
                 thumbnailUrl,
-                generatedNotes.aiNotes.overview,
-                generatedNotes.aiNotes.keyConcepts,
-                generatedNotes.aiNotes.detailedNotes,
-                generatedNotes.aiNotes.shorthands,
+                synthesizedNotes.overview,
+                synthesizedNotes.keyConcepts,
+                combinedDetailedNotes,
+                synthesizedNotes.shorthands,
               ]
             );
 
@@ -456,13 +851,12 @@ export const generateNotesFunction = inngest.createFunction(
           : (performance.now() - stageStart) / 1000;
         recordGenerationDuration('completed', durationSeconds);
 
-        logger.info('inngest_generation_completed_successfully', {
+        logger.info('inngest_adaptive_generation_completed_successfully', {
           userId,
           videoId: mediaData.resolvedVideoId,
           idempotencyKey,
           noteId,
-          generationMethod: generatedNotes.generationMethod,
-          transcriptProvider: generatedNotes.transcriptProvider,
+          totalChunks: manifest.totalChunks,
           durationSeconds,
         });
 
