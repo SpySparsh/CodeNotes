@@ -535,9 +535,14 @@ export const generateNotesFunction = inngest.createFunction(
       return planChunkManifest(mediaData.resolvedVideoId, mediaData.transcriptText);
     });
 
-    // Step 3b: Parallel Fan-Out Generation for each chunk
-    const chunkPromises = manifest.chunks.map((chunk) => {
-      return step.run(`generate-chunk-${chunk.chunkIndex}`, async () => {
+    // Step 3b: Bounded Concurrency Fan-Out Generation for each chunk (max 2 concurrent to respect Gemini 15 RPM limit)
+    const CONCURRENCY_LIMIT = 2;
+    const chunkResults: any[] = [];
+    for (let i = 0; i < manifest.chunks.length; i += CONCURRENCY_LIMIT) {
+      const chunkBatch = manifest.chunks.slice(i, i + CONCURRENCY_LIMIT);
+      const batchResults = await Promise.all(
+        chunkBatch.map((chunk) => {
+          return step.run(`generate-chunk-${chunk.chunkIndex}`, async () => {
         const workerId = crypto.randomUUID();
         const chunkText = sliceByCodePoints(mediaData.transcriptText, chunk.startChar, chunk.endChar);
 
@@ -550,28 +555,46 @@ export const generateNotesFunction = inngest.createFunction(
           workerId,
         });
 
-        // 1. Reserve Quota
-        let reserveRes;
-        try {
-          reserveRes = await reserveQuota({
-            userId,
-            parentKey: idempotencyKey,
-            chunkIndex: chunk.chunkIndex,
-            projectId: 'codenotes',
-            quotaScope: DEFAULT_AI_MODEL,
-            modelName: DEFAULT_AI_MODEL,
-            workerId,
-            estimatedTokens: chunk.estimatedTokens,
-            leaseDurationInterval: '300 seconds',
-          });
-        } catch (resErr: any) {
-          logger.error('inngest_quota_reservation_call_error', {
-            userId,
-            idempotencyKey,
-            chunkIndex: chunk.chunkIndex,
-            errorMessage: resErr?.message,
-          });
-          throw resErr;
+        // 1. Reserve Quota with backoff on rate limiting
+        let reserveRes: any;
+        for (let attempt = 0; attempt < 15; attempt++) {
+          try {
+            reserveRes = await reserveQuota({
+              userId,
+              parentKey: idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              projectId: 'codenotes',
+              quotaScope: DEFAULT_AI_MODEL,
+              modelName: DEFAULT_AI_MODEL,
+              workerId,
+              estimatedTokens: chunk.estimatedTokens,
+              leaseDurationInterval: '300 seconds',
+            });
+          } catch (resErr: any) {
+            logger.error('inngest_quota_reservation_call_error', {
+              userId,
+              idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              errorMessage: resErr?.message,
+            });
+            throw resErr;
+          }
+
+          if (reserveRes.allowed || reserveRes.statusCode === 'ALREADY_COMMITTED') {
+            break;
+          }
+
+          if (reserveRes.statusCode?.startsWith('RATE_LIMIT_EXCEEDED_')) {
+            logger.info('inngest_quota_rate_limited_waiting', {
+              chunkIndex: chunk.chunkIndex,
+              attempt,
+              statusCode: reserveRes.statusCode,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 2000 + Math.random() * 1000));
+            continue;
+          }
+
+          break;
         }
 
         if (reserveRes.statusCode === 'ALREADY_COMMITTED') {
@@ -639,35 +662,47 @@ export const generateNotesFunction = inngest.createFunction(
           throw new Error(`Mark reservation dispatching failed: ${dispatchRes.statusCode}`);
         }
 
-        // 3. Generate Chunk AI Notes
-        let chunkNotes;
-        try {
-          chunkNotes = await generateChunkAiNotes(
-            chunkText,
-            mediaData.videoTitle,
-            chunk.chunkIndex,
-            manifest.totalChunks,
-            {
-              requestId: `${idempotencyKey}-chunk-${chunk.chunkIndex}`,
+        // 3. Generate Chunk AI Notes (with retry on transient provider 429)
+        let chunkNotes: any;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            chunkNotes = await generateChunkAiNotes(
+              chunkText,
+              mediaData.videoTitle,
+              chunk.chunkIndex,
+              manifest.totalChunks,
+              {
+                requestId: `${idempotencyKey}-chunk-${chunk.chunkIndex}-att${attempt}`,
+              }
+            );
+            break;
+          } catch (genErr: any) {
+            if (genErr?.isRetryable && attempt < 4) {
+              logger.warn('inngest_chunk_ai_generation_retry', {
+                chunkIndex: chunk.chunkIndex,
+                attempt,
+                errorMessage: genErr.message,
+              });
+              await new Promise((resolve) => setTimeout(resolve, 5000 * (attempt + 1)));
+              continue;
             }
-          );
-        } catch (genErr: any) {
-          logger.error('inngest_chunk_ai_generation_failed', {
-            userId,
-            idempotencyKey,
-            chunkIndex: chunk.chunkIndex,
-            errorMessage: genErr?.message,
-          });
-          await releaseAbortedDispatch({
-            reservationToken,
-            leaseToken,
-            workerId,
-            generation,
-            reason: genErr?.message || 'Chunk AI generation failure',
-          }).catch((relErr) => {
-            logger.error('inngest_release_aborted_dispatch_error', { err: relErr?.message });
-          });
-          throw genErr;
+            logger.error('inngest_chunk_ai_generation_failed', {
+              userId,
+              idempotencyKey,
+              chunkIndex: chunk.chunkIndex,
+              errorMessage: genErr?.message,
+            });
+            await releaseAbortedDispatch({
+              reservationToken,
+              leaseToken,
+              workerId,
+              generation,
+              reason: genErr?.message || 'Chunk AI generation failure',
+            }).catch((relErr) => {
+              logger.error('inngest_release_aborted_dispatch_error', { err: relErr?.message });
+            });
+            throw genErr;
+          }
         }
 
         // 4. Complete Chunk and Commit Quota
@@ -716,9 +751,10 @@ export const generateNotesFunction = inngest.createFunction(
           },
         };
       });
-    });
-
-    const chunkResults = await Promise.all(chunkPromises);
+    })
+  );
+  chunkResults.push(...batchResults);
+}
 
     // Step 3c: Hierarchical Synthesis
     const synthesizedNotes = await step.run('hierarchical-synthesis', async () => {

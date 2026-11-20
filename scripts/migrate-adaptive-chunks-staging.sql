@@ -741,6 +741,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_global_config        RECORD;
     v_scope_config         RECORD;
@@ -1169,6 +1170,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_user_id              UUID;
     v_parent_key           VARCHAR(64);
@@ -1297,6 +1299,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_parent_status        VARCHAR(20);
     v_res                  RECORD;
@@ -1645,6 +1648,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_parent_status        VARCHAR(20);
     v_res                  RECORD;
@@ -1765,6 +1769,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_user_id              UUID;
     v_parent_key           VARCHAR(64);
@@ -1915,6 +1920,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_user_id              UUID;
     v_parent_key           VARCHAR(64);
@@ -2075,6 +2081,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_limit                INTEGER;
     v_now                  TIMESTAMPTZ;
@@ -2198,6 +2205,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_limit                INTEGER;
     v_now                  TIMESTAMPTZ;
@@ -2308,6 +2316,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_unlocked_user_id     UUID;
     v_unlocked_parent_key  VARCHAR(64);
@@ -2548,6 +2557,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_ticket_id            UUID;
     v_unlocked_user_id     UUID;
@@ -2723,6 +2733,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+#variable_conflict use_column
 DECLARE
     v_ticket               RECORD;
     v_now                  TIMESTAMPTZ;
