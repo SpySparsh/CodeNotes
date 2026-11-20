@@ -14,7 +14,7 @@ export interface GeneratedNotes {
 }
 
 export const GEMINI_TIMEOUT_MS = 75000;
-export const GEMINI_MODEL = 'gemini-2.5-flash';
+export const GEMINI_MODEL = 'gemini-1.5-flash';
 
 export async function generateNotes(transcript: string, videoTitle: string): Promise<GeneratedNotes> {
   if (!apiKey || apiKey === 'your_api_key_here') {

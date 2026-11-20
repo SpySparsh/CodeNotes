@@ -829,7 +829,7 @@ describe('OpenTelemetry Tracing & Inngest Span Integration', () => {
       // Verify low-risk attributes on fastapi.http_request
       expect(httpSpan?.attributes['http.request.method']).toBe('POST');
       expect(httpSpan?.attributes['http.route']).toBe('/api/v1/generate');
-      expect(httpSpan?.attributes['model']).toBe('gemini-2.5-flash');
+      expect(httpSpan?.attributes['model']).toBe('gemini-1.5-flash');
       expect(httpSpan?.attributes['http.response.status_code']).toBe(200);
       expect(httpSpan?.attributes['status']).toBe('success');
       expect(httpSpan?.status.code).toBe(SpanStatusCode.OK);

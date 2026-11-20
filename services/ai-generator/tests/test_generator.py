@@ -290,7 +290,7 @@ async def test_diagnostics_records_stop_response_metadata(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-diag-stop"
-    assert received_record.model == "gemini-2.5-flash"
+    assert received_record.model == "gemini-1.5-flash"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "STOP"
     assert received_record.prompt_tokens == 1250
@@ -575,7 +575,7 @@ async def test_diagnostics_records_metadata_when_no_usable_text_candidate(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-no-text-sdk-response"
-    assert received_record.model == "gemini-2.5-flash"
+    assert received_record.model == "gemini-1.5-flash"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "SAFETY"
     assert received_record.prompt_tokens == 1800
