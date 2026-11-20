@@ -250,6 +250,7 @@ def test_get_generator_dependency_reuses_application_scoped_generator():
 # Diagnostics & Telemetry Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_diagnostics_records_stop_response_metadata(
     mock_gemini_client, sample_valid_notes_dict: dict, caplog: pytest.LogCaptureFixture
@@ -599,9 +600,7 @@ async def test_diagnostics_records_metadata_when_no_usable_text_candidate(
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_handles_text_accessor_exception_safely(
-    mock_gemini_client, caplog: pytest.LogCaptureFixture
-):
+async def test_diagnostics_handles_text_accessor_exception_safely(mock_gemini_client, caplog: pytest.LogCaptureFixture):
     """Verifies metadata is logged even when response.text raises an exception."""
     mock_response = MagicMock()
     # Configure response.text to raise an unexpected exception
@@ -679,9 +678,7 @@ def test_build_synthesis_prompt_formats_sections():
 
 
 @pytest.mark.asyncio
-async def test_generate_chunk_success_with_thoughts_tokens(
-    mock_gemini_client, sample_valid_notes_dict: dict
-):
+async def test_generate_chunk_success_with_thoughts_tokens(mock_gemini_client, sample_valid_notes_dict: dict):
     """generate_chunk returns ChunkGeneratedNotes and extracts thoughts_tokens from usage_metadata."""
     mock_response = MagicMock()
     mock_response.text = json.dumps(sample_valid_notes_dict)

@@ -8,12 +8,10 @@ from app.schemas import (
     MAX_TRANSCRIPT_CHARS,
     ChunkGeneratedNotes,
     ChunkGenerateRequest,
-    ChunkSummary,
     GeneratedNotes,
     GenerateNotesRequest,
     SynthesizedNotes,
     SynthesizeRequest,
-    UsageMetadata,
 )
 
 
@@ -236,9 +234,7 @@ def test_chunk_generate_request_accepts_camel_and_snake_case():
 
 def test_chunk_generate_request_fallback_from_transcript():
     """If transcript is provided instead of chunkText, fallback populates chunk_text."""
-    req = ChunkGenerateRequest.model_validate(
-        {"transcript": "Transcript content fallback.", "videoTitle": "Course"}
-    )
+    req = ChunkGenerateRequest.model_validate({"transcript": "Transcript content fallback.", "videoTitle": "Course"})
     assert req.chunk_text == "Transcript content fallback."
     assert req.chunk_index == 0
     assert req.total_chunks == 1

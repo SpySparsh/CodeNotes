@@ -601,9 +601,7 @@ def test_synthesize_api_unauthorized_without_bearer(client: TestClient):
         "/api/v1/synthesize",
         json={
             "videoTitle": "Title",
-            "chunkSummaries": [
-                {"chunkIndex": 0, "overview": "Overview", "keyConcepts": [], "shorthands": []}
-            ],
+            "chunkSummaries": [{"chunkIndex": 0, "overview": "Overview", "keyConcepts": [], "shorthands": []}],
         },
     )
     assert response.status_code == 401

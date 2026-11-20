@@ -4,12 +4,11 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
 
@@ -208,7 +207,9 @@ def parse_and_validate_synthesized_notes(raw_text: str) -> SynthesizedNotesConte
             "gemini_synthesis_schema_validation_failed",
             extra={"output_length": len(cleaned), "error_count": exc.error_count()},
         )
-        raise MalformedOutputException("The AI model output could not be parsed into synthesized notes format.") from exc
+        raise MalformedOutputException(
+            "The AI model output could not be parsed into synthesized notes format."
+        ) from exc
 
 
 def extract_usage_metadata(response: Any) -> UsageMetadata:
@@ -616,7 +617,9 @@ class GeminiNoteGenerator:
                     "gemini_chunk_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
-                raise MalformedOutputException("Failed to extract textual content from AI response.") from text_extraction_exc
+                raise MalformedOutputException(
+                    "Failed to extract textual content from AI response."
+                ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
                 logger.error(
@@ -670,7 +673,9 @@ class GeminiNoteGenerator:
             )
 
             if error_code == 429 or "RESOURCE_EXHAUSTED" in error_message or "rate limit" in error_message.lower():
-                raise RateLimitedException("AI generation service is temporarily busy. Retrying later is recommended.") from exc
+                raise RateLimitedException(
+                    "AI generation service is temporarily busy. Retrying later is recommended."
+                ) from exc
 
             if error_code == 504 or "timeout" in error_message.lower() or "deadline exceeded" in error_message.lower():
                 raise TimeoutException(timeout_seconds=int(timeout_ms / 1000)) from exc
@@ -700,10 +705,15 @@ class GeminiNoteGenerator:
             exc_msg = str(exc).lower()
 
             if "timeout" in exc_name.lower() or "timeout" in exc_msg or "timed out" in exc_msg:
-                logger.warning("gemini_chunk_client_timeout", extra={**log_context, "duration_ms": round(duration_ms, 2)})
+                logger.warning(
+                    "gemini_chunk_client_timeout", extra={**log_context, "duration_ms": round(duration_ms, 2)}
+                )
                 raise TimeoutException(timeout_seconds=int(timeout_ms / 1000)) from exc
 
-            logger.error("gemini_chunk_unexpected_error", extra={**log_context, "duration_ms": round(duration_ms, 2), "error_type": exc_name})
+            logger.error(
+                "gemini_chunk_unexpected_error",
+                extra={**log_context, "duration_ms": round(duration_ms, 2), "error_type": exc_name},
+            )
             raise UpstreamErrorException("Unexpected error occurred while invoking AI provider.") from exc
 
     async def synthesize(
@@ -796,7 +806,9 @@ class GeminiNoteGenerator:
                     "gemini_synthesis_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
-                raise MalformedOutputException("Failed to extract textual content from AI response.") from text_extraction_exc
+                raise MalformedOutputException(
+                    "Failed to extract textual content from AI response."
+                ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
                 logger.error(
@@ -851,7 +863,9 @@ class GeminiNoteGenerator:
             )
 
             if error_code == 429 or "RESOURCE_EXHAUSTED" in error_message or "rate limit" in error_message.lower():
-                raise RateLimitedException("AI generation service is temporarily busy. Retrying later is recommended.") from exc
+                raise RateLimitedException(
+                    "AI generation service is temporarily busy. Retrying later is recommended."
+                ) from exc
 
             if error_code == 504 or "timeout" in error_message.lower() or "deadline exceeded" in error_message.lower():
                 raise TimeoutException(timeout_seconds=int(timeout_ms / 1000)) from exc
@@ -860,7 +874,9 @@ class GeminiNoteGenerator:
 
         except TimeoutError as exc:
             duration_ms = (time.perf_counter() - start_time) * 1000
-            logger.warning("gemini_synthesis_timeout_error", extra={**log_context, "duration_ms": round(duration_ms, 2)})
+            logger.warning(
+                "gemini_synthesis_timeout_error", extra={**log_context, "duration_ms": round(duration_ms, 2)}
+            )
             raise TimeoutException(timeout_seconds=int(timeout_ms / 1000)) from exc
 
         except Exception as exc:
@@ -881,8 +897,13 @@ class GeminiNoteGenerator:
             exc_msg = str(exc).lower()
 
             if "timeout" in exc_name.lower() or "timeout" in exc_msg or "timed out" in exc_msg:
-                logger.warning("gemini_synthesis_client_timeout", extra={**log_context, "duration_ms": round(duration_ms, 2)})
+                logger.warning(
+                    "gemini_synthesis_client_timeout", extra={**log_context, "duration_ms": round(duration_ms, 2)}
+                )
                 raise TimeoutException(timeout_seconds=int(timeout_ms / 1000)) from exc
 
-            logger.error("gemini_synthesis_unexpected_error", extra={**log_context, "duration_ms": round(duration_ms, 2), "error_type": exc_name})
+            logger.error(
+                "gemini_synthesis_unexpected_error",
+                extra={**log_context, "duration_ms": round(duration_ms, 2), "error_type": exc_name},
+            )
             raise UpstreamErrorException("Unexpected error occurred while invoking AI provider.") from exc
