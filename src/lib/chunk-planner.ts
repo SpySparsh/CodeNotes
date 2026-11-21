@@ -315,3 +315,35 @@ export function verifyChunkManifest(manifest: ChunkManifest, fullTranscript: str
 
   return true;
 }
+
+/**
+ * Computes a deterministic canonical SHA-256 hash of a ChunkManifest.
+ * Standardizes key ordering and property types across manifest generation and verification.
+ */
+export function computeCanonicalManifestHash(manifest: ChunkManifest): string {
+  if (!manifest || !Array.isArray(manifest.chunks)) {
+    throw new Error('Invalid manifest for canonical hash computation');
+  }
+
+  // Canonical representation: sorted chunk list with deterministic fields
+  const canonicalChunks = manifest.chunks
+    .slice()
+    .sort((a, b) => a.chunkIndex - b.chunkIndex)
+    .map((c) => ({
+      chunkIndex: c.chunkIndex,
+      codePointCount: c.codePointCount,
+      contentSha256: c.contentSha256,
+      endChar: c.endChar,
+      estimatedTokens: c.estimatedTokens,
+      startChar: c.startChar,
+    }));
+
+  const canonicalPayload = JSON.stringify({
+    chunks: canonicalChunks,
+    totalChunks: manifest.totalChunks,
+    totalCodePoints: manifest.totalCodePoints,
+    videoId: manifest.videoId,
+  });
+
+  return crypto.createHash('sha256').update(canonicalPayload, 'utf8').digest('hex');
+}

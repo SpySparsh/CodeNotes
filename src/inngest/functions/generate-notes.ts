@@ -19,6 +19,7 @@ import {
 } from '@/lib/ai-client';
 import {
   planChunkManifest,
+  computeCanonicalManifestHash,
   sliceByCodePoints,
   getCodePointLength,
   MAX_CHUNK_CHARS,
@@ -30,6 +31,11 @@ import {
   completeChunkAndCommitQuota,
   releaseQuotaReservation,
   releaseAbortedDispatch,
+  claimOrAdoptDispatchSlot,
+  completeDispatchAttempt,
+  reportStaleAttemptOutcome,
+  classifyAttemptOutcome,
+  DispatchAuthorizationTicket,
   QuotaError,
   isRateLimitExceeded,
 } from '@/lib/quota-client';
@@ -399,38 +405,183 @@ export const generateNotesFunction = inngest.createFunction(
     // BRANCH A: Single-Chunk Monolithic Path (Backward Compatibility)
     // -------------------------------------------------------------------------
     if (!isMultiChunk) {
-      // Step 3: AI Generation with FastAPI AI Service (Outside DB transaction)
+      // Step 3: AI Generation with FastAPI AI Service (Guarded by Dispatch Ticket)
       const generatedNotes = await step.run('generate-ai-notes', async () => {
         const stageStart = performance.now();
         try {
+          if (!mediaData.transcriptText) {
+            throw new NonRetriableError('Transcript text is required for AI note generation.');
+          }
+
+          const workerId = crypto.randomUUID();
+          const estimatedTokens = Math.max(1000, Math.ceil(mediaData.transcriptText.length / 4) + 1500);
+
+          // 1. Reserve Quota for Monolithic Generation
+          const reserveRes = await reserveQuota({
+            userId,
+            parentKey: idempotencyKey,
+            chunkIndex: -1,
+            projectId: 'codenotes',
+            quotaScope: DEFAULT_AI_MODEL,
+            modelName: DEFAULT_AI_MODEL,
+            workerId,
+            estimatedTokens,
+            operationType: 'monolithic',
+          });
+
+          if (
+            !reserveRes.allowed ||
+            !reserveRes.reservationToken ||
+            !reserveRes.leaseToken ||
+            typeof reserveRes.generation !== 'number'
+          ) {
+            throw new Error(`Monolithic quota reservation rejected: ${reserveRes.statusCode}`);
+          }
+
+          // 2. Claim Dispatch Slot or Adopt Existing Result
+          const slotRes = await claimOrAdoptDispatchSlot({
+            userId,
+            parentKey: idempotencyKey,
+            operationType: 'monolithic',
+            chunkIndex: -1,
+            reservationToken: reserveRes.reservationToken,
+            leaseToken: reserveRes.leaseToken,
+            workerId,
+            generation: reserveRes.generation,
+            projectId: 'codenotes',
+            quotaScope: DEFAULT_AI_MODEL,
+            modelName: DEFAULT_AI_MODEL,
+            estimatedTokens,
+          });
+
           let aiNotes: GeneratedNotes;
 
-          try {
-            if (!mediaData.transcriptText) {
-              throw new NonRetriableError('Transcript text is required for AI note generation.');
+          if (slotRes.adopted && slotRes.adoptedPayload) {
+            aiNotes = slotRes.adoptedPayload;
+          } else {
+            if (!slotRes.allowed || !slotRes.ticket) {
+              throw new Error(`Monolithic dispatch quota rejected: ${slotRes.statusCode}`);
             }
-            aiNotes = await withSpan('fastapi.http_request', async (span) => {
-              return await generateAiNotes(mediaData.transcriptText, mediaData.videoTitle, {
-                requestId: idempotencyKey,
-                span,
+
+            try {
+              aiNotes = await withSpan('fastapi.http_request', async (span) => {
+                return await generateAiNotes(slotRes.ticket!, mediaData.transcriptText, mediaData.videoTitle, {
+                  requestId: idempotencyKey,
+                  span,
+                });
               });
-            });
-          } catch (err: any) {
-            const classification = classifyError(err);
-            if (classification.isUnrecoverable) {
-              throw new NonRetriableError(classification.message);
+            } catch (err: any) {
+              if (slotRes.attemptId && reserveRes.reservationToken) {
+                const outcome = classifyAttemptOutcome(err);
+                await reportStaleAttemptOutcome({
+                  attemptId: slotRes.attemptId,
+                  reservationToken: reserveRes.reservationToken,
+                  workerId,
+                  outcomeStatus: outcome,
+                  errorCode: err?.code || 'MONOLITHIC_AI_FAILURE',
+                  errorMessage: err?.message,
+                }).catch(() => {});
+              }
+              const classification = classifyError(err);
+              if (classification.isUnrecoverable) {
+                throw new NonRetriableError(classification.message);
+              }
+              throw err;
             }
-            throw err;
+
+            if (!aiNotes || !aiNotes.overview) {
+              throw new NonRetriableError('AI returned malformed data.');
+            }
+
+            // Extract usage metadata from provider response
+            const rawUsage = (aiNotes as any)?.usage;
+            const totalTokens = typeof rawUsage?.totalTokens === 'number'
+              ? rawUsage.totalTokens
+              : (typeof (aiNotes as any)?.totalTokens === 'number' ? (aiNotes as any).totalTokens : undefined);
+            const promptTokens = typeof rawUsage?.promptTokens === 'number'
+              ? rawUsage.promptTokens
+              : (typeof (aiNotes as any)?.promptTokens === 'number' ? (aiNotes as any).promptTokens : 0);
+            const candidateTokens = typeof rawUsage?.candidateTokens === 'number'
+              ? rawUsage.candidateTokens
+              : (typeof (aiNotes as any)?.candidateTokens === 'number' ? (aiNotes as any).candidateTokens : 0);
+            const thoughtsTokens = typeof rawUsage?.thoughtsTokens === 'number'
+              ? rawUsage.thoughtsTokens
+              : (typeof (aiNotes as any)?.thoughtsTokens === 'number' ? (aiNotes as any).thoughtsTokens : 0);
+
+            if (typeof totalTokens !== 'number' || isNaN(totalTokens)) {
+              throw new NonRetriableError(
+                'USAGE_METADATA_MISSING: Monolithic generation requires actual provider token usage metadata'
+              );
+            }
+
+            // 3. Complete Dispatch Attempt and Commit Quota
+            if (slotRes.attemptId && reserveRes.reservationToken && reserveRes.leaseToken) {
+              await completeDispatchAttempt({
+                attemptId: slotRes.attemptId,
+                reservationToken: reserveRes.reservationToken,
+                leaseToken: reserveRes.leaseToken,
+                workerId,
+                fencingGeneration: reserveRes.generation,
+                operationType: 'monolithic',
+                responsePayload: aiNotes,
+                totalTokens,
+                promptTokens,
+                candidateTokens,
+                thoughtsTokens,
+                modelName: DEFAULT_AI_MODEL,
+                userId,
+                parentKey: idempotencyKey,
+                videoId: mediaData.resolvedVideoId,
+                videoTitle: mediaData.videoTitle,
+                videoUrl,
+                thumbnailUrl: `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`,
+              }).catch((compErr) => {
+                logger.warn('inngest_monolithic_complete_dispatch_warning', { err: compErr?.message });
+              });
+            }
           }
 
           if (!aiNotes || !aiNotes.overview) {
             throw new NonRetriableError('AI returned malformed data.');
           }
 
+          const rawUsage = (aiNotes as any)?.usage;
+          const totalTokens = typeof rawUsage?.totalTokens === 'number'
+            ? rawUsage.totalTokens
+            : (typeof (aiNotes as any)?.totalTokens === 'number' ? (aiNotes as any).totalTokens : undefined);
+          const promptTokens = typeof rawUsage?.promptTokens === 'number'
+            ? rawUsage.promptTokens
+            : (typeof (aiNotes as any)?.promptTokens === 'number' ? (aiNotes as any).promptTokens : 0);
+          const candidateTokens = typeof rawUsage?.candidateTokens === 'number'
+            ? rawUsage.candidateTokens
+            : (typeof (aiNotes as any)?.candidateTokens === 'number' ? (aiNotes as any).candidateTokens : 0);
+          const thoughtsTokens = typeof rawUsage?.thoughtsTokens === 'number'
+            ? rawUsage.thoughtsTokens
+            : (typeof (aiNotes as any)?.thoughtsTokens === 'number' ? (aiNotes as any).thoughtsTokens : 0);
+
+          if (!slotRes.adopted && (typeof totalTokens !== 'number' || isNaN(totalTokens))) {
+            throw new NonRetriableError(
+              'USAGE_METADATA_MISSING: Monolithic generation requires actual provider token usage metadata'
+            );
+          }
+
           return {
             aiNotes,
             generationMethod: 'transcript' as const,
             transcriptProvider: mediaData.transcriptProvider,
+            attemptId: slotRes.attemptId,
+            reservationToken: reserveRes.reservationToken,
+            leaseToken: reserveRes.leaseToken,
+            workerId,
+            generation: reserveRes.generation,
+            usage: typeof totalTokens === 'number'
+              ? {
+                  totalTokens,
+                  promptTokens,
+                  candidateTokens,
+                  thoughtsTokens,
+                }
+              : undefined,
           };
         } finally {
           recordGenerationStageDuration('gemini_inference', (performance.now() - stageStart) / 1000);
@@ -441,7 +592,7 @@ export const generateNotesFunction = inngest.createFunction(
       const persistResult = await step.run('persist-notes', async () => {
         const stageStart = performance.now();
         try {
-          const noteId = crypto.randomUUID();
+          let finalNoteId: string | null = null;
           const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
 
           let createdAtEpochMs: number | null = null;
@@ -459,41 +610,121 @@ export const generateNotesFunction = inngest.createFunction(
                 createdAtEpochMs = checkRes.rows[0].created_at ? new Date(checkRes.rows[0].created_at).getTime() : null;
                 if (checkRes.rows[0].status === 'completed' && checkRes.rows[0].note_id) {
                   span.setAttribute('status', 'skipped_already_completed');
+                  finalNoteId = checkRes.rows[0].note_id;
                   return;
                 }
               }
 
-              await client.query(
-                `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [
-                  noteId,
-                  userId,
-                  mediaData.resolvedVideoId,
-                  mediaData.videoTitle,
-                  videoUrl,
-                  thumbnailUrl,
-                  generatedNotes.aiNotes.overview,
-                  generatedNotes.aiNotes.keyConcepts,
-                  generatedNotes.aiNotes.detailedNotes,
-                  generatedNotes.aiNotes.shorthands,
-                ]
-              );
+              // Fallback completion path:
+              // Must never publish an unlinked note bypassing complete_dispatch_attempt.
+              // Must use the existing authorized monolithic dispatch attempt identity.
+              const attemptId = (generatedNotes as any)?.attemptId;
+              const reservationToken = (generatedNotes as any)?.reservationToken;
+              const leaseToken = (generatedNotes as any)?.leaseToken;
+              const workerId = (generatedNotes as any)?.workerId;
+              const generation = (generatedNotes as any)?.generation;
 
-              await client.query(
-                `UPDATE generation_idempotency
-                 SET status = 'completed',
-                     note_id = $3,
-                     error_message = NULL,
-                     error_code = NULL,
-                     lease_until = NULL,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE user_id = $1 AND key = $2`,
-                [userId, idempotencyKey, noteId]
+              if (
+                !attemptId ||
+                typeof attemptId !== 'string' ||
+                !reservationToken ||
+                typeof reservationToken !== 'string' ||
+                !leaseToken ||
+                typeof leaseToken !== 'string'
+              ) {
+                throw new NonRetriableError(
+                  'PERSIST_FAILED: Cannot publish monolithic note without verified dispatch attempt and reservation'
+                );
+              }
+
+              if (typeof generation !== 'number' || isNaN(generation)) {
+                throw new NonRetriableError(
+                  'FENCING_IDENTITY_MISSING: Cannot complete monolithic dispatch without valid reservation generation'
+                );
+              }
+
+              if (typeof workerId !== 'string' || workerId.trim().length === 0) {
+                throw new NonRetriableError(
+                  'WORKER_IDENTITY_MISSING: Cannot complete monolithic dispatch without original worker identity'
+                );
+              }
+
+              const rawUsage = (generatedNotes as any)?.usage || (generatedNotes as any)?.aiNotes?.usage;
+              const totalTokens = typeof rawUsage?.totalTokens === 'number'
+                ? rawUsage.totalTokens
+                : (typeof (generatedNotes as any)?.aiNotes?.totalTokens === 'number'
+                  ? (generatedNotes as any).aiNotes.totalTokens
+                  : undefined);
+              const promptTokens = typeof rawUsage?.promptTokens === 'number'
+                ? rawUsage.promptTokens
+                : (typeof (generatedNotes as any)?.aiNotes?.promptTokens === 'number'
+                  ? (generatedNotes as any).aiNotes.promptTokens
+                  : 0);
+              const candidateTokens = typeof rawUsage?.candidateTokens === 'number'
+                ? rawUsage.candidateTokens
+                : (typeof (generatedNotes as any)?.aiNotes?.candidateTokens === 'number'
+                  ? (generatedNotes as any).aiNotes.candidateTokens
+                  : 0);
+              const thoughtsTokens = typeof rawUsage?.thoughtsTokens === 'number'
+                ? rawUsage.thoughtsTokens
+                : (typeof (generatedNotes as any)?.aiNotes?.thoughtsTokens === 'number'
+                  ? (generatedNotes as any).aiNotes.thoughtsTokens
+                  : 0);
+
+              if (typeof totalTokens !== 'number' || isNaN(totalTokens)) {
+                throw new NonRetriableError(
+                  'USAGE_METADATA_MISSING: Cannot complete monolithic dispatch without actual usage metadata'
+                );
+              }
+
+              const compRes = await completeDispatchAttempt({
+                attemptId,
+                reservationToken,
+                leaseToken,
+                workerId,
+                fencingGeneration: generation,
+                operationType: 'monolithic',
+                responsePayload: generatedNotes.aiNotes,
+                totalTokens,
+                promptTokens,
+                candidateTokens,
+                thoughtsTokens,
+                modelName: DEFAULT_AI_MODEL,
+                userId,
+                parentKey: idempotencyKey,
+                videoId: mediaData.resolvedVideoId,
+                videoTitle: mediaData.videoTitle,
+                videoUrl,
+                thumbnailUrl,
+              });
+
+              if (!compRes.success && compRes.statusCode !== 'ALREADY_COMPLETED') {
+                throw new NonRetriableError(
+                  `PERSIST_FAILED: Atomic complete_dispatch_attempt failed with ${compRes.statusCode}`
+                );
+              }
+
+              const verifyRes = await client.query(
+                `SELECT status, note_id FROM generation_idempotency WHERE user_id = $1 AND key = $2`,
+                [userId, idempotencyKey]
               );
+              const verifiedRow = verifyRes.rows[0];
+              if (!verifiedRow || verifiedRow.status !== 'completed' || !verifiedRow.note_id) {
+                throw new NonRetriableError(
+                  'PERSIST_VERIFICATION_FAILED: Monolithic generation recovery could not be verified completed with a valid note_id'
+                );
+              }
+
+              finalNoteId = verifiedRow.note_id;
             });
             span.setAttribute('status', 'success');
           });
+
+          if (!finalNoteId) {
+            throw new NonRetriableError(
+              'PERSIST_FAILED: Monolithic generation could not verify note persistence'
+            );
+          }
 
           recordGenerationJob('completed');
 
@@ -506,13 +737,13 @@ export const generateNotesFunction = inngest.createFunction(
             userId,
             videoId: mediaData.resolvedVideoId,
             idempotencyKey,
-            noteId,
+            noteId: finalNoteId,
             generationMethod: generatedNotes.generationMethod,
             transcriptProvider: generatedNotes.transcriptProvider,
             durationSeconds,
           });
 
-          return { success: true, noteId };
+          return { success: true, noteId: finalNoteId };
         } finally {
           recordGenerationStageDuration('db_persist', (performance.now() - stageStart) / 1000);
         }
@@ -532,7 +763,15 @@ export const generateNotesFunction = inngest.createFunction(
         videoId: mediaData.resolvedVideoId,
         totalCodePoints,
       });
-      return planChunkManifest(mediaData.resolvedVideoId, mediaData.transcriptText);
+      const planned = planChunkManifest(mediaData.resolvedVideoId, mediaData.transcriptText);
+      const manifestHash = computeCanonicalManifestHash(planned);
+      await query(
+        `UPDATE public.generation_idempotency
+         SET total_chunks = $3, manifest_hash = $4, updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND key = $2`,
+        [userId, idempotencyKey, planned.totalChunks, manifestHash]
+      );
+      return planned;
     });
 
     // Step 3b: Bounded Concurrency Fan-Out Generation for each chunk (max 2 concurrent to respect Gemini 15 RPM limit)
@@ -662,11 +901,43 @@ export const generateNotesFunction = inngest.createFunction(
           throw new Error(`Mark reservation dispatching failed: ${dispatchRes.statusCode}`);
         }
 
-        // 3. Generate Chunk AI Notes (with retry on transient provider 429)
+        // 3. Generate Chunk AI Notes (Claim slot per attempt and pass single-use ticket)
         let chunkNotes: any;
+        let lastAttemptId: string | null = null;
         for (let attempt = 0; attempt < 5; attempt++) {
+          const slotRes = await claimOrAdoptDispatchSlot({
+            userId,
+            parentKey: idempotencyKey,
+            operationType: 'chunk',
+            chunkIndex: chunk.chunkIndex,
+            reservationToken,
+            leaseToken,
+            workerId,
+            generation,
+            projectId: 'codenotes',
+            quotaScope: DEFAULT_AI_MODEL,
+            modelName: DEFAULT_AI_MODEL,
+            estimatedTokens: estimatedTokensPerChunk,
+          });
+
+          if (slotRes.adopted && slotRes.adoptedPayload) {
+            chunkNotes = slotRes.adoptedPayload;
+            break;
+          }
+
+          if (!slotRes.allowed || !slotRes.ticket) {
+            if (isRateLimitExceeded(slotRes.statusCode) && attempt < 4) {
+              await new Promise((resolve) => setTimeout(resolve, 5000 * (attempt + 1)));
+              continue;
+            }
+            throw new Error(`Chunk dispatch slot rejected: ${slotRes.statusCode}`);
+          }
+
+          lastAttemptId = slotRes.attemptId;
+
           try {
             chunkNotes = await generateChunkAiNotes(
+              slotRes.ticket,
               chunkText,
               mediaData.videoTitle,
               chunk.chunkIndex,
@@ -677,6 +948,17 @@ export const generateNotesFunction = inngest.createFunction(
             );
             break;
           } catch (genErr: any) {
+            if (slotRes.attemptId) {
+              const outcome = classifyAttemptOutcome(genErr);
+              await reportStaleAttemptOutcome({
+                attemptId: slotRes.attemptId,
+                reservationToken,
+                workerId,
+                outcomeStatus: outcome,
+                errorCode: genErr?.code || 'CHUNK_AI_FAILURE',
+                errorMessage: genErr?.message,
+              }).catch(() => {});
+            }
             if (genErr?.isRetryable && attempt < 4) {
               logger.warn('inngest_chunk_ai_generation_retry', {
                 chunkIndex: chunk.chunkIndex,
@@ -705,7 +987,29 @@ export const generateNotesFunction = inngest.createFunction(
           }
         }
 
-        // 4. Complete Chunk and Commit Quota
+        // 4. Complete Chunk and Commit Quota (Attempt Ledger & Chunk Generations)
+        if (lastAttemptId) {
+          await completeDispatchAttempt({
+            attemptId: lastAttemptId,
+            reservationToken,
+            leaseToken,
+            workerId,
+            fencingGeneration: generation,
+            operationType: 'chunk',
+            responsePayload: {
+              overview: chunkNotes.overview,
+              keyConcepts: chunkNotes.keyConcepts,
+              detailedNotes: chunkNotes.detailedNotes,
+              shorthands: chunkNotes.shorthands,
+            },
+            totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
+            promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
+            candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
+            thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
+            modelName: DEFAULT_AI_MODEL,
+          }).catch(() => {});
+        }
+
         const commitRes = await completeChunkAndCommitQuota({
           userId,
           parentKey: idempotencyKey,
@@ -758,14 +1062,66 @@ export const generateNotesFunction = inngest.createFunction(
 
     // Step 3c: Hierarchical Synthesis
     const synthesizedNotes = await step.run('hierarchical-synthesis', async () => {
-      const summaries: ChunkSummary[] = chunkResults
-        .sort((a, b) => a.chunkIndex - b.chunkIndex)
-        .map((cr) => ({
-          chunkIndex: cr.chunkIndex,
-          overview: cr.overview,
-          keyConcepts: cr.keyConcepts,
-          shorthands: cr.shorthands,
-        }));
+      // 1. Verify Parent Generation & Manifest from Database
+      const parentRes = await query(
+        `SELECT total_chunks, manifest_hash, status
+         FROM public.generation_idempotency
+         WHERE user_id = $1 AND key = $2`,
+        [userId, idempotencyKey]
+      );
+      if (parentRes.rows.length === 0) {
+        throw new NonRetriableError('MANIFEST_VERIFICATION_FAILED: Parent generation record not found in database');
+      }
+      const parentRow = parentRes.rows[0];
+      if (parentRow.total_chunks !== manifest.totalChunks) {
+        throw new NonRetriableError(
+          `MANIFEST_VERIFICATION_FAILED: total_chunks mismatch (db: ${parentRow.total_chunks}, planned: ${manifest.totalChunks})`
+        );
+      }
+      const expectedHash = computeCanonicalManifestHash(manifest);
+      if (parentRow.manifest_hash !== expectedHash) {
+        throw new NonRetriableError(
+          `MANIFEST_VERIFICATION_FAILED: manifest_hash mismatch (db: ${parentRow.manifest_hash}, expected: ${expectedHash})`
+        );
+      }
+
+      // 2. Load and verify completed chunks from Database
+      const chunksRes = await query(
+        `SELECT chunk_index, chunk_notes, status
+         FROM public.chunk_generations
+         WHERE user_id = $1 AND parent_key = $2 AND status = 'completed'
+         ORDER BY chunk_index ASC`,
+        [userId, idempotencyKey]
+      );
+
+      if (!chunksRes.rows || chunksRes.rows.length !== manifest.totalChunks) {
+        throw new NonRetriableError(
+          `MANIFEST_VERIFICATION_FAILED: Expected ${manifest.totalChunks} completed chunks in database, found ${chunksRes.rows?.length || 0}`
+        );
+      }
+
+      // Verify exact contiguous indices 0 .. totalChunks - 1 and valid chunk notes
+      for (let idx = 0; idx < manifest.totalChunks; idx++) {
+        const row = chunksRes.rows[idx];
+        if (!row || row.chunk_index !== idx) {
+          throw new NonRetriableError(
+            `MANIFEST_VERIFICATION_FAILED: Missing or non-contiguous chunk index ${idx} in database`
+          );
+        }
+        if (!row.chunk_notes || typeof row.chunk_notes.overview !== 'string') {
+          throw new NonRetriableError(
+            `MANIFEST_VERIFICATION_FAILED: Invalid or corrupted chunk notes payload for chunk ${idx}`
+          );
+        }
+      }
+
+      // Build summaries strictly from verified database records
+      const summaries: ChunkSummary[] = chunksRes.rows.map((row: any) => ({
+        chunkIndex: row.chunk_index,
+        overview: row.chunk_notes.overview,
+        keyConcepts: row.chunk_notes.keyConcepts || [],
+        shorthands: row.chunk_notes.shorthands || [],
+      }));
 
       logger.info('inngest_synthesizing_master_guide', {
         userId,
@@ -773,9 +1129,93 @@ export const generateNotesFunction = inngest.createFunction(
         chunkSummariesCount: summaries.length,
       });
 
-      return await synthesizeSectionNotes(summaries, mediaData.videoTitle, {
-        requestId: `${idempotencyKey}-synthesis`,
+      const synthWorkerId = crypto.randomUUID();
+      const synthEstimatedTokens = Math.max(1000, summaries.length * 400 + 1000);
+
+      // Reserve and claim slot for synthesis under operation_type = 'synthesis'
+      const synthReserve = await reserveQuota({
+        userId,
+        parentKey: idempotencyKey,
+        chunkIndex: -1,
+        projectId: 'codenotes',
+        quotaScope: DEFAULT_AI_MODEL,
+        modelName: DEFAULT_AI_MODEL,
+        workerId: synthWorkerId,
+        estimatedTokens: synthEstimatedTokens,
+        operationType: 'synthesis',
       });
+
+      const synthSlot = await claimOrAdoptDispatchSlot({
+        userId,
+        parentKey: idempotencyKey,
+        operationType: 'synthesis',
+        chunkIndex: -1,
+        reservationToken: synthReserve.reservationToken || crypto.randomUUID(),
+        leaseToken: synthReserve.leaseToken || crypto.randomUUID(),
+        workerId: synthWorkerId,
+        generation: synthReserve.generation || 1,
+        projectId: 'codenotes',
+        quotaScope: DEFAULT_AI_MODEL,
+        modelName: DEFAULT_AI_MODEL,
+        estimatedTokens: synthEstimatedTokens,
+      });
+
+      if (synthSlot.adopted && synthSlot.adoptedPayload) {
+        return {
+          notes: synthSlot.adoptedPayload,
+          synthAttemptId: synthSlot.attemptId,
+          synthReservationToken: synthReserve.reservationToken,
+        };
+      }
+
+      if (!synthSlot.allowed || !synthSlot.ticket) {
+        throw new Error(`Synthesis dispatch quota rejected: ${synthSlot.statusCode}`);
+      }
+
+      let notes: any;
+      try {
+        notes = await synthesizeSectionNotes(synthSlot.ticket, summaries, mediaData.videoTitle, {
+          requestId: `${idempotencyKey}-synthesis`,
+        });
+      } catch (err: any) {
+        if (synthSlot.attemptId && synthReserve.reservationToken) {
+          const outcome = classifyAttemptOutcome(err);
+          await reportStaleAttemptOutcome({
+            attemptId: synthSlot.attemptId,
+            reservationToken: synthReserve.reservationToken,
+            workerId: synthWorkerId,
+            outcomeStatus: outcome,
+            errorCode: err?.code || 'SYNTHESIS_AI_FAILURE',
+            errorMessage: err?.message,
+          }).catch(() => {});
+        }
+        throw err;
+      }
+
+      if (synthSlot.attemptId && synthReserve.reservationToken && synthReserve.leaseToken) {
+        await completeDispatchAttempt({
+          attemptId: synthSlot.attemptId,
+          reservationToken: synthReserve.reservationToken,
+          leaseToken: synthReserve.leaseToken,
+          workerId: synthWorkerId,
+          fencingGeneration: synthReserve.generation || 1,
+          operationType: 'synthesis',
+          responsePayload: notes,
+          totalTokens: notes.usage?.totalTokens ?? 0,
+          promptTokens: notes.usage?.promptTokens ?? 0,
+          candidateTokens: notes.usage?.candidateTokens ?? 0,
+          thoughtsTokens: notes.usage?.thoughtsTokens ?? 0,
+          modelName: DEFAULT_AI_MODEL,
+          userId,
+          parentKey: idempotencyKey,
+        }).catch(() => {});
+      }
+
+      return {
+        notes,
+        synthAttemptId: synthSlot.attemptId,
+        synthReservationToken: synthReserve.reservationToken,
+      };
     });
 
     // Step 3d: Persist Adaptive Notes
@@ -785,12 +1225,54 @@ export const generateNotesFunction = inngest.createFunction(
         const noteId = crypto.randomUUID();
         const thumbnailUrl = `https://img.youtube.com/vi/${mediaData.resolvedVideoId}/maxresdefault.jpg`;
 
-        // Assemble ordered detailed notes from all chunks
-        const sortedChunks = [...chunkResults].sort((a, b) => a.chunkIndex - b.chunkIndex);
-        const combinedDetailedNotes = sortedChunks
-          .map((cr, idx) => {
-            const sectionTitle = synthesizedNotes.tableOfContents[idx] || `Part ${idx + 1}`;
-            return `## ${sectionTitle}\n\n${cr.detailedNotes}`;
+        // 1. Verify Manifest from Database
+        const parentRes = await query(
+          `SELECT total_chunks, manifest_hash, status
+           FROM public.generation_idempotency
+           WHERE user_id = $1 AND key = $2`,
+          [userId, idempotencyKey]
+        );
+        if (parentRes.rows.length === 0) {
+          throw new NonRetriableError('DATABASE_CHUNKS_INCOMPLETE: Parent generation record not found');
+        }
+        const expectedHash = computeCanonicalManifestHash(manifest);
+        if (parentRes.rows[0].manifest_hash !== expectedHash) {
+          throw new NonRetriableError(
+            'DATABASE_CHUNKS_INCOMPLETE: Manifest hash mismatch before publication'
+          );
+        }
+
+        // 2. Database chunk verification & assembly (Strictly from database rows)
+        const chunksRes = await query(
+          `SELECT chunk_index, chunk_notes
+           FROM public.chunk_generations
+           WHERE user_id = $1 AND parent_key = $2 AND status = 'completed'
+           ORDER BY chunk_index ASC`,
+          [userId, idempotencyKey]
+        );
+
+        if (!chunksRes.rows || chunksRes.rows.length !== manifest.totalChunks) {
+          throw new NonRetriableError(
+            `DATABASE_CHUNKS_INCOMPLETE: Expected ${manifest.totalChunks} completed chunks in database, found ${chunksRes.rows?.length || 0}`
+          );
+        }
+
+        for (let idx = 0; idx < manifest.totalChunks; idx++) {
+          const row = chunksRes.rows[idx];
+          if (!row || row.chunk_index !== idx || !row.chunk_notes?.detailedNotes) {
+            throw new NonRetriableError(
+              `DATABASE_CHUNKS_INCOMPLETE: Missing or invalid database chunk row at index ${idx}`
+            );
+          }
+        }
+
+        const actualSynthesizedNotes = (synthesizedNotes as any)?.notes || synthesizedNotes;
+        const synthAttemptId = (synthesizedNotes as any)?.synthAttemptId || null;
+
+        const combinedDetailedNotes = chunksRes.rows
+          .map((row: any, idx: number) => {
+            const sectionTitle = actualSynthesizedNotes.tableOfContents?.[idx] || `Part ${idx + 1}`;
+            return `## ${sectionTitle}\n\n${row.chunk_notes.detailedNotes}`;
           })
           .join('\n\n---\n\n');
 
@@ -813,19 +1295,21 @@ export const generateNotesFunction = inngest.createFunction(
             }
 
             await client.query(
-              `INSERT INTO notes (id, user_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              `INSERT INTO notes (id, user_id, parent_key, attempt_id, video_id, video_title, video_url, thumbnail_url, overview, key_concepts, detailed_notes, shorthands)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
               [
                 noteId,
                 userId,
+                idempotencyKey,
+                synthAttemptId,
                 mediaData.resolvedVideoId,
                 mediaData.videoTitle,
                 videoUrl,
                 thumbnailUrl,
-                synthesizedNotes.overview,
-                synthesizedNotes.keyConcepts,
+                actualSynthesizedNotes.overview,
+                actualSynthesizedNotes.keyConcepts,
                 combinedDetailedNotes,
-                synthesizedNotes.shorthands,
+                actualSynthesizedNotes.shorthands,
               ]
             );
 

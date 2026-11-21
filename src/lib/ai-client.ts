@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { logger } from '@/lib/logger';
 import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
 import { withSpan, SpanStatusCode, sanitizeErrorMessage, createSafeSpan, type Span } from '@/lib/tracing';
+import { DispatchAuthorizationTicket } from '@/lib/quota-client';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
 export const DEFAULT_AI_MODEL = 'gemini-1.5-flash';
@@ -28,6 +29,11 @@ export const generatedNotesSchema = z.object({
   keyConcepts: z.array(z.string()),
   detailedNotes: z.string().min(1, 'detailedNotes is required and must not be empty'),
   shorthands: z.array(z.string()),
+  usage: usageMetadataSchema.optional(),
+  promptTokens: z.number().int().nonnegative().optional(),
+  candidateTokens: z.number().int().nonnegative().optional(),
+  thoughtsTokens: z.number().int().nonnegative().optional(),
+  totalTokens: z.number().int().nonnegative().optional(),
 });
 
 export type GeneratedNotes = z.infer<typeof generatedNotesSchema>;
@@ -261,10 +267,46 @@ export function normalizeRequestId(incoming?: string): string {
  * Never logs credentials, transcripts, prompts, or generated notes.
  */
 export async function generateAiNotes(
+  ticket: DispatchAuthorizationTicket,
   transcript: string,
   videoTitle: string,
   options?: GenerateAiNotesOptions
+): Promise<GeneratedNotes>;
+export async function generateAiNotes(
+  transcript: string,
+  videoTitle: string,
+  options?: GenerateAiNotesOptions
+): Promise<GeneratedNotes>;
+export async function generateAiNotes(
+  arg1: DispatchAuthorizationTicket | string,
+  arg2: string,
+  arg3?: string | GenerateAiNotesOptions,
+  arg4?: GenerateAiNotesOptions
 ): Promise<GeneratedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let transcript: string;
+  let videoTitle: string;
+  let options: GenerateAiNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    transcript = arg2;
+    videoTitle = arg3 as string;
+    options = arg4;
+    ticket.consume('monolithic', ticket.attemptId);
+  } else {
+    transcript = arg1;
+    videoTitle = arg2;
+    options = arg3 as GenerateAiNotesOptions | undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to generate AI notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);
@@ -1035,12 +1077,58 @@ export interface GenerateChunkAiNotesOptions extends GenerateAiNotesOptions {}
  * Returns ChunkGeneratedNotes including token metrics (prompt, candidate, thoughts, total).
  */
 export async function generateChunkAiNotes(
+  ticket: DispatchAuthorizationTicket,
   chunkText: string,
   videoTitle: string,
-  chunkIndex: number = 0,
-  totalChunks: number = 1,
+  chunkIndex?: number,
+  totalChunks?: number,
   options?: GenerateChunkAiNotesOptions
+): Promise<ChunkGeneratedNotes>;
+export async function generateChunkAiNotes(
+  chunkText: string,
+  videoTitle: string,
+  chunkIndex?: number,
+  totalChunks?: number,
+  options?: GenerateChunkAiNotesOptions
+): Promise<ChunkGeneratedNotes>;
+export async function generateChunkAiNotes(
+  arg1: DispatchAuthorizationTicket | string,
+  arg2: string,
+  arg3?: string | number,
+  arg4?: number,
+  arg5?: number | GenerateChunkAiNotesOptions,
+  arg6?: GenerateChunkAiNotesOptions
 ): Promise<ChunkGeneratedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let chunkText: string;
+  let videoTitle: string;
+  let chunkIndex = 0;
+  let totalChunks = 1;
+  let options: GenerateChunkAiNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    chunkText = arg2;
+    videoTitle = arg3 as string;
+    chunkIndex = typeof arg4 === 'number' ? arg4 : 0;
+    totalChunks = typeof arg5 === 'number' ? arg5 : 1;
+    options = arg6;
+    ticket.consume('chunk', ticket.attemptId);
+  } else {
+    chunkText = arg1;
+    videoTitle = arg2;
+    chunkIndex = typeof arg3 === 'number' ? arg3 : 0;
+    totalChunks = typeof arg4 === 'number' ? arg4 : 1;
+    options = typeof arg5 === 'object' ? arg5 : undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to generate chunk AI notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);
@@ -1117,10 +1205,46 @@ export interface SynthesizeSectionNotesOptions extends GenerateAiNotesOptions {}
  * and table of contents from multiple chunk summaries.
  */
 export async function synthesizeSectionNotes(
+  ticket: DispatchAuthorizationTicket,
   chunkSummaries: ChunkSummary[],
   videoTitle: string,
   options?: SynthesizeSectionNotesOptions
+): Promise<SynthesizedNotes>;
+export async function synthesizeSectionNotes(
+  chunkSummaries: ChunkSummary[],
+  videoTitle: string,
+  options?: SynthesizeSectionNotesOptions
+): Promise<SynthesizedNotes>;
+export async function synthesizeSectionNotes(
+  arg1: DispatchAuthorizationTicket | ChunkSummary[],
+  arg2: ChunkSummary[] | string,
+  arg3?: string | SynthesizeSectionNotesOptions,
+  arg4?: SynthesizeSectionNotesOptions
 ): Promise<SynthesizedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let chunkSummaries: ChunkSummary[];
+  let videoTitle: string;
+  let options: SynthesizeSectionNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    chunkSummaries = arg2 as ChunkSummary[];
+    videoTitle = arg3 as string;
+    options = arg4;
+    ticket.consume('synthesis', ticket.attemptId);
+  } else {
+    chunkSummaries = arg1 as ChunkSummary[];
+    videoTitle = arg2 as string;
+    options = arg3 as SynthesizeSectionNotesOptions | undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to synthesize section notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);
