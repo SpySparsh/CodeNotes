@@ -1,10 +1,14 @@
 """FastAPI application entrypoint for CodeNotes AI generator service."""
 
+import itertools
+import json
 import logging
 import re
+import sys
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -30,11 +34,154 @@ from app.schemas import (
     SynthesizeRequest,
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
-)
+# Explicitly allowlisted diagnostic and operational fields for JSON logging
+ALLOWLISTED_LOG_FIELDS = frozenset({
+    # Diagnostic error fields
+    "status_code",
+    "grpc_status",
+    "error_message",
+    "quota_failures",
+    "error_info",
+    "retry_delay",
+    "retry_after_header",
+    # Request & execution context
+    "request_id",
+    "model",
+    "chunk_index",
+    "total_chunks",
+    "timeout_ms",
+    "duration_ms",
+    # Operational telemetry & token accounting
+    "prompt_tokens",
+    "candidate_tokens",
+    "thoughts_tokens",
+    "total_tokens",
+    "finish_reason",
+    "transcript_chars",
+    "output_chars",
+})
+
+SENSITIVE_KEY_PATTERN = re.compile(r"(AIza[0-9A-Za-z-_]{35}|Bearer\s+[A-Za-z0-9_\-\.]+)", re.IGNORECASE)
+
+
+def _sanitize_log_value(val: Any, max_depth: int = 5) -> Any:
+    """Recursively sanitize allowlisted log values, redacting credentials and bounding size."""
+    if max_depth <= 0:
+        return "[DEPTH_EXCEEDED]"
+
+    if isinstance(val, str):
+        sanitized = SENSITIVE_KEY_PATTERN.sub("[REDACTED]", val.strip())
+        if len(sanitized) > 1000:
+            return sanitized[:1000] + "...[TRUNCATED]"
+        return sanitized
+
+    if isinstance(val, (int, float, bool)) or val is None:
+        return val
+
+    if isinstance(val, dict):
+        cleaned_dict: dict[str, Any] = {}
+        for k, v in itertools.islice(val.items(), 25):
+            clean_k = _sanitize_log_value(str(k), max_depth=max_depth - 1)
+            cleaned_dict[str(clean_k)] = _sanitize_log_value(v, max_depth=max_depth - 1)
+        return cleaned_dict
+
+    if isinstance(val, (list, tuple, set)):
+        return [_sanitize_log_value(item, max_depth=max_depth - 1) for item in itertools.islice(val, 25)]
+
+    try:
+        raw_str = str(val)
+        return _sanitize_log_value(raw_str, max_depth=max_depth - 1)
+    except Exception:
+        return "[UNSERIALIZABLE]"
+
+
+class SafeJsonFormatter(logging.Formatter):
+    """Structured JSON log formatter that explicitly allowlists and sanitizes diagnostic fields.
+
+    Preserves standard fields: timestamp, level, logger, message.
+    Explicitly includes only allowlisted fields from extra.
+    Prevents leakage of transcripts, prompts, credentials, and raw exception objects.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            try:
+                raw_msg = record.getMessage()
+                clean_msg = _sanitize_log_value(raw_msg)
+            except Exception:
+                clean_msg = "[UNSERIALIZABLE]"
+
+            log_entry: dict[str, Any] = {
+                "timestamp": self.formatTime(record, self.datefmt),
+                "level": getattr(record, "levelname", "UNKNOWN"),
+                "logger": getattr(record, "name", "root"),
+                "message": clean_msg if clean_msg is not None else "",
+            }
+
+            for field in ALLOWLISTED_LOG_FIELDS:
+                if hasattr(record, field):
+                    val = getattr(record, field)
+                    if val is not None:
+                        sanitized = _sanitize_log_value(val)
+                        if sanitized is not None:
+                            log_entry[field] = sanitized
+
+            return json.dumps(log_entry, default=str)
+        except Exception:
+            try:
+                try:
+                    ts = self.formatTime(record, self.datefmt)
+                except Exception:
+                    ts = None
+
+                try:
+                    lvl = str(getattr(record, "levelname", "UNKNOWN"))
+                except Exception:
+                    lvl = "UNKNOWN"
+
+                try:
+                    log_name = str(getattr(record, "name", "root"))
+                except Exception:
+                    log_name = "root"
+
+                try:
+                    raw_msg = record.getMessage()
+                    clean_msg = _sanitize_log_value(raw_msg)
+                except Exception:
+                    clean_msg = "[UNSERIALIZABLE]"
+
+                fallback: dict[str, Any] = {
+                    "level": lvl,
+                    "logger": log_name,
+                    "message": clean_msg if clean_msg is not None else "",
+                }
+                if ts is not None:
+                    fallback["timestamp"] = ts
+
+                return json.dumps(fallback, default=str)
+            except Exception:
+                return '{"level":"ERROR","message":"[LOG_FORMATTING_FATAL_ERROR]"}'
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure root logger with SafeJsonFormatter emitting to stdout."""
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    has_safe_formatter = False
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            handler.setFormatter(SafeJsonFormatter())
+            handler.setStream(sys.stdout)
+            has_safe_formatter = True
+
+    if not has_safe_formatter:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(SafeJsonFormatter())
+        root.addHandler(handler)
+
+
+setup_logging()
 logger = logging.getLogger("ai_generator.main")
 
 # Safe character set for request IDs (alphanumeric, hyphens, underscores, dots, 1-64 chars)
