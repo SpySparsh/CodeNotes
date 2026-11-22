@@ -28,7 +28,7 @@ from app.schemas import ChunkSummary
 
 
 def test_build_prompt_preserves_exact_requirements():
-    """Prompt must include Technical Content Architect persona and all three functional requirements."""
+    """Prompt must include Technical Content Architect persona and all functional requirements."""
     prompt = build_prompt(transcript="Tutorial content on React hooks", video_title="React Hooks Masterclass")
 
     assert 'titled "React Hooks Masterclass"' in prompt
@@ -36,6 +36,7 @@ def test_build_prompt_preserves_exact_requirements():
     assert "1. **Structure First:**" in prompt
     assert "2. **Contextual Code Mapping:**" in prompt
     assert "3. **Comparison Tables:**" in prompt
+    assert "4. **Original Synthesis:**" in prompt
     assert "Tutorial content on React hooks" in prompt
     assert "==================" in prompt
 
@@ -290,7 +291,7 @@ async def test_diagnostics_records_stop_response_metadata(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-diag-stop"
-    assert received_record.model == "gemini-1.5-flash"
+    assert received_record.model == "gemini-3.5-flash-lite"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "STOP"
     assert received_record.prompt_tokens == 1250
@@ -575,7 +576,7 @@ async def test_diagnostics_records_metadata_when_no_usable_text_candidate(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-no-text-sdk-response"
-    assert received_record.model == "gemini-1.5-flash"
+    assert received_record.model == "gemini-3.5-flash-lite"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "SAFETY"
     assert received_record.prompt_tokens == 1800
@@ -652,6 +653,70 @@ async def test_diagnostics_handles_text_accessor_exception_safely(mock_gemini_cl
     assert failed_record.raw_response_chars == 0
 
 
+@pytest.mark.asyncio
+async def test_diagnostics_records_metadata_when_recitation_finish_reason(
+    mock_gemini_client, caplog: pytest.LogCaptureFixture
+):
+    """Verifies FinishReason.RECITATION is safely handled, raises MalformedOutputException, and preserves diagnostics."""
+    sdk_response = types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=types.FinishReason.RECITATION,
+                # Content is omitted by provider on recitation
+            )
+        ],
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=978,
+            candidates_token_count=0,
+            thoughts_token_count=0,
+            total_token_count=978,
+        ),
+        model_version="gemini-2.5-flash-001",
+    )
+
+    mock_gemini_client.aio.models.generate_content.return_value = sdk_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(MalformedOutputException) as exc_info:
+            await generator.generate_notes(
+                transcript="Transcript that triggered Google copyright recitation filter.",
+                video_title="Fireship JavaScript in 100 Seconds",
+                request_id="test-req-recitation-safely-handled",
+            )
+
+    assert "no usable text" in exc_info.value.message.lower()
+
+    # 1. Verify pre-parse response received event captured finish_reason and usage
+    received_record = next(
+        (r for r in caplog.records if r.message == "gemini_generation_response_received"),
+        None,
+    )
+    assert received_record is not None
+    assert received_record.request_id == "test-req-recitation-safely-handled"
+    assert received_record.model == "gemini-3.5-flash-lite"
+    assert received_record.finish_reason == "RECITATION"
+    assert received_record.prompt_tokens == 978
+    assert received_record.candidate_tokens == 0
+    assert received_record.thoughts_tokens == 0
+    assert received_record.total_tokens == 978
+    assert received_record.raw_response_chars == 0
+
+    # 2. Verify parsing failure structured event captured finish reason and usage
+    failed_record = next(
+        (r for r in caplog.records if r.message == "gemini_generation_parsing_failed"),
+        None,
+    )
+    assert failed_record is not None
+    assert failed_record.request_id == "test-req-recitation-safely-handled"
+    assert failed_record.exception_category == "MalformedOutputException"
+    assert failed_record.finish_reason == "RECITATION"
+    assert failed_record.prompt_tokens == 978
+    assert failed_record.candidate_tokens == 0
+    assert failed_record.total_tokens == 978
+    assert failed_record.raw_response_chars == 0
+
+
 def test_build_chunk_prompt_includes_section_indices():
     """build_chunk_prompt must include section indices and tutorial title."""
     prompt = build_chunk_prompt(
@@ -662,6 +727,7 @@ def test_build_chunk_prompt_includes_section_indices():
     )
     assert 'titled "FastAPI Mastery"' in prompt
     assert "Section 3 of 10" in prompt
+    assert "4. **Original Synthesis:**" in prompt
     assert "Chunk transcript content." in prompt
 
 

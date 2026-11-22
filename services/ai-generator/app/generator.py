@@ -182,6 +182,8 @@ Your objective is to generate premium, highly structured technical study notes b
 
 3. **Comparison Tables:** Whenever the transcript compares two or more topics, concepts, or tools (e.g., if-else vs switch, React vs Vue), you MUST generate a Markdown comparison table to highlight differences (Performance, Use Case, Readability, etc.) inline within the 'detailedNotes' markdown string.
 
+4. **Original Synthesis:** Synthesize, explain, and organize the concepts in your own original words. Do not quote or recite long segments of the transcript verbatim. Extract code snippets and technical keywords accurately, but articulate the explanations independently.
+
 Return the result strictly as a JSON object matching this schema:
 {{
   "overview": "A compelling overview of the video's purpose (2-3 sentences).",
@@ -250,6 +252,8 @@ Your objective is to generate detailed, structured technical study notes based o
 2. **Contextual Code Mapping:** Do NOT clump code blocks at the end. When you process a theory block or topic within the 'detailedNotes' markdown, you MUST immediately locate and insert the syntactically correct code block exactly where it belongs conceptually. All code must reside inline within the appropriate detailed topic sections using standard markdown fences (e.g., ```typescript).
 
 3. **Comparison Tables:** Whenever the transcript section compares two or more topics, concepts, or tools (e.g., if-else vs switch, React vs Vue), you MUST generate a Markdown comparison table to highlight differences (Performance, Use Case, Readability, etc.) inline within the 'detailedNotes' markdown string.
+
+4. **Original Synthesis:** Synthesize, explain, and organize the concepts in your own original words. Do not quote or recite long segments of the transcript verbatim. Extract code snippets and technical keywords accurately, but articulate the explanations independently.
 
 Return the result strictly as a JSON object matching this schema:
 {{
