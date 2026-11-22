@@ -283,6 +283,15 @@ async def test_diagnostics_records_stop_response_metadata(
         )
 
     assert notes.overview == sample_valid_notes_dict["overview"]
+    assert notes.usage is not None
+    assert notes.usage.prompt_tokens == 1250
+    assert notes.usage.candidate_tokens == 820
+    assert notes.usage.thoughts_tokens == 210
+    assert notes.usage.total_tokens == 2280
+    assert notes.prompt_tokens == 1250
+    assert notes.candidate_tokens == 820
+    assert notes.thoughts_tokens == 210
+    assert notes.total_tokens == 2280
 
     # Locate gemini_generation_response_received log record
     received_record = next(
@@ -300,6 +309,164 @@ async def test_diagnostics_records_stop_response_metadata(
     assert received_record.total_tokens == 2280
     assert received_record.raw_response_chars == len(mock_response.text)
     assert received_record.duration_ms > 0
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_omits_usage_when_provider_metadata_absent(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """When provider response omits usage_metadata, notes.usage is None and no tokens are fabricated."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(sample_valid_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata = None
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture and patterns.",
+        video_title="TypeScript Masterclass",
+        request_id="test-req-no-usage",
+    )
+
+    assert notes.overview == sample_valid_notes_dict["overview"]
+    assert notes.usage is None
+    assert notes.total_tokens is None
+    assert notes.prompt_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.thoughts_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_ignores_gemini_hallucinated_usage_when_provider_usage_present(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Gemini-generated fake nested and flat usage fields in JSON text are strictly ignored."""
+    fake_notes_dict = {
+        **sample_valid_notes_dict,
+        "usage": {
+            "promptTokens": 99999,
+            "candidateTokens": 88888,
+            "thoughtsTokens": 77777,
+            "totalTokens": 188887,
+        },
+        "promptTokens": 99999,
+        "candidateTokens": 88888,
+        "thoughtsTokens": 77777,
+        "totalTokens": 188887,
+    }
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(fake_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+
+    # Actual provider usage
+    mock_usage = MagicMock()
+    mock_usage.prompt_token_count = 1250
+    mock_usage.candidates_token_count = 820
+    mock_usage.thoughts_token_count = 210
+    mock_usage.total_token_count = 2280
+    mock_response.usage_metadata = mock_usage
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    # Actual provider tokens must be used, NOT Gemini's hallucinated tokens
+    assert notes.usage is not None
+    assert notes.usage.prompt_tokens == 1250
+    assert notes.usage.candidate_tokens == 820
+    assert notes.usage.thoughts_tokens == 210
+    assert notes.usage.total_tokens == 2280
+    assert notes.total_tokens == 2280
+    assert notes.prompt_tokens == 1250
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_ignores_gemini_hallucinated_usage_when_provider_usage_missing(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Missing provider usage results in all usage fields being None even if Gemini generated fake counts."""
+    fake_notes_dict = {
+        **sample_valid_notes_dict,
+        "usage": {
+            "promptTokens": 99999,
+            "candidateTokens": 88888,
+            "thoughtsTokens": 77777,
+            "totalTokens": 188887,
+        },
+        "totalTokens": 188887,
+    }
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(fake_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata = None
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    assert notes.usage is None
+    assert notes.total_tokens is None
+    assert notes.prompt_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.thoughts_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_preserves_missing_components_honestly_and_genuine_zeros(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Provider total tokens with missing component counts preserves None, while genuine zero is preserved as 0."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(sample_valid_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+
+    # prompt_tokens is 0 (genuine 0), candidates_token_count is missing (None), thoughts is 0
+    mock_usage = MagicMock()
+    mock_usage.prompt_token_count = 0
+    mock_usage.candidates_token_count = None
+    mock_usage.thoughts_token_count = 0
+    mock_usage.total_token_count = 500
+    mock_response.usage_metadata = mock_usage
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    assert notes.usage is not None
+    assert notes.usage.total_tokens == 500
+    assert notes.total_tokens == 500
+    assert notes.usage.prompt_tokens == 0
+    assert notes.prompt_tokens == 0
+    assert notes.usage.candidate_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.usage.thoughts_tokens == 0
+    assert notes.thoughts_tokens == 0
 
 
 @pytest.mark.asyncio

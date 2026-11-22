@@ -24,6 +24,7 @@ from app.schemas import (
     ChunkGeneratedNotes,
     ChunkSummary,
     GeneratedNotes,
+    GeneratedNotesContent,
     SynthesizedNotes,
     UsageMetadata,
 )
@@ -199,7 +200,7 @@ Here is the transcript:
 """
 
 
-def parse_and_validate_notes(raw_text: str) -> GeneratedNotes:
+def parse_and_validate_notes(raw_text: str) -> GeneratedNotesContent:
     """Parse raw text from model output, strip markdown code fences, and validate schema."""
     cleaned = raw_text.strip()
     if cleaned.startswith("```json"):
@@ -224,7 +225,7 @@ def parse_and_validate_notes(raw_text: str) -> GeneratedNotes:
         raise MalformedOutputException("AI returned non-object JSON output.")
 
     try:
-        return GeneratedNotes.model_validate(data)
+        return GeneratedNotesContent.model_validate(data)
     except ValidationError as exc:
         logger.error(
             "gemini_schema_validation_failed",
@@ -351,9 +352,9 @@ def parse_and_validate_synthesized_notes(raw_text: str) -> SynthesizedNotesConte
 def extract_usage_metadata(response: Any) -> UsageMetadata:
     """Extract prompt, candidate, thoughts, and total token metrics from Google GenAI SDK response."""
     usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = 0
-    candidate_tokens = 0
-    thoughts_tokens = 0
+    prompt_tokens = None
+    candidate_tokens = None
+    thoughts_tokens = None
     total_tokens = 0
 
     if usage is not None:
@@ -430,7 +431,7 @@ class GeminiNoteGenerator:
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=GeneratedNotes,
+            response_schema=GeneratedNotesContent,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
 
@@ -516,6 +517,15 @@ class GeminiNoteGenerator:
             # Log diagnostic metadata immediately before JSON parsing / validation
             logger.info("gemini_generation_response_received", extra=diagnostic_context)
 
+            usage_meta: UsageMetadata | None = None
+            if usage is not None and total_tokens is not None:
+                usage_meta = UsageMetadata(
+                    prompt_tokens=prompt_tokens,
+                    candidate_tokens=candidate_tokens,
+                    thoughts_tokens=thoughts_tokens,
+                    total_tokens=total_tokens,
+                )
+
             # Handle text extraction failure or absent textual content
             if text_extraction_exc is not None:
                 logger.error(
@@ -533,7 +543,8 @@ class GeminiNoteGenerator:
                     },
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -551,12 +562,17 @@ class GeminiNoteGenerator:
                         "duration_ms": round(duration_ms, 2),
                     },
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             # Attempt parsing and schema validation
             try:
-                notes = parse_and_validate_notes(raw_text)
+                content = parse_and_validate_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_generation_parsing_failed",
                     extra={
@@ -572,6 +588,18 @@ class GeminiNoteGenerator:
                     },
                 )
                 raise
+
+            notes = GeneratedNotes(
+                overview=content.overview,
+                key_concepts=content.key_concepts,
+                detailed_notes=content.detailed_notes,
+                shorthands=content.shorthands,
+                usage=usage_meta,
+                prompt_tokens=usage_meta.prompt_tokens if usage_meta else None,
+                candidate_tokens=usage_meta.candidate_tokens if usage_meta else None,
+                thoughts_tokens=usage_meta.thoughts_tokens if usage_meta else None,
+                total_tokens=usage_meta.total_tokens if usage_meta else None,
+            )
 
             logger.info(
                 "gemini_generation_completed",
@@ -678,7 +706,7 @@ class GeminiNoteGenerator:
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=GeneratedNotes,
+            response_schema=GeneratedNotesContent,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
 
@@ -755,7 +783,8 @@ class GeminiNoteGenerator:
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -763,11 +792,16 @@ class GeminiNoteGenerator:
                     "gemini_chunk_parsing_failed",
                     extra={**diagnostic_context, "exception_category": "MalformedOutputException"},
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             try:
                 notes = parse_and_validate_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_chunk_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(parse_exc).__name__},
@@ -949,7 +983,8 @@ class GeminiNoteGenerator:
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -957,11 +992,16 @@ class GeminiNoteGenerator:
                     "gemini_synthesis_parsing_failed",
                     extra={**diagnostic_context, "exception_category": "MalformedOutputException"},
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             try:
                 synth_data = parse_and_validate_synthesized_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_synthesis_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(parse_exc).__name__},

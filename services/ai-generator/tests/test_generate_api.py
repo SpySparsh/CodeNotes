@@ -60,6 +60,177 @@ def test_generate_notes_success_with_camel_case_contract(
         assert data["shorthands"] == sample_valid_notes_dict["shorthands"]
 
 
+def test_generate_notes_success_with_usage_metadata(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    sample_valid_notes_dict: dict,
+):
+    """POST /api/v1/generate returns 200 with usage metadata and flat token counts."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(sample_valid_notes_dict)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = AsyncMock(
+            prompt_token_count=1250,
+            candidates_token_count=820,
+            thoughts_token_count=210,
+            total_token_count=2280,
+        )
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "In this tutorial we learn interfaces and generics in TypeScript.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "overview" in data
+        assert "keyConcepts" in data
+        assert "detailedNotes" in data
+        assert "shorthands" in data
+        assert "usage" in data
+        assert data["usage"]["promptTokens"] == 1250
+        assert data["usage"]["candidateTokens"] == 820
+        assert data["usage"]["thoughtsTokens"] == 210
+        assert data["usage"]["totalTokens"] == 2280
+        assert data["promptTokens"] == 1250
+        assert data["candidateTokens"] == 820
+        assert data["thoughtsTokens"] == 210
+        assert data["totalTokens"] == 2280
+
+
+def test_generate_notes_success_without_usage_metadata_omits_tokens(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    sample_valid_notes_dict: dict,
+):
+    """POST /api/v1/generate without provider usage omits tokens without fabricating estimates."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(sample_valid_notes_dict)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = None
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "In this tutorial we learn interfaces and generics in TypeScript.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "overview" in data
+        assert "keyConcepts" in data
+        assert "detailedNotes" in data
+        assert "shorthands" in data
+        assert "usage" not in data
+        assert "totalTokens" not in data
+        assert "promptTokens" not in data
+
+
+def test_generate_notes_api_ignores_gemini_fake_usage(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    sample_valid_notes_dict: dict,
+):
+    """POST /api/v1/generate ignores fake usage counts in model output when provider usage is missing."""
+    fake_notes = {
+        **sample_valid_notes_dict,
+        "usage": {"totalTokens": 99999, "promptTokens": 88888},
+        "totalTokens": 99999,
+    }
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(fake_notes)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = None
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "In this tutorial we learn interfaces and generics in TypeScript.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "usage" not in data
+        assert "totalTokens" not in data
+        assert "promptTokens" not in data
+
+
+def test_generate_notes_api_preserves_honest_missing_components(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    sample_valid_notes_dict: dict,
+):
+    """POST /api/v1/generate preserves missing components as absent and genuine 0 as 0."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = json.dumps(sample_valid_notes_dict)
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = AsyncMock(
+            prompt_token_count=0,
+            candidates_token_count=None,
+            thoughts_token_count=None,
+            total_token_count=500,
+        )
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "In this tutorial we learn interfaces and generics in TypeScript.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "usage" in data
+        assert data["usage"]["totalTokens"] == 500
+        assert data["totalTokens"] == 500
+        # Genuine zero is preserved
+        assert data["usage"]["promptTokens"] == 0
+        assert data["promptTokens"] == 0
+        # Missing candidateTokens and thoughtsTokens are omitted by response_model_exclude_none=True
+        assert "candidateTokens" not in data["usage"]
+        assert "candidateTokens" not in data
+        assert "thoughtsTokens" not in data["usage"]
+        assert "thoughtsTokens" not in data
+
+
 def test_generate_notes_with_markdown_fences(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -605,3 +776,79 @@ def test_synthesize_api_unauthorized_without_bearer(client: TestClient):
         },
     )
     assert response.status_code == 401
+
+
+def test_generate_notes_malformed_json_preserves_usage(client: TestClient, auth_headers: dict[str, str]):
+    """When Gemini returns malformed JSON but provides token usage, 502 response preserves verified usage."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        mock_response.text = "{invalid json string"
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_usage = AsyncMock()
+        mock_usage.prompt_token_count = 1200
+        mock_usage.candidates_token_count = 200
+        mock_usage.thoughts_token_count = 20
+        mock_usage.total_token_count = 1420
+        mock_response.usage_metadata = mock_usage
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "Tutorial on TypeScript architecture.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 502
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == ERR_MALFORMED_OUTPUT
+        assert "usage" in data["error"]
+        assert data["error"]["usage"]["promptTokens"] == 1200
+        assert data["error"]["usage"]["candidateTokens"] == 200
+        assert data["error"]["usage"]["thoughtsTokens"] == 20
+        assert data["error"]["usage"]["totalTokens"] == 1420
+
+
+def test_generate_notes_schema_invalid_preserves_usage(client: TestClient, auth_headers: dict[str, str]):
+    """When Gemini returns JSON that violates the schema, 502 response preserves verified usage."""
+    with patch("app.generator.genai.Client") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_response = AsyncMock()
+        # Missing overview and detailedNotes
+        mock_response.text = json.dumps({"keyConcepts": ["Concept 1"], "shorthands": []})
+        mock_response.model_version = "gemini-2.5-flash-001"
+        mock_candidate = AsyncMock()
+        mock_candidate.finish_reason = "STOP"
+        mock_response.candidates = [mock_candidate]
+        mock_usage = AsyncMock()
+        mock_usage.prompt_token_count = 800
+        mock_usage.candidates_token_count = 150
+        mock_usage.thoughts_token_count = None
+        mock_usage.total_token_count = 950
+        mock_response.usage_metadata = mock_usage
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        response = client.post(
+            "/api/v1/generate",
+            headers=auth_headers,
+            json={
+                "transcript": "Tutorial on TypeScript architecture.",
+                "videoTitle": "TypeScript Tutorial",
+            },
+        )
+
+        assert response.status_code == 502
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == ERR_MALFORMED_OUTPUT
+        assert "usage" in data["error"]
+        assert data["error"]["usage"]["promptTokens"] == 800
+        assert data["error"]["usage"]["candidateTokens"] == 150
+        assert data["error"]["usage"]["totalTokens"] == 950

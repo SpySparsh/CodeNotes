@@ -33,6 +33,7 @@ import {
   releaseAbortedDispatch,
   claimOrAdoptDispatchSlot,
   completeDispatchAttempt,
+  settleFailedDispatchUsage,
   reportStaleAttemptOutcome,
   classifyAttemptOutcome,
   DispatchAuthorizationTicket,
@@ -472,15 +473,36 @@ export const generateNotesFunction = inngest.createFunction(
               });
             } catch (err: any) {
               if (slotRes.attemptId && reserveRes.reservationToken) {
-                const outcome = classifyAttemptOutcome(err);
-                await reportStaleAttemptOutcome({
-                  attemptId: slotRes.attemptId,
-                  reservationToken: reserveRes.reservationToken,
-                  workerId,
-                  outcomeStatus: outcome,
-                  errorCode: err?.code || 'MONOLITHIC_AI_FAILURE',
-                  errorMessage: err?.message,
-                }).catch(() => {});
+                if (err?.code === 'MALFORMED_AI_OUTPUT' && err.usageEvidence?.totalTokens !== undefined && reserveRes.leaseToken) {
+                  await settleFailedDispatchUsage({
+                    attemptId: slotRes.attemptId,
+                    reservationToken: reserveRes.reservationToken,
+                    leaseToken: reserveRes.leaseToken,
+                    workerId,
+                    fencingGeneration: reserveRes.generation || 1,
+                    totalTokens: err.usageEvidence.totalTokens,
+                    promptTokens: err.usageEvidence.promptTokens ?? null,
+                    candidateTokens: err.usageEvidence.candidateTokens ?? null,
+                    thoughtsTokens: err.usageEvidence.thoughtsTokens ?? null,
+                    errorCode: 'MALFORMED_OUTPUT',
+                    errorMessage: err?.message,
+                    evidencePayload: err.usageEvidence,
+                  }).catch((settleErr) => {
+                    logger.error('settle_failed_dispatch_usage_error', {
+                      error: settleErr?.message,
+                    });
+                  });
+                } else {
+                  const outcome = classifyAttemptOutcome(err);
+                  await reportStaleAttemptOutcome({
+                    attemptId: slotRes.attemptId,
+                    reservationToken: reserveRes.reservationToken,
+                    workerId,
+                    outcomeStatus: outcome,
+                    errorCode: err?.code || 'MONOLITHIC_AI_FAILURE',
+                    errorMessage: err?.message,
+                  }).catch(() => {});
+                }
               }
               const classification = classifyError(err);
               if (classification.isUnrecoverable) {
@@ -917,7 +939,7 @@ export const generateNotesFunction = inngest.createFunction(
             projectId: 'codenotes',
             quotaScope: DEFAULT_AI_MODEL,
             modelName: DEFAULT_AI_MODEL,
-            estimatedTokens: estimatedTokensPerChunk,
+            estimatedTokens: chunk.estimatedTokens,
           });
 
           if (slotRes.adopted && slotRes.adoptedPayload) {
@@ -949,15 +971,37 @@ export const generateNotesFunction = inngest.createFunction(
             break;
           } catch (genErr: any) {
             if (slotRes.attemptId) {
-              const outcome = classifyAttemptOutcome(genErr);
-              await reportStaleAttemptOutcome({
-                attemptId: slotRes.attemptId,
-                reservationToken,
-                workerId,
-                outcomeStatus: outcome,
-                errorCode: genErr?.code || 'CHUNK_AI_FAILURE',
-                errorMessage: genErr?.message,
-              }).catch(() => {});
+              if (genErr?.code === 'MALFORMED_AI_OUTPUT' && genErr.usageEvidence?.totalTokens !== undefined && leaseToken) {
+                await settleFailedDispatchUsage({
+                  attemptId: slotRes.attemptId,
+                  reservationToken,
+                  leaseToken,
+                  workerId,
+                  fencingGeneration: generation,
+                  totalTokens: genErr.usageEvidence.totalTokens,
+                  promptTokens: genErr.usageEvidence.promptTokens ?? null,
+                  candidateTokens: genErr.usageEvidence.candidateTokens ?? null,
+                  thoughtsTokens: genErr.usageEvidence.thoughtsTokens ?? null,
+                  errorCode: 'MALFORMED_OUTPUT',
+                  errorMessage: genErr?.message,
+                  evidencePayload: genErr.usageEvidence,
+                }).catch((settleErr) => {
+                  logger.error('settle_failed_dispatch_usage_error', {
+                    error: settleErr?.message,
+                  });
+                });
+                throw new NonRetriableError(genErr?.message || 'Chunk AI output was malformed.');
+              } else {
+                const outcome = classifyAttemptOutcome(genErr);
+                await reportStaleAttemptOutcome({
+                  attemptId: slotRes.attemptId,
+                  reservationToken,
+                  workerId,
+                  outcomeStatus: outcome,
+                  errorCode: genErr?.code || 'CHUNK_AI_FAILURE',
+                  errorMessage: genErr?.message,
+                }).catch(() => {});
+              }
             }
             if (genErr?.isRetryable && attempt < 4) {
               logger.warn('inngest_chunk_ai_generation_retry', {
@@ -1179,15 +1223,37 @@ export const generateNotesFunction = inngest.createFunction(
         });
       } catch (err: any) {
         if (synthSlot.attemptId && synthReserve.reservationToken) {
-          const outcome = classifyAttemptOutcome(err);
-          await reportStaleAttemptOutcome({
-            attemptId: synthSlot.attemptId,
-            reservationToken: synthReserve.reservationToken,
-            workerId: synthWorkerId,
-            outcomeStatus: outcome,
-            errorCode: err?.code || 'SYNTHESIS_AI_FAILURE',
-            errorMessage: err?.message,
-          }).catch(() => {});
+          if (err?.code === 'MALFORMED_AI_OUTPUT' && err.usageEvidence?.totalTokens !== undefined && synthReserve.leaseToken) {
+            await settleFailedDispatchUsage({
+              attemptId: synthSlot.attemptId,
+              reservationToken: synthReserve.reservationToken,
+              leaseToken: synthReserve.leaseToken,
+              workerId: synthWorkerId,
+              fencingGeneration: synthReserve.generation || 1,
+              totalTokens: err.usageEvidence.totalTokens,
+              promptTokens: err.usageEvidence.promptTokens ?? null,
+              candidateTokens: err.usageEvidence.candidateTokens ?? null,
+              thoughtsTokens: err.usageEvidence.thoughtsTokens ?? null,
+              errorCode: 'MALFORMED_OUTPUT',
+              errorMessage: err?.message,
+              evidencePayload: err.usageEvidence,
+            }).catch((settleErr) => {
+              logger.error('settle_failed_dispatch_usage_error', {
+                error: settleErr?.message,
+              });
+            });
+            throw new NonRetriableError(err?.message || 'Synthesis AI output was malformed.');
+          } else {
+            const outcome = classifyAttemptOutcome(err);
+            await reportStaleAttemptOutcome({
+              attemptId: synthSlot.attemptId,
+              reservationToken: synthReserve.reservationToken,
+              workerId: synthWorkerId,
+              outcomeStatus: outcome,
+              errorCode: err?.code || 'SYNTHESIS_AI_FAILURE',
+              errorMessage: err?.message,
+            }).catch(() => {});
+          }
         }
         throw err;
       }

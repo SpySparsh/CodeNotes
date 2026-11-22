@@ -69,12 +69,14 @@ vi.mock('@/lib/ai-client', () => ({
     readonly isRetryable: boolean;
     readonly statusCode?: number;
     readonly requestId?: string;
+    readonly usageEvidence?: any;
     constructor(options: {
       code: string;
       message: string;
       isRetryable: boolean;
       statusCode?: number;
       requestId?: string;
+      usageEvidence?: any;
     }) {
       super(options.message);
       this.name = 'AiClientError';
@@ -82,6 +84,7 @@ vi.mock('@/lib/ai-client', () => ({
       this.isRetryable = options.isRetryable;
       this.statusCode = options.statusCode;
       this.requestId = options.requestId;
+      this.usageEvidence = options.usageEvidence;
     }
   },
 }));
@@ -113,6 +116,7 @@ vi.mock('@/lib/quota-client', () => ({
     adopted: false,
   }),
   completeDispatchAttempt: vi.fn().mockResolvedValue({ success: true }),
+  settleFailedDispatchUsage: vi.fn().mockResolvedValue({ success: true, statusCode: 'SUCCESS', settledAt: new Date() }),
   reportStaleAttemptOutcome: vi.fn().mockResolvedValue({ success: true }),
   markReservationDispatching: vi.fn().mockResolvedValue({ success: true }),
   completeChunkAndCommitQuota: vi.fn().mockResolvedValue({ success: true }),
@@ -844,7 +848,7 @@ describe('Inngest generateNotesFunction', () => {
 
     // Prove that NO direct unlinked INSERT INTO notes was executed
     const dbCalls = vi.mocked(db.query).mock.calls;
-    const unlinkedInsertCalls = dbCalls.filter(([sql]: [any]) =>
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
       typeof sql === 'string' &&
       sql.includes('INSERT INTO notes') &&
       !sql.includes('parent_key')
@@ -986,7 +990,75 @@ describe('Inngest generateNotesFunction', () => {
 
     // Prove no unlinked INSERT was called
     const dbCalls = vi.mocked(db.query).mock.calls;
-    const unlinkedInsertCalls = dbCalls.filter(([sql]: [any]) =>
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
+      typeof sql === 'string' &&
+      sql.includes('INSERT INTO notes') &&
+      !sql.includes('parent_key')
+    );
+    expect(unlinkedInsertCalls).toHaveLength(0);
+  });
+
+  it('settles failed dispatch when Gemini succeeds with verified usage but malformed output', async () => {
+    const { step } = createMockStep();
+
+    // Step 1: Claim DB queries
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    // Step 2: Transcript & title
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript for malformed output test',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Malformed Output Title');
+
+    // Step 3: AI Generation throws MALFORMED_AI_OUTPUT with verified usage
+    const verifiedUsage = {
+      promptTokens: 1200,
+      candidateTokens: 200,
+      thoughtsTokens: 20,
+      totalTokens: 1420,
+    };
+    vi.mocked(aiClient.generateAiNotes).mockRejectedValueOnce(
+      new aiClient.AiClientError({
+        code: 'MALFORMED_AI_OUTPUT',
+        message: 'The AI model output could not be parsed into notes format.',
+        isRetryable: false,
+        statusCode: 502,
+        requestId: 'req-malformed-settle',
+        usageEvidence: verifiedUsage,
+      })
+    );
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
+
+    // Proves settleFailedDispatchUsage was called with verified usage evidence
+    expect(quotaClient.settleFailedDispatchUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attemptId: '123e4567-e89b-12d3-a456-426614174001',
+        reservationToken: 'mock-res-token',
+        leaseToken: 'mock-lease-token',
+        totalTokens: 1420,
+        promptTokens: 1200,
+        candidateTokens: 200,
+        thoughtsTokens: 20,
+        errorCode: 'MALFORMED_OUTPUT',
+        evidencePayload: verifiedUsage,
+      })
+    );
+
+    // Proves reportStaleAttemptOutcome was NOT called
+    expect(quotaClient.reportStaleAttemptOutcome).not.toHaveBeenCalled();
+
+    // Proves NO unlinked note was inserted
+    const dbCalls = vi.mocked(db.query).mock.calls;
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
       typeof sql === 'string' &&
       sql.includes('INSERT INTO notes') &&
       !sql.includes('parent_key')

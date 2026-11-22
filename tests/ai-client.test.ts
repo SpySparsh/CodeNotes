@@ -182,6 +182,99 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
       const result = generatedNotesSchema.safeParse(data);
       expect(result.success).toBe(false);
     });
+
+    it('validates a response with actual provider token usage metadata', () => {
+      const dataWithUsage = {
+        ...sampleValidResponse,
+        usage: {
+          promptTokens: 1250,
+          candidateTokens: 820,
+          thoughtsTokens: 210,
+          totalTokens: 2280,
+        },
+        promptTokens: 1250,
+        candidateTokens: 820,
+        thoughtsTokens: 210,
+        totalTokens: 2280,
+      };
+      const parsed = generatedNotesSchema.parse(dataWithUsage);
+      expect(parsed.usage).toEqual({
+        promptTokens: 1250,
+        candidateTokens: 820,
+        thoughtsTokens: 210,
+        totalTokens: 2280,
+      });
+      expect(parsed.totalTokens).toBe(2280);
+      expect(parsed.promptTokens).toBe(1250);
+      expect(parsed.candidateTokens).toBe(820);
+      expect(parsed.thoughtsTokens).toBe(210);
+    });
+
+    it('allows usage and token metrics to be null or undefined', () => {
+      const dataWithNullUsage = {
+        ...sampleValidResponse,
+        usage: null,
+        promptTokens: null,
+        candidateTokens: null,
+        thoughtsTokens: null,
+        totalTokens: null,
+      };
+      const parsed = generatedNotesSchema.parse(dataWithNullUsage);
+      expect(parsed.usage).toBeNull();
+      expect(parsed.totalTokens).toBeNull();
+    });
+
+    it('rejects empty nested usage object {}', () => {
+      const dataWithEmptyUsage = {
+        ...sampleValidResponse,
+        usage: {},
+      };
+      const result = generatedNotesSchema.safeParse(dataWithEmptyUsage);
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects incomplete nested usage object missing totalTokens', () => {
+      const dataMissingTotal = {
+        ...sampleValidResponse,
+        usage: { promptTokens: 100 },
+      };
+      const result = generatedNotesSchema.safeParse(dataMissingTotal);
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts usage with totalTokens only and preserves absent components as undefined', () => {
+      const dataTotalOnly = {
+        ...sampleValidResponse,
+        usage: { totalTokens: 1500 },
+        totalTokens: 1500,
+      };
+      const parsed = generatedNotesSchema.parse(dataTotalOnly);
+      expect(parsed.usage?.totalTokens).toBe(1500);
+      expect(parsed.usage?.promptTokens).toBeUndefined();
+      expect(parsed.usage?.candidateTokens).toBeUndefined();
+      expect(parsed.usage?.thoughtsTokens).toBeUndefined();
+    });
+
+    it('accepts genuine zero component counts in usage metadata', () => {
+      const dataWithZeros = {
+        ...sampleValidResponse,
+        usage: {
+          promptTokens: 0,
+          candidateTokens: 0,
+          thoughtsTokens: 0,
+          totalTokens: 250,
+        },
+        promptTokens: 0,
+        candidateTokens: 0,
+        thoughtsTokens: 0,
+        totalTokens: 250,
+      };
+      const parsed = generatedNotesSchema.parse(dataWithZeros);
+      expect(parsed.usage?.promptTokens).toBe(0);
+      expect(parsed.usage?.candidateTokens).toBe(0);
+      expect(parsed.usage?.thoughtsTokens).toBe(0);
+      expect(parsed.usage?.totalTokens).toBe(250);
+    });
   });
 
   describe('Input Parameter Validation', () => {
@@ -248,6 +341,37 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
       const metricsText = await registry.metrics();
       expect(metricsText).toContain(`codenotes_ai_requests_total{model="${DEFAULT_AI_MODEL}",status="success"} 1`);
       expect(metricsText).toContain(`codenotes_ai_duration_seconds_count{model="${DEFAULT_AI_MODEL}"} 1`);
+    });
+
+    it('returns usage metadata and token counts when provided by FastAPI', async () => {
+      const responseWithUsage = {
+        ...sampleValidResponse,
+        usage: {
+          promptTokens: 1250,
+          candidateTokens: 820,
+          thoughtsTokens: 210,
+          totalTokens: 2280,
+        },
+        promptTokens: 1250,
+        candidateTokens: 820,
+        thoughtsTokens: 210,
+        totalTokens: 2280,
+      };
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(JSON.stringify(responseWithUsage), { status: 200 });
+      });
+
+      const result = await generateAiNotes(mockTranscript, mockTitle);
+      expect(result.usage).toEqual({
+        promptTokens: 1250,
+        candidateTokens: 820,
+        thoughtsTokens: 210,
+        totalTokens: 2280,
+      });
+      expect(result.totalTokens).toBe(2280);
+      expect(result.promptTokens).toBe(1250);
+      expect(result.candidateTokens).toBe(820);
+      expect(result.thoughtsTokens).toBe(210);
     });
   });
 
@@ -1001,6 +1125,107 @@ describe('AI Client Adapter (src/lib/ai-client.ts)', () => {
       expect(span.attributes['http.response.status_code']).toBe(429);
       expect(span.status.code).toBe(SpanStatusCode.ERROR);
       expect(span.status.message).toBe('HTTP 429');
+    });
+  });
+
+  describe('Usage Evidence Preservation on Malformed Output', () => {
+    it('attaches verified usageEvidence on HTTP 502 MALFORMED_OUTPUT', async () => {
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'MALFORMED_OUTPUT',
+              message: 'The AI model output could not be parsed into notes format.',
+              usage: {
+                promptTokens: 1200,
+                candidateTokens: 200,
+                thoughtsTokens: 20,
+                totalTokens: 1420,
+              },
+            },
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      try {
+        await generateAiNotes(mockTranscript, mockTitle, { requestId: 'req-malformed-usage' });
+        expect.unreachable('Should have thrown AiClientError');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(AiClientError);
+        expect(err.code).toBe('MALFORMED_AI_OUTPUT');
+        expect(err.statusCode).toBe(502);
+        expect(err.usageEvidence).toBeDefined();
+        expect(err.usageEvidence).toEqual({
+          promptTokens: 1200,
+          candidateTokens: 200,
+          thoughtsTokens: 20,
+          totalTokens: 1420,
+        });
+      }
+    });
+
+    it('rejects inconsistent usage arithmetic (prompt + candidate + thoughts != total)', async () => {
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'MALFORMED_OUTPUT',
+              message: 'The AI model output could not be parsed into notes format.',
+              usage: {
+                promptTokens: 1000,
+                candidateTokens: 200,
+                thoughtsTokens: 50,
+                totalTokens: 9999, // Inconsistent arithmetic!
+              },
+            },
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      try {
+        await generateAiNotes(mockTranscript, mockTitle, { requestId: 'req-inconsistent-usage' });
+        expect.unreachable('Should have thrown AiClientError');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(AiClientError);
+        expect(err.code).toBe('MALFORMED_AI_OUTPUT');
+        expect(err.usageEvidence).toBeUndefined(); // Inconsistent arithmetic safely rejected
+      }
+    });
+
+    it('attaches verified usageEvidence when HTTP 200 body violates schema but includes usage', async () => {
+      globalThis.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            // Missing overview and detailedNotes
+            keyConcepts: ['Concept 1'],
+            shorthands: [],
+            usage: {
+              promptTokens: 800,
+              candidateTokens: 150,
+              thoughtsTokens: null,
+              totalTokens: 950,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      try {
+        await generateAiNotes(mockTranscript, mockTitle, { requestId: 'req-schema-invalid-usage' });
+        expect.unreachable('Should have thrown AiClientError');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(AiClientError);
+        expect(err.code).toBe('MALFORMED_AI_OUTPUT');
+        expect(err.usageEvidence).toBeDefined();
+        expect(err.usageEvidence).toEqual({
+          promptTokens: 800,
+          candidateTokens: 150,
+          thoughtsTokens: null,
+          totalTokens: 950,
+        });
+      }
     });
   });
 });

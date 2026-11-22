@@ -1,5 +1,7 @@
 """Error codes, custom exceptions, and standardized error responses."""
 
+from typing import Any
+
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -85,12 +87,17 @@ class TimeoutException(ServiceException):
 class MalformedOutputException(ServiceException):
     """Raised when Gemini returns unparseable or schema-violating output."""
 
-    def __init__(self, message: str = "The AI model output could not be parsed into notes format."):
+    def __init__(
+        self,
+        message: str = "The AI model output could not be parsed into notes format.",
+        usage: Any | None = None,
+    ):
         super().__init__(
             code=ERR_MALFORMED_OUTPUT,
             message=message,
             status_code=502,
         )
+        self.usage = usage
 
 
 class UpstreamErrorException(ServiceException):
@@ -106,9 +113,17 @@ class UpstreamErrorException(ServiceException):
 
 def service_exception_handler(_request: Request, exc: ServiceException) -> JSONResponse:
     """Handle custom ServiceException and return sanitized error response."""
+    error_content: dict[str, Any] = {"code": exc.code, "message": exc.message}
+    if isinstance(exc, MalformedOutputException) and exc.usage is not None:
+        if hasattr(exc.usage, "model_dump"):
+            error_content["usage"] = exc.usage.model_dump(by_alias=True)
+        elif isinstance(exc.usage, dict):
+            error_content["usage"] = exc.usage
+        else:
+            error_content["usage"] = getattr(exc.usage, "__dict__", str(exc.usage))
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}},
+        content={"error": error_content},
         headers=exc.headers,
     )
 

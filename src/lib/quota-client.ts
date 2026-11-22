@@ -893,3 +893,60 @@ export async function recoverReservationOwnership(
     newLeaseUntil: row.new_lease_until ? new Date(row.new_lease_until) : null,
   };
 }
+
+export interface SettleFailedDispatchUsageParams {
+  attemptId: string;
+  reservationToken: string;
+  leaseToken: string;
+  workerId: string;
+  fencingGeneration: number;
+  totalTokens: number;
+  promptTokens?: number | null;
+  candidateTokens?: number | null;
+  thoughtsTokens?: number | null;
+  errorCode?: string;
+  errorMessage?: string | null;
+  evidencePayload?: Record<string, any> | null;
+}
+
+export interface SettleFailedDispatchUsageResult {
+  success: boolean;
+  statusCode: string;
+  settledAt: Date | null;
+}
+
+export async function settleFailedDispatchUsage(
+  params: SettleFailedDispatchUsageParams
+): Promise<SettleFailedDispatchUsageResult> {
+  const res = await query(
+    `SELECT success, status_code, settled_at
+     FROM public.settle_failed_dispatch_usage(
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+     )`,
+    [
+      params.attemptId,
+      params.reservationToken,
+      params.leaseToken,
+      params.workerId,
+      params.fencingGeneration,
+      params.totalTokens,
+      params.promptTokens ?? null,
+      params.candidateTokens ?? null,
+      params.thoughtsTokens ?? null,
+      params.errorCode ?? 'MALFORMED_OUTPUT',
+      params.errorMessage ?? null,
+      params.evidencePayload ? JSON.stringify(params.evidencePayload) : null,
+    ]
+  );
+
+  const row = res.rows[0];
+  if (!row) {
+    throw new QuotaError('NO_ROW_RETURNED', 'settle_failed_dispatch_usage returned no rows');
+  }
+
+  return {
+    success: Boolean(row.success),
+    statusCode: row.status_code,
+    settledAt: row.settled_at ? new Date(row.settled_at) : null,
+  };
+}

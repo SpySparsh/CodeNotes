@@ -270,6 +270,7 @@ def create_app() -> FastAPI:
         "/api/v1/generate",
         response_model=GeneratedNotes,
         response_model_by_alias=True,
+        response_model_exclude_none=True,
         responses={
             400: {"model": ErrorResponse, "description": "Bad Request"},
             401: {"model": ErrorResponse, "description": "Unauthorized - Missing/Invalid Token"},

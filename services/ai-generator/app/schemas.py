@@ -46,10 +46,24 @@ class GenerateNotesRequest(BaseModel):
     )
 
 
-class GeneratedNotes(BaseModel):
-    """Structured technical notes produced by Gemini model.
+class UsageMetadata(BaseModel):
+    """Token usage metrics extracted from Gemini response."""
 
-    Serializes using camelCase to preserve 1:1 compatibility with existing TypeScript types.
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    prompt_tokens: int | None = Field(default=None, ge=0, alias="promptTokens", description="Prompt token count.")
+    candidate_tokens: int | None = Field(default=None, ge=0, alias="candidateTokens", description="Candidate token count.")
+    thoughts_tokens: int | None = Field(default=None, ge=0, alias="thoughtsTokens", description="Thoughts/reasoning token count.")
+    total_tokens: int = Field(..., ge=0, alias="totalTokens", description="Total token count.")
+
+
+class GeneratedNotesContent(BaseModel):
+    """Raw structured technical notes produced by Gemini model (content only).
+
+    Excludes usage metadata so Gemini's generation schema cannot be polluted with token metrics.
     """
 
     model_config = ConfigDict(
@@ -84,18 +98,40 @@ class GeneratedNotes(BaseModel):
     )
 
 
-class UsageMetadata(BaseModel):
-    """Token usage metrics extracted from Gemini response."""
+class GeneratedNotes(GeneratedNotesContent):
+    """API response model for monolithic generated notes, including provider usage metadata.
 
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
+    Serializes using camelCase to preserve 1:1 compatibility with existing TypeScript types.
+    """
+
+    usage: UsageMetadata | None = Field(
+        default=None,
+        description="Token usage metadata extracted from Gemini response.",
     )
-
-    prompt_tokens: int = Field(default=0, ge=0, alias="promptTokens", description="Prompt token count.")
-    candidate_tokens: int = Field(default=0, ge=0, alias="candidateTokens", description="Candidate token count.")
-    thoughts_tokens: int = Field(default=0, ge=0, alias="thoughtsTokens", description="Thoughts/reasoning token count.")
-    total_tokens: int = Field(default=0, ge=0, alias="totalTokens", description="Total token count.")
+    prompt_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        alias="promptTokens",
+        description="Prompt token count.",
+    )
+    candidate_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        alias="candidateTokens",
+        description="Candidate token count.",
+    )
+    thoughts_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        alias="thoughtsTokens",
+        description="Thoughts/reasoning token count.",
+    )
+    total_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        alias="totalTokens",
+        description="Total token count.",
+    )
 
 
 class ChunkGenerateRequest(BaseModel):
@@ -180,9 +216,9 @@ class ChunkGeneratedNotes(BaseModel):
         description="List of shorthands, quick tips, or gotchas for this chunk.",
     )
     usage: UsageMetadata = Field(..., description="Token usage metadata.")
-    prompt_tokens: int = Field(default=0, ge=0, alias="promptTokens")
-    candidate_tokens: int = Field(default=0, ge=0, alias="candidateTokens")
-    thoughts_tokens: int = Field(default=0, ge=0, alias="thoughtsTokens")
+    prompt_tokens: int | None = Field(default=None, ge=0, alias="promptTokens")
+    candidate_tokens: int | None = Field(default=None, ge=0, alias="candidateTokens")
+    thoughts_tokens: int | None = Field(default=None, ge=0, alias="thoughtsTokens")
     total_tokens: int = Field(default=0, ge=0, alias="totalTokens")
 
 
@@ -274,9 +310,9 @@ class SynthesizedNotes(BaseModel):
         description="Optional synthesized or combined detailed notes string.",
     )
     usage: UsageMetadata = Field(..., description="Token usage metadata.")
-    prompt_tokens: int = Field(default=0, ge=0, alias="promptTokens")
-    candidate_tokens: int = Field(default=0, ge=0, alias="candidateTokens")
-    thoughts_tokens: int = Field(default=0, ge=0, alias="thoughtsTokens")
+    prompt_tokens: int | None = Field(default=None, ge=0, alias="promptTokens")
+    candidate_tokens: int | None = Field(default=None, ge=0, alias="candidateTokens")
+    thoughts_tokens: int | None = Field(default=None, ge=0, alias="thoughtsTokens")
     total_tokens: int = Field(default=0, ge=0, alias="totalTokens")
 
 
@@ -285,6 +321,7 @@ class ErrorDetail(BaseModel):
 
     code: str = Field(..., description="Machine-readable error code")
     message: str = Field(..., description="Human-readable sanitized error description")
+    usage: UsageMetadata | None = Field(default=None, description="Optional provider token usage metadata")
 
 
 class ErrorResponse(BaseModel):
