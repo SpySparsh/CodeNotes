@@ -54,8 +54,8 @@ describe('Database Privileges & Security Posture Verification', () => {
   });
 
   it('creates partial unique index on public.notes for parent_key', () => {
-    expect(sql).toContain(
-      'CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_parent_key_unique \n    ON public.notes (user_id, parent_key) \n    WHERE parent_key IS NOT NULL;'
+    expect(sql).toMatch(
+      /CREATE\s+UNIQUE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+idx_notes_parent_key_unique\s+ON\s+public\.notes\s*\(\s*user_id\s*,\s*parent_key\s*\)\s+WHERE\s+parent_key\s+IS\s+NOT\s+NULL\s*;/i
     );
   });
 });
