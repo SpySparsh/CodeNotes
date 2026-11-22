@@ -1,8 +1,63 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import crypto from 'crypto';
 import net from 'net';
 
 const uuidv4 = () => crypto.randomUUID();
+
+/**
+ * Strictly parses and validates TEST_DATABASE_URL for live database integration tests.
+ * Enforces exact loopback host 127.0.0.1, port 5433, and database codenotes_staging.
+ * Never leaks credentials in thrown error messages.
+ */
+export function validateLiveDatabaseUrl(rawUrl: string | undefined): {
+  url: string;
+  host: string;
+  port: string;
+  database: string;
+} {
+  if (!rawUrl || rawUrl.trim() === '') {
+    throw new Error('TEST_DATABASE_URL is not set.');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('TEST_DATABASE_URL is not a valid URL.');
+  }
+
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    throw new Error(`TEST_DATABASE_URL must use postgresql: protocol, received: ${parsed.protocol}`);
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname !== '127.0.0.1') {
+    throw new Error(
+      `TEST_DATABASE_URL host "${hostname}" is forbidden. Live database integration tests strictly require host "127.0.0.1".`
+    );
+  }
+
+  const port = parsed.port;
+  if (port !== '5433') {
+    throw new Error(
+      `TEST_DATABASE_URL port "${port || 'default'}" is forbidden. Live database integration tests strictly require port "5433".`
+    );
+  }
+
+  const database = parsed.pathname.replace(/^\//, '');
+  if (database !== 'codenotes_staging') {
+    throw new Error(
+      `TEST_DATABASE_URL database "${database}" is forbidden. Live database integration tests strictly require database "codenotes_staging".`
+    );
+  }
+
+  return {
+    url: rawUrl,
+    host: hostname,
+    port,
+    database,
+  };
+}
 
 async function isPortReachable(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -24,6 +79,65 @@ async function isPortReachable(port: number, host: string): Promise<boolean> {
   });
 }
 
+describe('TEST_DATABASE_URL Strict Validation Contract', () => {
+  it('rejects missing or empty URLs', () => {
+    expect(() => validateLiveDatabaseUrl(undefined)).toThrow(/TEST_DATABASE_URL is not set/);
+    expect(() => validateLiveDatabaseUrl('')).toThrow(/TEST_DATABASE_URL is not set/);
+    expect(() => validateLiveDatabaseUrl('   ')).toThrow(/TEST_DATABASE_URL is not set/);
+  });
+
+  it('rejects non-postgres protocols', () => {
+    expect(() => validateLiveDatabaseUrl('http://127.0.0.1:5433/codenotes_staging')).toThrow(
+      /must use postgresql: protocol/i
+    );
+    expect(() => validateLiveDatabaseUrl('mysql://127.0.0.1:5433/codenotes_staging')).toThrow(
+      /must use postgresql: protocol/i
+    );
+  });
+
+  it('rejects remote or non-127.0.0.1 hostnames (including localhost and remote Supabase)', () => {
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@localhost:5433/codenotes_staging')
+    ).toThrow(/host "localhost" is forbidden/i);
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@db.supabase.co:5433/codenotes_staging')
+    ).toThrow(/host "db.supabase.co" is forbidden/i);
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@192.168.1.50:5433/codenotes_staging')
+    ).toThrow(/host "192.168.1.50" is forbidden/i);
+  });
+
+  it('rejects non-5433 ports', () => {
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@127.0.0.1:5432/codenotes_staging')
+    ).toThrow(/port "5432" is forbidden/i);
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@127.0.0.1/codenotes_staging')
+    ).toThrow(/port "default" is forbidden/i);
+  });
+
+  it('rejects unapproved database names', () => {
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@127.0.0.1:5433/postgres')
+    ).toThrow(/database "postgres" is forbidden/i);
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@127.0.0.1:5433/codenotes_test')
+    ).toThrow(/database "codenotes_test" is forbidden/i);
+    expect(() =>
+      validateLiveDatabaseUrl('postgresql://phase1v_admin:secret@127.0.0.1:5433/codenotes_prod')
+    ).toThrow(/database "codenotes_prod" is forbidden/i);
+  });
+
+  it('accepts strictly valid 127.0.0.1:5433/codenotes_staging without exposing credentials in error paths', () => {
+    const res = validateLiveDatabaseUrl(
+      'postgresql://phase1v_admin:test_password@127.0.0.1:5433/codenotes_staging'
+    );
+    expect(res.host).toBe('127.0.0.1');
+    expect(res.port).toBe('5433');
+    expect(res.database).toBe('codenotes_staging');
+  });
+});
+
 describe('Gap 4: Application-to-Database Live Integration', () => {
   let hasLiveDb = false;
   let query: any;
@@ -35,28 +149,118 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
   let reportStaleAttemptOutcome: any;
   let recoverReservationOwnership: any;
 
-  beforeAll(async () => {
-    hasLiveDb = await isPortReachable(5433, '127.0.0.1');
-    if (hasLiveDb) {
-      process.env.DATABASE_URL =
-        'postgresql://phase1v_admin:AEqDdhYtEK5zmnQz24AYn6bQskIBT7ng0_Pz_vFT8qY@127.0.0.1:5433/codenotes_disposable_val2';
-      const db = await import('@/lib/db');
-      const qc = await import('@/lib/quota-client');
-      query = db.query;
-      getPool = db.getPool;
-      withUserTransaction = db.withUserTransaction;
-      reserveQuota = qc.reserveQuota;
-      claimOrAdoptDispatchSlot = qc.claimOrAdoptDispatchSlot;
-      completeDispatchAttempt = qc.completeDispatchAttempt;
-      reportStaleAttemptOutcome = qc.reportStaleAttemptOutcome;
-      recoverReservationOwnership = qc.recoverReservationOwnership;
+  // Unique run identifier namespaces every generated key in this test process
+  const runId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const trackedParentKeys = new Set<string>();
+
+  function createTestParentKey(suffix: string): string {
+    const key = `key-app-${runId}-${suffix}-${Date.now()}`;
+    trackedParentKeys.add(key);
+    return key;
+  }
+
+  /**
+   * Deterministic bottom-up cleanup respecting foreign key constraints:
+   * 1. notes
+   * 2. rate_limit_events
+   * 3. reconciliation_authorizations
+   * 4. rate_limit_dispatch_attempts
+   * 5. chunk_generations
+   * 6. rate_limit_reservations
+   * 7. generation_idempotency
+   * Deletes only records created by this test run's trackedParentKeys.
+   */
+  async function cleanupTrackedRecords() {
+    if (!hasLiveDb || trackedParentKeys.size === 0 || !query) return;
+    const keys = Array.from(trackedParentKeys);
+    try {
+      await query(`DELETE FROM public.notes WHERE parent_key = ANY($1::text[])`, [keys]);
+      await query(
+        `DELETE FROM public.rate_limit_events WHERE reservation_token IN (
+           SELECT reservation_token FROM public.rate_limit_reservations WHERE parent_key = ANY($1::text[])
+         )`,
+        [keys]
+      );
+      await query(
+        `DELETE FROM public.reconciliation_authorizations WHERE reservation_token IN (
+           SELECT reservation_token FROM public.rate_limit_reservations WHERE parent_key = ANY($1::text[])
+         )`,
+        [keys]
+      );
+      await query(
+        `DELETE FROM public.rate_limit_dispatch_attempts WHERE reservation_token IN (
+           SELECT reservation_token FROM public.rate_limit_reservations WHERE parent_key = ANY($1::text[])
+         )`,
+        [keys]
+      );
+      await query(`DELETE FROM public.chunk_generations WHERE parent_key = ANY($1::text[])`, [keys]);
+      await query(`DELETE FROM public.rate_limit_reservations WHERE parent_key = ANY($1::text[])`, [keys]);
+      await query(`DELETE FROM public.generation_idempotency WHERE key = ANY($1::text[])`, [keys]);
+    } catch (err: any) {
+      console.error('Failed to cleanup live test run records:', err?.message);
     }
+  }
+
+  beforeAll(async () => {
+    // Live database tests strictly require TEST_DATABASE_URL to be set
+    const rawUrl = process.env.TEST_DATABASE_URL?.trim();
+    if (!rawUrl) {
+      // Offline mode: skip live DB operations even if port 5433 is listening
+      hasLiveDb = false;
+      return;
+    }
+
+    const validated = validateLiveDatabaseUrl(rawUrl);
+    const reachable = await isPortReachable(Number(validated.port), validated.host);
+    if (!reachable) {
+      throw new Error(`Target ${validated.host}:${validated.port} is unreachable.`);
+    }
+
+    process.env.DATABASE_URL = validated.url;
+    hasLiveDb = true;
+
+    const db = await import('@/lib/db');
+    const qc = await import('@/lib/quota-client');
+    query = db.query;
+    getPool = db.getPool;
+    withUserTransaction = db.withUserTransaction;
+    reserveQuota = qc.reserveQuota;
+    claimOrAdoptDispatchSlot = qc.claimOrAdoptDispatchSlot;
+    completeDispatchAttempt = qc.completeDispatchAttempt;
+    reportStaleAttemptOutcome = qc.reportStaleAttemptOutcome;
+    recoverReservationOwnership = qc.recoverReservationOwnership;
+  });
+
+  afterEach(async () => {
+    // Reliable cleanup runs after every test regardless of pass or fail
+    await cleanupTrackedRecords();
   });
 
   afterAll(async () => {
-    if (hasLiveDb && getPool) {
-      const pool = getPool();
-      await pool.end();
+    try {
+      await cleanupTrackedRecords();
+      // Verify no records leaked from this test run
+      if (hasLiveDb && query && trackedParentKeys.size > 0) {
+        const keys = Array.from(trackedParentKeys);
+        const check = await query(
+          `SELECT
+             (SELECT count(*) FROM public.notes WHERE parent_key = ANY($1::text[])) as notes_cnt,
+             (SELECT count(*) FROM public.rate_limit_reservations WHERE parent_key = ANY($1::text[])) as res_cnt,
+             (SELECT count(*) FROM public.generation_idempotency WHERE key = ANY($1::text[])) as idemp_cnt`,
+          [keys]
+        );
+        const { notes_cnt, res_cnt, idemp_cnt } = check.rows[0];
+        if (Number(notes_cnt) > 0 || Number(res_cnt) > 0 || Number(idemp_cnt) > 0) {
+          throw new Error(
+            `Cleanup leaked test records! notes=${notes_cnt}, reservations=${res_cnt}, idemp=${idemp_cnt}`
+          );
+        }
+      }
+    } finally {
+      if (hasLiveDb && getPool) {
+        const pool = getPool();
+        await pool.end();
+      }
     }
   });
 
@@ -72,7 +276,7 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
 
     const testUserId = uuidv4();
     const modelName = 'gemini-2.5-flash';
-    const parentKey = `key-app-mono-${Date.now()}`;
+    const parentKey = createTestParentKey('mono');
     const videoId = 'vid-app-001';
 
     await query(
@@ -167,7 +371,7 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
 
     const testUserId = uuidv4();
     const testUserBId = uuidv4();
-    const parentKey = `key-app-iso-${Date.now()}`;
+    const parentKey = createTestParentKey('iso');
     const videoId = 'vid-app-iso';
     const noteId = uuidv4();
 
@@ -204,7 +408,7 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
 
     const testUserId = uuidv4();
     const modelName = 'gemini-2.5-flash';
-    const parentKey = `key-app-adapt-${Date.now()}`;
+    const parentKey = createTestParentKey('adapt');
     const videoId = 'vid-app-adapt';
 
     await query(
@@ -277,7 +481,7 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
 
     const testUserId = uuidv4();
     const modelName = 'gemini-2.5-flash';
-    const parentKey = `key-app-rec-${Date.now()}`;
+    const parentKey = createTestParentKey('rec');
     const videoId = 'vid-app-rec';
 
     await query(
@@ -324,7 +528,7 @@ describe('Gap 4: Application-to-Database Live Integration', () => {
 
     const testUserId = uuidv4();
     const modelName = 'gemini-2.5-flash';
-    const parentKey = `key-app-stale-${Date.now()}`;
+    const parentKey = createTestParentKey('stale');
     const videoId = 'vid-app-stale';
 
     await query(
