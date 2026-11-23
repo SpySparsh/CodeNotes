@@ -3,12 +3,12 @@
 import io
 import json
 import logging
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.genai import errors as genai_errors
 
-from app.errors import RateLimitedException, UpstreamErrorException
+from app.errors import RateLimitedException
 from app.generator import (
     GeminiNoteGenerator,
     extract_api_error_diagnostics,
@@ -18,14 +18,13 @@ from app.main import (
     ALLOWLISTED_LOG_FIELDS,
     SafeJsonFormatter,
     _sanitize_log_value,
-    setup_logging,
 )
 from app.schemas import ChunkSummary
-
 
 # -----------------------------------------------------------------------------
 # 1. QuotaFailure with Quota Metric
 # -----------------------------------------------------------------------------
+
 
 def test_extract_quota_failure_with_metric():
     """Extracts violations from google.rpc.QuotaFailure including subject and description."""
@@ -62,6 +61,7 @@ def test_extract_quota_failure_with_metric():
 # -----------------------------------------------------------------------------
 # 2. ErrorInfo with Quota Metadata
 # -----------------------------------------------------------------------------
+
 
 def test_extract_error_info_with_quota_metadata():
     """Extracts reason and allowlisted metadata from google.rpc.ErrorInfo while ignoring arbitrary keys."""
@@ -102,6 +102,7 @@ def test_extract_error_info_with_quota_metadata():
 # -----------------------------------------------------------------------------
 # 3. RetryInfo with Duration String and Object
 # -----------------------------------------------------------------------------
+
 
 def test_extract_retry_info_duration_string():
     """Extracts retryDelay string from google.rpc.RetryInfo."""
@@ -147,6 +148,7 @@ def test_extract_retry_info_duration_object():
 # 4. HTTP Retry-After Header
 # -----------------------------------------------------------------------------
 
+
 def test_extract_http_retry_after_header():
     """Extracts Retry-After header from underlying HTTP response object."""
     mock_response = MagicMock()
@@ -181,6 +183,7 @@ def test_extract_http_retry_after_header_case_insensitive():
 # 5. Missing Details
 # -----------------------------------------------------------------------------
 
+
 def test_extract_missing_details():
     """Handles empty response JSON without crashing."""
     exc = genai_errors.APIError(code=429, response_json={})
@@ -198,6 +201,7 @@ def test_extract_missing_details():
 # -----------------------------------------------------------------------------
 # 6. Malformed Details
 # -----------------------------------------------------------------------------
+
 
 def test_extract_malformed_details_non_dict_and_non_list():
     """Handles non-dict and non-list details payloads gracefully."""
@@ -223,6 +227,7 @@ def test_extract_malformed_details_non_dict_and_non_list():
 # -----------------------------------------------------------------------------
 # 7. Unexpected Detail Types
 # -----------------------------------------------------------------------------
+
 
 def test_extract_unexpected_detail_types():
     """Ignores unfamiliar detail protobuf types without failing."""
@@ -255,6 +260,7 @@ def test_extract_unexpected_detail_types():
 # 8. Non-429 API Errors
 # -----------------------------------------------------------------------------
 
+
 def test_extract_non_429_api_errors():
     """Extracts status and message from 503 or 500 API errors."""
     error_payload = {
@@ -276,6 +282,7 @@ def test_extract_non_429_api_errors():
 # -----------------------------------------------------------------------------
 # 9. Confirmation: No Secrets or Raw Response Logged
 # -----------------------------------------------------------------------------
+
 
 def test_sanitize_diagnostic_string_redacts_api_keys():
     """Sanitizer redacts Gemini API keys and Bearer tokens."""
@@ -364,6 +371,7 @@ async def test_logs_include_diagnostics_without_leaking_secrets_or_transcripts(c
 # 10. Confirmation: Client-Facing Error Response Unchanged
 # -----------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_client_facing_rate_limited_response_unchanged():
     """Client receives the exact same RateLimitedException semantics and message."""
@@ -412,6 +420,7 @@ async def test_client_facing_rate_limited_response_unchanged():
 # -----------------------------------------------------------------------------
 # 11. Edge-Case Extraction Tests
 # -----------------------------------------------------------------------------
+
 
 def test_extract_retry_info_zero_seconds_nonzero_nanos():
     """Extracts duration string when seconds is 0 and nanos is nonzero."""
@@ -484,6 +493,7 @@ def test_extract_unexpected_inputs_to_extractor():
 # -----------------------------------------------------------------------------
 # 12. SafeJsonFormatter Stdout Formatting Tests
 # -----------------------------------------------------------------------------
+
 
 def test_safe_json_formatter_ordinary_log_format():
     """Ordinary application log preserves timestamp, level, logger, message without extra fields."""
@@ -737,7 +747,7 @@ async def test_actual_stdout_capture_during_gemini_429():
         with pytest.raises(RateLimitedException):
             await generator.generate_chunk(chunk_text="Chunk text", video_title="Video")
 
-        lines = [json.loads(l) for l in stream.getvalue().strip().splitlines() if l.strip()]
+        lines = [json.loads(line) for line in stream.getvalue().strip().splitlines() if line.strip()]
         assert len(lines) == 2
 
         # 1. Started event
@@ -765,6 +775,7 @@ async def test_actual_stdout_capture_during_gemini_429():
 # 15. Message Sanitization Tests (Fix 1)
 # -----------------------------------------------------------------------------
 
+
 def test_safe_json_formatter_redacts_secret_in_message():
     """Secrets embedded directly inside record.msg or record.getMessage() are redacted."""
     stream = io.StringIO()
@@ -786,7 +797,7 @@ def test_safe_json_formatter_redacts_secret_in_message():
     assert secret_key not in raw_output
     assert "eyJhbGci" not in raw_output
 
-    lines = [json.loads(l) for l in raw_output.strip().splitlines() if l.strip()]
+    lines = [json.loads(line) for line in raw_output.strip().splitlines() if line.strip()]
     assert len(lines) == 2
     assert lines[0]["message"] == "Failed to connect using API key: [REDACTED]"
     assert lines[1]["message"] == "Authorization header contains: [REDACTED]"
@@ -872,8 +883,10 @@ def test_safe_json_formatter_formatting_error_cannot_expose_unsanitized_message(
 
     # Case 2: Fatal error during fallback json.dumps
     with pytest.MonkeyPatch.context() as mp:
+
         def crashing_dumps(*args, **kwargs):
             raise RuntimeError("Fatal serialization crash")
+
         mp.setattr(json, "dumps", crashing_dumps)
 
         fatal_output = formatter.format(record_bad_args)
@@ -883,6 +896,7 @@ def test_safe_json_formatter_formatting_error_cannot_expose_unsanitized_message(
 # -----------------------------------------------------------------------------
 # 16. Operational Telemetry Tests (Fix 2)
 # -----------------------------------------------------------------------------
+
 
 def test_safe_json_formatter_operational_telemetry_included():
     """Operational token telemetry, finish_reason, and character counts appear in emitted JSON while unapproved fields remain excluded."""
@@ -962,12 +976,14 @@ async def test_actual_stdout_capture_during_successful_generation():
 
     try:
         mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "overview": "Overview of chunk",
-            "keyConcepts": ["Concept A", "Concept B"],
-            "detailedNotes": "Detailed notes markdown",
-            "shorthands": ["Tip 1"],
-        })
+        mock_response.text = json.dumps(
+            {
+                "overview": "Overview of chunk",
+                "keyConcepts": ["Concept A", "Concept B"],
+                "detailedNotes": "Detailed notes markdown",
+                "shorthands": ["Tip 1"],
+            }
+        )
         mock_response.model_version = "gemini-2.5-flash-preview"
 
         mock_candidate = MagicMock()
@@ -994,8 +1010,8 @@ async def test_actual_stdout_capture_during_successful_generation():
         )
         assert result.overview == "Overview of chunk"
 
-        lines = [json.loads(l) for l in stream.getvalue().strip().splitlines() if l.strip()]
-        completed_logs = [l for l in lines if l.get("message") == "gemini_chunk_generation_completed"]
+        lines = [json.loads(line) for line in stream.getvalue().strip().splitlines() if line.strip()]
+        completed_logs = [entry for entry in lines if entry.get("message") == "gemini_chunk_generation_completed"]
         assert len(completed_logs) == 1
         comp = completed_logs[0]
 
@@ -1019,6 +1035,7 @@ async def test_actual_stdout_capture_during_successful_generation():
 # -----------------------------------------------------------------------------
 # 17. Bounded Collection Consumption & Non-Throwing Fallback Tests
 # -----------------------------------------------------------------------------
+
 
 def test_sanitize_log_value_bounds_collection_consumption():
     """Confirms no more than 25 items are consumed from large or instrumented collections."""
@@ -1069,6 +1086,7 @@ def test_safe_json_formatter_fallback_handles_timestamp_failure():
 
     # Force formatTime to raise an exception
     with pytest.MonkeyPatch.context() as mp:
+
         def crashing_format_time(*args, **kwargs):
             raise ValueError("Corrupted time attribute")
 
@@ -1081,6 +1099,3 @@ def test_safe_json_formatter_fallback_handles_timestamp_failure():
         assert parsed["logger"] == "test.broken_timestamp"
         assert parsed["message"] == "Operational warning with bad timestamp"
         assert "timestamp" not in parsed
-
-
-

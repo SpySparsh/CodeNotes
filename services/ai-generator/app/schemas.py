@@ -55,8 +55,12 @@ class UsageMetadata(BaseModel):
     )
 
     prompt_tokens: int | None = Field(default=None, ge=0, alias="promptTokens", description="Prompt token count.")
-    candidate_tokens: int | None = Field(default=None, ge=0, alias="candidateTokens", description="Candidate token count.")
-    thoughts_tokens: int | None = Field(default=None, ge=0, alias="thoughtsTokens", description="Thoughts/reasoning token count.")
+    candidate_tokens: int | None = Field(
+        default=None, ge=0, alias="candidateTokens", description="Candidate token count."
+    )
+    thoughts_tokens: int | None = Field(
+        default=None, ge=0, alias="thoughtsTokens", description="Thoughts/reasoning token count."
+    )
     total_tokens: int = Field(..., ge=0, alias="totalTokens", description="Total token count.")
 
 

@@ -35,31 +35,33 @@ from app.schemas import (
 )
 
 # Explicitly allowlisted diagnostic and operational fields for JSON logging
-ALLOWLISTED_LOG_FIELDS = frozenset({
-    # Diagnostic error fields
-    "status_code",
-    "grpc_status",
-    "error_message",
-    "quota_failures",
-    "error_info",
-    "retry_delay",
-    "retry_after_header",
-    # Request & execution context
-    "request_id",
-    "model",
-    "chunk_index",
-    "total_chunks",
-    "timeout_ms",
-    "duration_ms",
-    # Operational telemetry & token accounting
-    "prompt_tokens",
-    "candidate_tokens",
-    "thoughts_tokens",
-    "total_tokens",
-    "finish_reason",
-    "transcript_chars",
-    "output_chars",
-})
+ALLOWLISTED_LOG_FIELDS = frozenset(
+    {
+        # Diagnostic error fields
+        "status_code",
+        "grpc_status",
+        "error_message",
+        "quota_failures",
+        "error_info",
+        "retry_delay",
+        "retry_after_header",
+        # Request & execution context
+        "request_id",
+        "model",
+        "chunk_index",
+        "total_chunks",
+        "timeout_ms",
+        "duration_ms",
+        # Operational telemetry & token accounting
+        "prompt_tokens",
+        "candidate_tokens",
+        "thoughts_tokens",
+        "total_tokens",
+        "finish_reason",
+        "transcript_chars",
+        "output_chars",
+    }
+)
 
 SENSITIVE_KEY_PATTERN = re.compile(r"(AIza[0-9A-Za-z-_]{35}|Bearer\s+[A-Za-z0-9_\-\.]+)", re.IGNORECASE)
 
