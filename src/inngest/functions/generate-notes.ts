@@ -1033,7 +1033,7 @@ export const generateNotesFunction = inngest.createFunction(
 
         // 4. Complete Chunk and Commit Quota (Attempt Ledger & Chunk Generations)
         if (lastAttemptId) {
-          await completeDispatchAttempt({
+          const compRes = await completeDispatchAttempt({
             attemptId: lastAttemptId,
             reservationToken,
             leaseToken,
@@ -1051,32 +1051,36 @@ export const generateNotesFunction = inngest.createFunction(
             candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
             thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
             modelName: DEFAULT_AI_MODEL,
-          }).catch(() => {});
-        }
+          });
 
-        const commitRes = await completeChunkAndCommitQuota({
-          userId,
-          parentKey: idempotencyKey,
-          chunkIndex: chunk.chunkIndex,
-          reservationToken,
-          leaseToken,
-          workerId,
-          fencingGeneration: generation,
-          chunkNotes: {
-            overview: chunkNotes.overview,
-            keyConcepts: chunkNotes.keyConcepts,
-            detailedNotes: chunkNotes.detailedNotes,
-            shorthands: chunkNotes.shorthands,
-          },
-          totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
-          promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
-          candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
-          thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
-          modelName: DEFAULT_AI_MODEL,
-        });
+          if (!compRes.success && compRes.statusCode !== 'ALREADY_COMPLETED') {
+            throw new Error(`Complete chunk dispatch attempt failed: ${compRes.statusCode}`);
+          }
+        } else {
+          const commitRes = await completeChunkAndCommitQuota({
+            userId,
+            parentKey: idempotencyKey,
+            chunkIndex: chunk.chunkIndex,
+            reservationToken,
+            leaseToken,
+            workerId,
+            fencingGeneration: generation,
+            chunkNotes: {
+              overview: chunkNotes.overview,
+              keyConcepts: chunkNotes.keyConcepts,
+              detailedNotes: chunkNotes.detailedNotes,
+              shorthands: chunkNotes.shorthands,
+            },
+            totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
+            promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
+            candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
+            thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
+            modelName: DEFAULT_AI_MODEL,
+          });
 
-        if (!commitRes.success) {
-          throw new Error(`Complete chunk and commit quota failed: ${commitRes.statusCode}`);
+          if (!commitRes.success) {
+            throw new Error(`Complete chunk and commit quota failed: ${commitRes.statusCode}`);
+          }
         }
 
         logger.info('inngest_chunk_committed_successfully', {
