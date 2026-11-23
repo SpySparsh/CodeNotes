@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   turbopack: {
-    root: __dirname,
+    root: process.env.VERCEL || process.env.CI ? __dirname : path.resolve(__dirname, '..'),
   },
   serverExternalPackages: [
     'inngest',
