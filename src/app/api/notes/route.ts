@@ -13,7 +13,7 @@ import {
 } from '@/lib/validations/notes';
 import { withSentryRouteSpan, withSentryChildSpan } from '@/lib/sentry-tracing';
 
-export async function GET(request?: Request) {
+export async function GET(request: Request) {
   return withSentryRouteSpan(
     { name: 'GET /api/notes', method: 'GET', route: '/api/notes' },
     async (span) => {

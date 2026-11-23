@@ -4,7 +4,7 @@ import { logger } from '@/lib/logger';
 import { getRequestId } from '@/lib/request-context';
 import { recordHttpRequest } from '@/lib/metrics';
 
-export async function GET(request?: Request) {
+export async function GET(request: Request) {
   const startTime = performance.now();
   const requestId = getRequestId(request);
 

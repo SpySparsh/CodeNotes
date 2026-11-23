@@ -155,7 +155,7 @@ describe('Prometheus Metrics Layer', () => {
     recordTranscriptRequest('cache_hit', 'success');
     recordAiRequest('gemini-2.5-flash', 'success');
 
-    const response = await getMetrics();
+    const response = await getMetrics(new Request('http://localhost/api/metrics'));
 
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe(registry.contentType);
