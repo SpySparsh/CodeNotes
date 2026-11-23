@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration:rls": "vitest run --config vitest.integration.config.ts",
+    "test:staging": "vitest run --config vitest.staging.config.ts",
     "validate:observability": "vitest run tests/observability-config.test.ts",
     "test:fastapi-boundary": "node scripts/verify-fastapi-boundary.mjs",
     "test:e2e": "node scripts/run-e2e.js",
