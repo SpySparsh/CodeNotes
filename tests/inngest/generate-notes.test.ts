@@ -27,6 +27,7 @@ import {
 import * as transcript from '@/lib/transcript';
 import * as gemini from '@/lib/gemini';
 import * as aiClient from '@/lib/ai-client';
+import * as quotaClient from '@/lib/quota-client';
 import * as db from '@/lib/db';
 import { registry } from '@/lib/metrics';
 
@@ -38,7 +39,7 @@ vi.mock('@/lib/transcript', () => ({
   }),
   acquireTranscript: vi.fn(),
   fetchTranscript: vi.fn(),
-  extractVideoTitle: vi.fn(),
+  extractVideoTitle: vi.fn().mockResolvedValue('Unknown Video'),
   extractVideoId: vi.fn((url: string) => {
     const match = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
     return match ? match[1] : null;
@@ -60,17 +61,22 @@ vi.mock('@/lib/transcript', () => ({
 
 vi.mock('@/lib/ai-client', () => ({
   generateAiNotes: vi.fn(),
+  DEFAULT_AI_MODEL: 'gemini-1.5-flash',
+  generateChunkAiNotes: vi.fn(),
+  synthesizeSectionNotes: vi.fn(),
   AiClientError: class AiClientError extends Error {
     readonly code: string;
     readonly isRetryable: boolean;
     readonly statusCode?: number;
     readonly requestId?: string;
+    readonly usageEvidence?: any;
     constructor(options: {
       code: string;
       message: string;
       isRetryable: boolean;
       statusCode?: number;
       requestId?: string;
+      usageEvidence?: any;
     }) {
       super(options.message);
       this.name = 'AiClientError';
@@ -78,6 +84,7 @@ vi.mock('@/lib/ai-client', () => ({
       this.isRetryable = options.isRetryable;
       this.statusCode = options.statusCode;
       this.requestId = options.requestId;
+      this.usageEvidence = options.usageEvidence;
     }
   },
 }));
@@ -85,6 +92,39 @@ vi.mock('@/lib/ai-client', () => ({
 vi.mock('@/lib/gemini', () => ({
   generateNotes: vi.fn(),
   generateNotesFromVideoUrl: vi.fn(),
+}));
+
+vi.mock('@/lib/quota-client', () => ({
+  reserveQuota: vi.fn().mockResolvedValue({
+    allowed: true,
+    reservationToken: 'mock-res-token',
+    leaseToken: 'mock-lease-token',
+    generation: 1,
+    leaseExpiry: new Date(Date.now() + 60000),
+  }),
+  claimOrAdoptDispatchSlot: vi.fn().mockResolvedValue({
+    allowed: true,
+    statusCode: 'GRANTED',
+    attemptId: '123e4567-e89b-12d3-a456-426614174001',
+    attemptNumber: 1,
+    generation: 1,
+    ticket: {
+      consume: vi.fn(),
+      attemptId: '123e4567-e89b-12d3-a456-426614174001',
+      operationType: 'monolithic',
+    },
+    adopted: false,
+  }),
+  completeDispatchAttempt: vi.fn().mockResolvedValue({ success: true }),
+  settleFailedDispatchUsage: vi.fn().mockResolvedValue({ success: true, statusCode: 'SUCCESS', settledAt: new Date() }),
+  reportStaleAttemptOutcome: vi.fn().mockResolvedValue({ success: true }),
+  markReservationDispatching: vi.fn().mockResolvedValue({ success: true }),
+  completeChunkAndCommitQuota: vi.fn().mockResolvedValue({ success: true }),
+  releaseQuotaReservation: vi.fn().mockResolvedValue({ success: true }),
+  releaseAbortedDispatch: vi.fn().mockResolvedValue({ success: true }),
+  recoverReservationOwnership: vi.fn().mockResolvedValue({ recovered: true }),
+  QuotaError: class QuotaError extends Error {},
+  isRateLimitExceeded: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('@/lib/db', () => {
@@ -284,6 +324,7 @@ describe('Inngest generateNotesFunction', () => {
       keyConcepts: ['Concept 1', 'Concept 2'],
       detailedNotes: '# Detailed Notes',
       shorthands: ['Shorthand 1'],
+      usage: { promptTokens: 1000, candidateTokens: 200, thoughtsTokens: 0, totalTokens: 1200 },
     };
 
     // Step 1: Claim DB queries (SELECT then UPDATE lease)
@@ -308,17 +349,13 @@ describe('Inngest generateNotesFunction', () => {
     // Step 3: AI Generation via FastAPI service
     vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
 
-    // Step 4: withUserTransaction queries (check lock -> insert note -> update completed)
+    // Step 4: withUserTransaction queries (check lock -> verify completed)
     vi.mocked(db.query).mockResolvedValueOnce({
       rows: [{ status: 'processing', note_id: null }],
       rowCount: 1,
     } as any);
     vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [],
-      rowCount: 1,
-    } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({
-      rows: [],
+      rows: [{ status: 'completed', note_id: 'mock-note-id-1' }],
       rowCount: 1,
     } as any);
 
@@ -337,6 +374,7 @@ describe('Inngest generateNotesFunction', () => {
 
     expect(db.withUserTransaction).toHaveBeenCalledWith(mockUserId, expect.any(Function));
     expect(aiClient.generateAiNotes).toHaveBeenCalledWith(
+      expect.objectContaining({ attemptId: expect.any(String) }),
       mockTranscript,
       mockTitle,
       expect.objectContaining({
@@ -369,14 +407,14 @@ describe('Inngest generateNotesFunction', () => {
       keyConcepts: ['Concept'],
       detailedNotes: 'Notes',
       shorthands: ['Short'],
+      usage: { promptTokens: 1000, candidateTokens: 200, thoughtsTokens: 0, totalTokens: 1200 },
     });
 
     vi.mocked(db.query).mockResolvedValueOnce({
       rows: [{ status: 'processing', note_id: null, created_at: new Date(Date.now() - 5000).toISOString() }],
       rowCount: 1,
     } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'completed', note_id: 'mock-note-id-2' }], rowCount: 1 } as any);
 
     const fnHandler = (generateNotesFunction as any).fn;
     await fnHandler({ event: mockEvent, step });
@@ -442,6 +480,17 @@ describe('Inngest generateNotesFunction', () => {
             },
             generationMethod: 'transcript',
             transcriptProvider: 'supadata',
+            attemptId: '123e4567-e89b-12d3-a456-426614174001',
+            reservationToken: 'res-token-memoized',
+            leaseToken: 'lease-token-memoized',
+            workerId: 'worker-memoized',
+            generation: 1,
+            usage: {
+              promptTokens: 1000,
+              candidateTokens: 200,
+              thoughtsTokens: 0,
+              totalTokens: 1200,
+            },
           };
         }
         // Only step 4 executes the actual callback
@@ -453,8 +502,7 @@ describe('Inngest generateNotesFunction', () => {
       rows: [{ status: 'processing', note_id: null, created_at: new Date(Date.now() - 3000).toISOString() }],
       rowCount: 1,
     } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'completed', note_id: 'mock-note-id-4' }], rowCount: 1 } as any);
 
     const fnHandler = (generateNotesFunction as any).fn;
     await fnHandler({ event: mockEvent, step: memoizedStep });
@@ -541,6 +589,7 @@ describe('Inngest generateNotesFunction', () => {
       keyConcepts: ['Concept 1'],
       detailedNotes: '# Detailed Notes',
       shorthands: ['Shorthand 1'],
+      usage: { promptTokens: 1000, candidateTokens: 200, thoughtsTokens: 0, totalTokens: 1200 },
     };
 
     // User A Generation (Cache Miss -> Acquired)
@@ -556,8 +605,7 @@ describe('Inngest generateNotesFunction', () => {
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
     vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'completed', note_id: 'note-a' }] } as any);
 
     const fnHandler = (generateNotesFunction as any).fn;
     const resA = await fnHandler({
@@ -581,8 +629,7 @@ describe('Inngest generateNotesFunction', () => {
     vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce(sharedTitle);
     vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce(mockAiNotes);
     vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'processing', note_id: null }] } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
-    vi.mocked(db.query).mockResolvedValueOnce({ rows: [] } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ status: 'completed', note_id: 'note-b' }] } as any);
 
     const resB = await fnHandler({
       event: { name: 'notes/generate.requested', data: { userId: userB, idempotencyKey: 'key-b', videoId: mockVideoId, videoUrl: mockVideoUrl } },
@@ -753,5 +800,269 @@ describe('Inngest generateNotesFunction', () => {
 
     // Sentry error capture must NOT be invoked for successfully replayed jobs
     expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it('regression: fails monolithic generation cleanly without publishing unlinked note if completeDispatchAttempt fails', async () => {
+    const { step } = createMockStep();
+
+    // Step 1: Claim DB queries
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    // Step 2: Transcript & title
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript for regression test',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Regression Title');
+
+    // Step 3: AI Generation
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce({
+      overview: 'Overview',
+      keyConcepts: ['Concept'],
+      detailedNotes: 'Notes',
+      shorthands: ['Short'],
+      usage: { promptTokens: 1000, candidateTokens: 200, thoughtsTokens: 0, totalTokens: 1200 },
+    });
+
+    // completeDispatchAttempt fails in Step 3 / Step 4
+    vi.mocked(quotaClient.completeDispatchAttempt).mockResolvedValue({
+      success: false,
+      statusCode: 'LOCK_TIMEOUT',
+      completedAt: null,
+    } as any);
+
+    // Step 4: withUserTransaction query 1 (check lock returns processing)
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null }],
+      rowCount: 1,
+    } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
+
+    // Prove that NO direct unlinked INSERT INTO notes was executed
+    const dbCalls = vi.mocked(db.query).mock.calls;
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
+      typeof sql === 'string' &&
+      sql.includes('INSERT INTO notes') &&
+      !sql.includes('parent_key')
+    );
+    expect(unlinkedInsertCalls).toHaveLength(0);
+  });
+
+  it('regression: fails monolithic generation when actual provider usage metadata is missing', async () => {
+    const { step } = createMockStep();
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript without token usage',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Title');
+
+    // AI response missing usage and totalTokens
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce({
+      overview: 'Overview',
+      keyConcepts: ['Concept'],
+      detailedNotes: 'Notes',
+      shorthands: ['Short'],
+    });
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(
+      /USAGE_METADATA_MISSING/
+    );
+
+    // completeDispatchAttempt must NOT have been called with fabricated zero usage
+    expect(quotaClient.completeDispatchAttempt).not.toHaveBeenCalled();
+  });
+
+  it('regression: fails monolithic generation recovery when fencing identity or worker identity is missing', async () => {
+    // Simulate memoized replay where generate-ai-notes returned an object missing generation fencing token
+    const stepMissingFencing = {
+      run: vi.fn(async (stepId: string, fn: () => Promise<any>) => {
+        if (stepId === 'claim-generation-processing') {
+          return { claimed: true, noteId: null };
+        }
+        if (stepId === 'fetch-transcript-and-title') {
+          return {
+            resolvedVideoId: mockVideoId,
+            videoTitle: 'Title',
+            transcriptText: 'Transcript',
+            transcriptProvider: 'supadata',
+          };
+        }
+        if (stepId === 'generate-ai-notes') {
+          return {
+            aiNotes: {
+              overview: 'Overview',
+              keyConcepts: ['Concept'],
+              detailedNotes: 'Notes',
+              shorthands: ['Short'],
+            },
+            generationMethod: 'transcript',
+            transcriptProvider: 'supadata',
+            attemptId: '123e4567-e89b-12d3-a456-426614174001',
+            reservationToken: 'mock-res-token',
+            leaseToken: 'mock-lease-token',
+            workerId: 'worker-1',
+            generation: undefined, // MISSING fencing generation!
+            usage: { totalTokens: 500, promptTokens: 400, candidateTokens: 100, thoughtsTokens: 0 },
+          };
+        }
+        return await fn();
+      }),
+    };
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null }],
+      rowCount: 1,
+    } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step: stepMissingFencing })).rejects.toThrow(
+      /FENCING_IDENTITY_MISSING/
+    );
+
+    // completeDispatchAttempt must NOT have been called with defaulted generation 1
+    expect(quotaClient.completeDispatchAttempt).not.toHaveBeenCalled();
+  });
+
+  it('regression: fails monolithic generation when completion verification does not observe completed status and non-null note_id', async () => {
+    const { step } = createMockStep();
+
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Title');
+
+    vi.mocked(aiClient.generateAiNotes).mockResolvedValueOnce({
+      overview: 'Overview',
+      keyConcepts: ['Concept'],
+      detailedNotes: 'Notes',
+      shorthands: ['Short'],
+      usage: { totalTokens: 1200, promptTokens: 1000, candidateTokens: 200, thoughtsTokens: 0 },
+    });
+
+    vi.mocked(quotaClient.completeDispatchAttempt).mockResolvedValue({
+      success: true,
+      statusCode: 'COMPLETED',
+    } as any);
+
+    // Step 4: withUserTransaction query 1 (check lock returns processing)
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null }],
+      rowCount: 1,
+    } as any);
+
+    // Step 4: verification query returns status 'processing' with null note_id
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'processing', note_id: null }],
+      rowCount: 1,
+    } as any);
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(
+      /PERSIST_VERIFICATION_FAILED/
+    );
+
+    // Prove no unlinked INSERT was called
+    const dbCalls = vi.mocked(db.query).mock.calls;
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
+      typeof sql === 'string' &&
+      sql.includes('INSERT INTO notes') &&
+      !sql.includes('parent_key')
+    );
+    expect(unlinkedInsertCalls).toHaveLength(0);
+  });
+
+  it('settles failed dispatch when Gemini succeeds with verified usage but malformed output', async () => {
+    const { step } = createMockStep();
+
+    // Step 1: Claim DB queries
+    vi.mocked(db.query).mockResolvedValueOnce({
+      rows: [{ status: 'pending', note_id: null, lease_until: null }],
+      rowCount: 1,
+    } as any);
+    vi.mocked(db.query).mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+    // Step 2: Transcript & title
+    vi.mocked(transcript.acquireTranscript).mockResolvedValueOnce({
+      text: 'Transcript for malformed output test',
+      videoId: mockVideoId,
+      provider: 'supadata',
+      cached: false,
+    });
+    vi.mocked(transcript.extractVideoTitle).mockResolvedValueOnce('Malformed Output Title');
+
+    // Step 3: AI Generation throws MALFORMED_AI_OUTPUT with verified usage
+    const verifiedUsage = {
+      promptTokens: 1200,
+      candidateTokens: 200,
+      thoughtsTokens: 20,
+      totalTokens: 1420,
+    };
+    vi.mocked(aiClient.generateAiNotes).mockRejectedValueOnce(
+      new aiClient.AiClientError({
+        code: 'MALFORMED_AI_OUTPUT',
+        message: 'The AI model output could not be parsed into notes format.',
+        isRetryable: false,
+        statusCode: 502,
+        requestId: 'req-malformed-settle',
+        usageEvidence: verifiedUsage,
+      })
+    );
+
+    const fnHandler = (generateNotesFunction as any).fn;
+    await expect(fnHandler({ event: mockEvent, step })).rejects.toThrow(NonRetriableError);
+
+    // Proves settleFailedDispatchUsage was called with verified usage evidence
+    expect(quotaClient.settleFailedDispatchUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attemptId: '123e4567-e89b-12d3-a456-426614174001',
+        reservationToken: 'mock-res-token',
+        leaseToken: 'mock-lease-token',
+        totalTokens: 1420,
+        promptTokens: 1200,
+        candidateTokens: 200,
+        thoughtsTokens: 20,
+        errorCode: 'MALFORMED_OUTPUT',
+        evidencePayload: verifiedUsage,
+      })
+    );
+
+    // Proves reportStaleAttemptOutcome was NOT called
+    expect(quotaClient.reportStaleAttemptOutcome).not.toHaveBeenCalled();
+
+    // Proves NO unlinked note was inserted
+    const dbCalls = vi.mocked(db.query).mock.calls;
+    const unlinkedInsertCalls = dbCalls.filter(([sql]) =>
+      typeof sql === 'string' &&
+      sql.includes('INSERT INTO notes') &&
+      !sql.includes('parent_key')
+    );
+    expect(unlinkedInsertCalls).toHaveLength(0);
   });
 });

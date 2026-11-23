@@ -9,9 +9,11 @@ from app.schemas import (
     ChunkGeneratedNotes,
     ChunkGenerateRequest,
     GeneratedNotes,
+    GeneratedNotesContent,
     GenerateNotesRequest,
     SynthesizedNotes,
     SynthesizeRequest,
+    UsageMetadata,
 )
 
 
@@ -333,3 +335,95 @@ def test_synthesized_notes_serializes_with_table_of_contents():
     assert dumped["usage"]["thoughtsTokens"] == 120
     assert dumped["thoughtsTokens"] == 120
     assert dumped["totalTokens"] == 2620
+
+
+def test_generated_notes_serializes_with_usage_metadata():
+    """GeneratedNotes must serialize to camelCase and include usage + flat token metrics when present."""
+    data = {
+        "overview": "Overview of video.",
+        "keyConcepts": ["Concept 1", "Concept 2"],
+        "detailedNotes": "# Detailed Notes\n\nContent here.",
+        "shorthands": ["Tip 1"],
+        "usage": {
+            "promptTokens": 1250,
+            "candidateTokens": 820,
+            "thoughtsTokens": 210,
+            "totalTokens": 2280,
+        },
+        "promptTokens": 1250,
+        "candidateTokens": 820,
+        "thoughtsTokens": 210,
+        "totalTokens": 2280,
+    }
+    notes = GeneratedNotes.model_validate(data)
+    dumped = notes.model_dump(by_alias=True)
+
+    assert dumped["overview"] == "Overview of video."
+    assert dumped["keyConcepts"] == ["Concept 1", "Concept 2"]
+    assert dumped["detailedNotes"] == "# Detailed Notes\n\nContent here."
+    assert dumped["shorthands"] == ["Tip 1"]
+    assert dumped["usage"]["promptTokens"] == 1250
+    assert dumped["usage"]["candidateTokens"] == 820
+    assert dumped["usage"]["thoughtsTokens"] == 210
+    assert dumped["usage"]["totalTokens"] == 2280
+    assert dumped["promptTokens"] == 1250
+    assert dumped["candidateTokens"] == 820
+    assert dumped["thoughtsTokens"] == 210
+    assert dumped["totalTokens"] == 2280
+
+
+def test_generated_notes_without_usage_leaves_usage_none():
+    """GeneratedNotes without usage leaves usage None and exclude_none omits token fields."""
+    data = {
+        "overview": "Overview of video.",
+        "keyConcepts": ["Concept 1"],
+        "detailedNotes": "Detailed Notes.",
+        "shorthands": ["Tip 1"],
+    }
+    notes = GeneratedNotes.model_validate(data)
+    assert notes.usage is None
+    assert notes.total_tokens is None
+    assert notes.prompt_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.thoughts_tokens is None
+
+    dumped_clean = notes.model_dump(by_alias=True, exclude_none=True)
+    assert "usage" not in dumped_clean
+    assert "totalTokens" not in dumped_clean
+    assert "promptTokens" not in dumped_clean
+
+
+def test_gemini_generation_schema_excludes_usage_metadata():
+    """Gemini generation schema (GeneratedNotesContent) must strictly contain only content fields."""
+    schema = GeneratedNotesContent.model_json_schema()
+    props = schema.get("properties", {})
+    assert set(props.keys()) == {"overview", "keyConcepts", "detailedNotes", "shorthands"}
+    assert "usage" not in props
+    assert "promptTokens" not in props
+    assert "candidateTokens" not in props
+    assert "thoughtsTokens" not in props
+    assert "totalTokens" not in props
+    assert "UsageMetadata" not in schema.get("$defs", {})
+
+
+def test_usage_metadata_preserves_none_components_honestly():
+    """UsageMetadata preserves absent component counts as None rather than coercing to zero."""
+    usage = UsageMetadata(total_tokens=100)
+    assert usage.total_tokens == 100
+    assert usage.prompt_tokens is None
+    assert usage.candidate_tokens is None
+    assert usage.thoughts_tokens is None
+
+
+def test_usage_metadata_preserves_genuine_zero_counts():
+    """UsageMetadata preserves genuine zero component counts as 0."""
+    usage = UsageMetadata(
+        total_tokens=100,
+        prompt_tokens=0,
+        candidate_tokens=0,
+        thoughts_tokens=0,
+    )
+    assert usage.total_tokens == 100
+    assert usage.prompt_tokens == 0
+    assert usage.candidate_tokens == 0
+    assert usage.thoughts_tokens == 0

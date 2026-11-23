@@ -68,7 +68,8 @@ describe('GET /api/health', () => {
       fields: [],
     } as any);
 
-    const response = await GET();
+    const request = new Request('http://localhost:3000/api/health');
+    const response = await GET(request);
     expect(response.status).toBe(200);
 
     const body = await response.json();
@@ -91,7 +92,8 @@ describe('GET /api/health', () => {
       fields: [],
     } as any);
 
-    const response = await GET();
+    const request = new Request('http://localhost:3000/api/health');
+    const response = await GET(request);
     expect(response.status).toBe(200);
 
     const body = await response.json();
@@ -105,7 +107,8 @@ describe('GET /api/health', () => {
 
     vi.mocked(db.query).mockRejectedValueOnce(new Error('Connection refused'));
 
-    const response = await GET();
+    const request = new Request('http://localhost:3000/api/health');
+    const response = await GET(request);
     expect(response.status).toBe(503);
     expect(response.headers.get('x-request-id')).toBeDefined();
 

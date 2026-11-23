@@ -240,7 +240,7 @@ describe('Log Privacy Remediation & Leakage Prevention', () => {
     it('health endpoint returns 200 with minimal status without credentials or internal details', async () => {
       vi.mocked(db.query).mockResolvedValueOnce({ rows: [{ '?column?': 1 }] } as any);
 
-      const response = await getHealth();
+      const response = await getHealth(new Request('http://localhost/api/health'));
       expect(response.status).toBe(200);
 
       const body = await response.json();
@@ -266,7 +266,7 @@ describe('Log Privacy Remediation & Leakage Prevention', () => {
         envRecord.METRICS_SECRET = 'test-secret-value-123';
 
         // Missing Authorization header
-        const resNoAuth = await getMetrics();
+        const resNoAuth = await getMetrics(new Request('http://localhost/api/metrics'));
         expect(resNoAuth.status).toBe(401);
 
         // Invalid token

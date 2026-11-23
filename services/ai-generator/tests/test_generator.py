@@ -28,7 +28,7 @@ from app.schemas import ChunkSummary
 
 
 def test_build_prompt_preserves_exact_requirements():
-    """Prompt must include Technical Content Architect persona and all three functional requirements."""
+    """Prompt must include Technical Content Architect persona and all functional requirements."""
     prompt = build_prompt(transcript="Tutorial content on React hooks", video_title="React Hooks Masterclass")
 
     assert 'titled "React Hooks Masterclass"' in prompt
@@ -36,6 +36,7 @@ def test_build_prompt_preserves_exact_requirements():
     assert "1. **Structure First:**" in prompt
     assert "2. **Contextual Code Mapping:**" in prompt
     assert "3. **Comparison Tables:**" in prompt
+    assert "4. **Original Synthesis:**" in prompt
     assert "Tutorial content on React hooks" in prompt
     assert "==================" in prompt
 
@@ -282,6 +283,15 @@ async def test_diagnostics_records_stop_response_metadata(
         )
 
     assert notes.overview == sample_valid_notes_dict["overview"]
+    assert notes.usage is not None
+    assert notes.usage.prompt_tokens == 1250
+    assert notes.usage.candidate_tokens == 820
+    assert notes.usage.thoughts_tokens == 210
+    assert notes.usage.total_tokens == 2280
+    assert notes.prompt_tokens == 1250
+    assert notes.candidate_tokens == 820
+    assert notes.thoughts_tokens == 210
+    assert notes.total_tokens == 2280
 
     # Locate gemini_generation_response_received log record
     received_record = next(
@@ -290,7 +300,7 @@ async def test_diagnostics_records_stop_response_metadata(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-diag-stop"
-    assert received_record.model == "gemini-1.5-flash"
+    assert received_record.model == "gemini-3.5-flash-lite"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "STOP"
     assert received_record.prompt_tokens == 1250
@@ -299,6 +309,164 @@ async def test_diagnostics_records_stop_response_metadata(
     assert received_record.total_tokens == 2280
     assert received_record.raw_response_chars == len(mock_response.text)
     assert received_record.duration_ms > 0
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_omits_usage_when_provider_metadata_absent(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """When provider response omits usage_metadata, notes.usage is None and no tokens are fabricated."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(sample_valid_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata = None
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture and patterns.",
+        video_title="TypeScript Masterclass",
+        request_id="test-req-no-usage",
+    )
+
+    assert notes.overview == sample_valid_notes_dict["overview"]
+    assert notes.usage is None
+    assert notes.total_tokens is None
+    assert notes.prompt_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.thoughts_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_ignores_gemini_hallucinated_usage_when_provider_usage_present(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Gemini-generated fake nested and flat usage fields in JSON text are strictly ignored."""
+    fake_notes_dict = {
+        **sample_valid_notes_dict,
+        "usage": {
+            "promptTokens": 99999,
+            "candidateTokens": 88888,
+            "thoughtsTokens": 77777,
+            "totalTokens": 188887,
+        },
+        "promptTokens": 99999,
+        "candidateTokens": 88888,
+        "thoughtsTokens": 77777,
+        "totalTokens": 188887,
+    }
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(fake_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+
+    # Actual provider usage
+    mock_usage = MagicMock()
+    mock_usage.prompt_token_count = 1250
+    mock_usage.candidates_token_count = 820
+    mock_usage.thoughts_token_count = 210
+    mock_usage.total_token_count = 2280
+    mock_response.usage_metadata = mock_usage
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    # Actual provider tokens must be used, NOT Gemini's hallucinated tokens
+    assert notes.usage is not None
+    assert notes.usage.prompt_tokens == 1250
+    assert notes.usage.candidate_tokens == 820
+    assert notes.usage.thoughts_tokens == 210
+    assert notes.usage.total_tokens == 2280
+    assert notes.total_tokens == 2280
+    assert notes.prompt_tokens == 1250
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_ignores_gemini_hallucinated_usage_when_provider_usage_missing(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Missing provider usage results in all usage fields being None even if Gemini generated fake counts."""
+    fake_notes_dict = {
+        **sample_valid_notes_dict,
+        "usage": {
+            "promptTokens": 99999,
+            "candidateTokens": 88888,
+            "thoughtsTokens": 77777,
+            "totalTokens": 188887,
+        },
+        "totalTokens": 188887,
+    }
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(fake_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata = None
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    assert notes.usage is None
+    assert notes.total_tokens is None
+    assert notes.prompt_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.thoughts_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_generate_notes_preserves_missing_components_honestly_and_genuine_zeros(
+    mock_gemini_client, sample_valid_notes_dict: dict
+):
+    """Provider total tokens with missing component counts preserves None, while genuine zero is preserved as 0."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(sample_valid_notes_dict)
+    mock_response.model_version = "gemini-2.5-flash-001"
+    mock_candidate = MagicMock()
+    mock_candidate.finish_reason = types.FinishReason.STOP
+    mock_response.candidates = [mock_candidate]
+
+    # prompt_tokens is 0 (genuine 0), candidates_token_count is missing (None), thoughts is 0
+    mock_usage = MagicMock()
+    mock_usage.prompt_token_count = 0
+    mock_usage.candidates_token_count = None
+    mock_usage.thoughts_token_count = 0
+    mock_usage.total_token_count = 500
+    mock_response.usage_metadata = mock_usage
+
+    mock_gemini_client.aio.models.generate_content.return_value = mock_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    notes = await generator.generate_notes(
+        transcript="Tutorial on TypeScript architecture.",
+        video_title="TypeScript Masterclass",
+    )
+
+    assert notes.usage is not None
+    assert notes.usage.total_tokens == 500
+    assert notes.total_tokens == 500
+    assert notes.usage.prompt_tokens == 0
+    assert notes.prompt_tokens == 0
+    assert notes.usage.candidate_tokens is None
+    assert notes.candidate_tokens is None
+    assert notes.usage.thoughts_tokens == 0
+    assert notes.thoughts_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -575,7 +743,7 @@ async def test_diagnostics_records_metadata_when_no_usable_text_candidate(
     )
     assert received_record is not None
     assert received_record.request_id == "test-req-no-text-sdk-response"
-    assert received_record.model == "gemini-1.5-flash"
+    assert received_record.model == "gemini-3.5-flash-lite"
     assert received_record.model_version == "gemini-2.5-flash-001"
     assert received_record.finish_reason == "SAFETY"
     assert received_record.prompt_tokens == 1800
@@ -652,6 +820,70 @@ async def test_diagnostics_handles_text_accessor_exception_safely(mock_gemini_cl
     assert failed_record.raw_response_chars == 0
 
 
+@pytest.mark.asyncio
+async def test_diagnostics_records_metadata_when_recitation_finish_reason(
+    mock_gemini_client, caplog: pytest.LogCaptureFixture
+):
+    """Verifies FinishReason.RECITATION is safely handled, raises MalformedOutputException, and preserves diagnostics."""
+    sdk_response = types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=types.FinishReason.RECITATION,
+                # Content is omitted by provider on recitation
+            )
+        ],
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=978,
+            candidates_token_count=0,
+            thoughts_token_count=0,
+            total_token_count=978,
+        ),
+        model_version="gemini-2.5-flash-001",
+    )
+
+    mock_gemini_client.aio.models.generate_content.return_value = sdk_response
+
+    generator = GeminiNoteGenerator(client=mock_gemini_client)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(MalformedOutputException) as exc_info:
+            await generator.generate_notes(
+                transcript="Transcript that triggered Google copyright recitation filter.",
+                video_title="Fireship JavaScript in 100 Seconds",
+                request_id="test-req-recitation-safely-handled",
+            )
+
+    assert "no usable text" in exc_info.value.message.lower()
+
+    # 1. Verify pre-parse response received event captured finish_reason and usage
+    received_record = next(
+        (r for r in caplog.records if r.message == "gemini_generation_response_received"),
+        None,
+    )
+    assert received_record is not None
+    assert received_record.request_id == "test-req-recitation-safely-handled"
+    assert received_record.model == "gemini-3.5-flash-lite"
+    assert received_record.finish_reason == "RECITATION"
+    assert received_record.prompt_tokens == 978
+    assert received_record.candidate_tokens == 0
+    assert received_record.thoughts_tokens == 0
+    assert received_record.total_tokens == 978
+    assert received_record.raw_response_chars == 0
+
+    # 2. Verify parsing failure structured event captured finish reason and usage
+    failed_record = next(
+        (r for r in caplog.records if r.message == "gemini_generation_parsing_failed"),
+        None,
+    )
+    assert failed_record is not None
+    assert failed_record.request_id == "test-req-recitation-safely-handled"
+    assert failed_record.exception_category == "MalformedOutputException"
+    assert failed_record.finish_reason == "RECITATION"
+    assert failed_record.prompt_tokens == 978
+    assert failed_record.candidate_tokens == 0
+    assert failed_record.total_tokens == 978
+    assert failed_record.raw_response_chars == 0
+
+
 def test_build_chunk_prompt_includes_section_indices():
     """build_chunk_prompt must include section indices and tutorial title."""
     prompt = build_chunk_prompt(
@@ -662,6 +894,7 @@ def test_build_chunk_prompt_includes_section_indices():
     )
     assert 'titled "FastAPI Mastery"' in prompt
     assert "Section 3 of 10" in prompt
+    assert "4. **Original Synthesis:**" in prompt
     assert "Chunk transcript content." in prompt
 
 

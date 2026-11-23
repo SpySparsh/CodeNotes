@@ -3,21 +3,112 @@ import crypto from 'crypto';
 import { logger } from '@/lib/logger';
 import { recordAiRequest, recordAiDuration } from '@/lib/metrics';
 import { withSpan, SpanStatusCode, sanitizeErrorMessage, createSafeSpan, type Span } from '@/lib/tracing';
+import { DispatchAuthorizationTicket } from '@/lib/quota-client';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
-export const DEFAULT_AI_MODEL = 'gemini-1.5-flash';
+export const DEFAULT_AI_MODEL = 'gemini-3.5-flash-lite';
 
 /**
  * Token usage metadata extracted from Gemini responses.
  */
 export const usageMetadataSchema = z.object({
-  promptTokens: z.number().int().nonnegative().default(0),
-  candidateTokens: z.number().int().nonnegative().default(0),
-  thoughtsTokens: z.number().int().nonnegative().default(0),
-  totalTokens: z.number().int().nonnegative().default(0),
+  promptTokens: z.number().int().nonnegative().nullish(),
+  candidateTokens: z.number().int().nonnegative().nullish(),
+  thoughtsTokens: z.number().int().nonnegative().nullish(),
+  totalTokens: z.number().int().nonnegative(),
 });
 
 export type UsageMetadata = z.infer<typeof usageMetadataSchema>;
+
+/**
+ * Token usage evidence extracted from FastAPI error payloads or responses.
+ */
+export interface UsageEvidencePayload {
+  totalTokens: number;
+  promptTokens?: number | null;
+  candidateTokens?: number | null;
+  thoughtsTokens?: number | null;
+}
+
+/**
+ * Validates raw provider usage evidence against arithmetic consistency and sanity bounds.
+ */
+export function extractUsageEvidence(rawUsage: any): UsageEvidencePayload | undefined {
+  if (!rawUsage || typeof rawUsage !== 'object') {
+    return undefined;
+  }
+
+  const totalTokens =
+    typeof rawUsage.totalTokens === 'number'
+      ? rawUsage.totalTokens
+      : (typeof rawUsage.total_tokens === 'number' ? rawUsage.total_tokens : undefined);
+
+  if (
+    typeof totalTokens !== 'number' ||
+    !Number.isInteger(totalTokens) ||
+    totalTokens < 0 ||
+    totalTokens > 20000000
+  ) {
+    return undefined;
+  }
+
+  const promptTokens =
+    typeof rawUsage.promptTokens === 'number'
+      ? rawUsage.promptTokens
+      : (typeof rawUsage.prompt_tokens === 'number' ? rawUsage.prompt_tokens : null);
+
+  const candidateTokens =
+    typeof rawUsage.candidateTokens === 'number'
+      ? rawUsage.candidateTokens
+      : (typeof rawUsage.candidate_tokens === 'number' ? rawUsage.candidate_tokens : null);
+
+  const thoughtsTokens =
+    typeof rawUsage.thoughtsTokens === 'number'
+      ? rawUsage.thoughtsTokens
+      : (typeof rawUsage.thoughts_tokens === 'number' ? rawUsage.thoughts_tokens : null);
+
+  // Negative component checks
+  if (
+    (promptTokens !== null && (!Number.isInteger(promptTokens) || promptTokens < 0)) ||
+    (candidateTokens !== null && (!Number.isInteger(candidateTokens) || candidateTokens < 0)) ||
+    (thoughtsTokens !== null && (!Number.isInteger(thoughtsTokens) || thoughtsTokens < 0))
+  ) {
+    return undefined;
+  }
+
+  // Component ceiling checks
+  if (
+    (promptTokens !== null && promptTokens > totalTokens) ||
+    (candidateTokens !== null && candidateTokens > totalTokens) ||
+    (thoughtsTokens !== null && thoughtsTokens > totalTokens)
+  ) {
+    return undefined;
+  }
+
+  // Arithmetic consistency checks:
+  const p = promptTokens ?? 0;
+  const c = candidateTokens ?? 0;
+  const th = thoughtsTokens ?? 0;
+
+  if (promptTokens !== null && candidateTokens !== null && thoughtsTokens !== null) {
+    // Case A: Complete components -> must equal totalTokens
+    if (p + c + th !== totalTokens) {
+      return undefined;
+    }
+  } else {
+    // Case B: Partial components -> sum cannot exceed totalTokens
+    if (p + c + th > totalTokens) {
+      return undefined;
+    }
+  }
+
+  return {
+    totalTokens,
+    promptTokens,
+    candidateTokens,
+    thoughtsTokens,
+  };
+}
 
 /**
  * Runtime Zod schema validating the structured notes contract returned by FastAPI.
@@ -28,6 +119,11 @@ export const generatedNotesSchema = z.object({
   keyConcepts: z.array(z.string()),
   detailedNotes: z.string().min(1, 'detailedNotes is required and must not be empty'),
   shorthands: z.array(z.string()),
+  usage: usageMetadataSchema.nullish(),
+  promptTokens: z.number().int().nonnegative().nullish(),
+  candidateTokens: z.number().int().nonnegative().nullish(),
+  thoughtsTokens: z.number().int().nonnegative().nullish(),
+  totalTokens: z.number().int().nonnegative().nullish(),
 });
 
 export type GeneratedNotes = z.infer<typeof generatedNotesSchema>;
@@ -41,10 +137,10 @@ export const chunkGeneratedNotesSchema = z.object({
   detailedNotes: z.string().min(1, 'detailedNotes is required and must not be empty'),
   shorthands: z.array(z.string()).default([]),
   usage: usageMetadataSchema,
-  promptTokens: z.number().int().nonnegative().default(0),
-  candidateTokens: z.number().int().nonnegative().default(0),
-  thoughtsTokens: z.number().int().nonnegative().default(0),
-  totalTokens: z.number().int().nonnegative().default(0),
+  promptTokens: z.number().int().nonnegative().nullish(),
+  candidateTokens: z.number().int().nonnegative().nullish(),
+  thoughtsTokens: z.number().int().nonnegative().nullish(),
+  totalTokens: z.number().int().nonnegative(),
 });
 
 export type ChunkGeneratedNotes = z.infer<typeof chunkGeneratedNotesSchema>;
@@ -71,10 +167,10 @@ export const synthesizedNotesSchema = z.object({
   shorthands: z.array(z.string()).default([]),
   detailedNotes: z.string().nullable().optional(),
   usage: usageMetadataSchema,
-  promptTokens: z.number().int().nonnegative().default(0),
-  candidateTokens: z.number().int().nonnegative().default(0),
-  thoughtsTokens: z.number().int().nonnegative().default(0),
-  totalTokens: z.number().int().nonnegative().default(0),
+  promptTokens: z.number().int().nonnegative().nullish(),
+  candidateTokens: z.number().int().nonnegative().nullish(),
+  thoughtsTokens: z.number().int().nonnegative().nullish(),
+  totalTokens: z.number().int().nonnegative(),
 });
 
 export type SynthesizedNotes = z.infer<typeof synthesizedNotesSchema>;
@@ -98,6 +194,7 @@ export class AiClientError extends Error {
   readonly isRetryable: boolean;
   readonly statusCode?: number;
   readonly requestId?: string;
+  readonly usageEvidence?: UsageEvidencePayload;
 
   constructor(options: {
     code: string;
@@ -106,6 +203,7 @@ export class AiClientError extends Error {
     statusCode?: number;
     requestId?: string;
     cause?: unknown;
+    usageEvidence?: UsageEvidencePayload;
   }) {
     super(options.message);
     this.name = 'AiClientError';
@@ -113,6 +211,7 @@ export class AiClientError extends Error {
     this.isRetryable = options.isRetryable;
     this.statusCode = options.statusCode;
     this.requestId = options.requestId;
+    this.usageEvidence = options.usageEvidence;
     if (options.cause) {
       this.cause = options.cause;
     }
@@ -261,10 +360,46 @@ export function normalizeRequestId(incoming?: string): string {
  * Never logs credentials, transcripts, prompts, or generated notes.
  */
 export async function generateAiNotes(
+  ticket: DispatchAuthorizationTicket,
   transcript: string,
   videoTitle: string,
   options?: GenerateAiNotesOptions
+): Promise<GeneratedNotes>;
+export async function generateAiNotes(
+  transcript: string,
+  videoTitle: string,
+  options?: GenerateAiNotesOptions
+): Promise<GeneratedNotes>;
+export async function generateAiNotes(
+  arg1: DispatchAuthorizationTicket | string,
+  arg2: string,
+  arg3?: string | GenerateAiNotesOptions,
+  arg4?: GenerateAiNotesOptions
 ): Promise<GeneratedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let transcript: string;
+  let videoTitle: string;
+  let options: GenerateAiNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    transcript = arg2;
+    videoTitle = arg3 as string;
+    options = arg4;
+    ticket.consume('monolithic', ticket.attemptId);
+  } else {
+    transcript = arg1;
+    videoTitle = arg2;
+    options = arg3 as GenerateAiNotesOptions | undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to generate AI notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);
@@ -510,12 +645,15 @@ export async function generateAiNotes(
         if (returnedCode === 'MALFORMED_OUTPUT') {
           recordAiRequest(model, 'malformed_output');
           recordAiDuration(model, durationSeconds);
+          const rawUsage = errorPayload?.error?.usage ?? errorPayload?.usage;
+          const usageEvidence = extractUsageEvidence(rawUsage);
           throw new AiClientError({
             code: 'MALFORMED_AI_OUTPUT',
             message: 'The AI model output could not be parsed into notes format.',
             isRetryable: false,
             statusCode: 502,
             requestId: effectiveRequestId,
+            usageEvidence,
           });
         }
 
@@ -610,6 +748,7 @@ export async function generateAiNotes(
         status: response.status,
         errors: validation.error.format(),
       });
+      const usageEvidence = extractUsageEvidence((parsedJson as any)?.usage);
       throw new AiClientError({
         code: 'MALFORMED_AI_OUTPUT',
         message: 'The AI model output could not be parsed into notes format.',
@@ -617,6 +756,7 @@ export async function generateAiNotes(
         statusCode: response.status,
         requestId: effectiveRequestId,
         cause: validation.error,
+        usageEvidence,
       });
     }
 
@@ -887,12 +1027,15 @@ async function sendFastApiRequest<T>({
         if (returnedCode === 'MALFORMED_OUTPUT') {
           recordAiRequest(model, 'malformed_output');
           recordAiDuration(model, durationSeconds);
+          const rawUsage = errorPayload?.error?.usage ?? errorPayload?.usage;
+          const usageEvidence = extractUsageEvidence(rawUsage);
           throw new AiClientError({
             code: 'MALFORMED_AI_OUTPUT',
             message: 'The AI model output could not be parsed into notes format.',
             isRetryable: false,
             statusCode: 502,
             requestId: effectiveRequestId,
+            usageEvidence,
           });
         }
 
@@ -985,6 +1128,7 @@ async function sendFastApiRequest<T>({
         status: response.status,
         errors: validation.error.format(),
       });
+      const usageEvidence = extractUsageEvidence((parsedJson as any)?.usage);
       throw new AiClientError({
         code: 'MALFORMED_AI_OUTPUT',
         message: 'The AI model output could not be parsed into notes format.',
@@ -992,6 +1136,7 @@ async function sendFastApiRequest<T>({
         statusCode: response.status,
         requestId: effectiveRequestId,
         cause: validation.error,
+        usageEvidence,
       });
     }
 
@@ -1035,12 +1180,58 @@ export interface GenerateChunkAiNotesOptions extends GenerateAiNotesOptions {}
  * Returns ChunkGeneratedNotes including token metrics (prompt, candidate, thoughts, total).
  */
 export async function generateChunkAiNotes(
+  ticket: DispatchAuthorizationTicket,
   chunkText: string,
   videoTitle: string,
-  chunkIndex: number = 0,
-  totalChunks: number = 1,
+  chunkIndex?: number,
+  totalChunks?: number,
   options?: GenerateChunkAiNotesOptions
+): Promise<ChunkGeneratedNotes>;
+export async function generateChunkAiNotes(
+  chunkText: string,
+  videoTitle: string,
+  chunkIndex?: number,
+  totalChunks?: number,
+  options?: GenerateChunkAiNotesOptions
+): Promise<ChunkGeneratedNotes>;
+export async function generateChunkAiNotes(
+  arg1: DispatchAuthorizationTicket | string,
+  arg2: string,
+  arg3?: string | number,
+  arg4?: number,
+  arg5?: number | GenerateChunkAiNotesOptions,
+  arg6?: GenerateChunkAiNotesOptions
 ): Promise<ChunkGeneratedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let chunkText: string;
+  let videoTitle: string;
+  let chunkIndex = 0;
+  let totalChunks = 1;
+  let options: GenerateChunkAiNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    chunkText = arg2;
+    videoTitle = arg3 as string;
+    chunkIndex = typeof arg4 === 'number' ? arg4 : 0;
+    totalChunks = typeof arg5 === 'number' ? arg5 : 1;
+    options = arg6;
+    ticket.consume('chunk', ticket.attemptId);
+  } else {
+    chunkText = arg1;
+    videoTitle = arg2;
+    chunkIndex = typeof arg3 === 'number' ? arg3 : 0;
+    totalChunks = typeof arg4 === 'number' ? arg4 : 1;
+    options = typeof arg5 === 'object' ? arg5 : undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to generate chunk AI notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);
@@ -1117,10 +1308,46 @@ export interface SynthesizeSectionNotesOptions extends GenerateAiNotesOptions {}
  * and table of contents from multiple chunk summaries.
  */
 export async function synthesizeSectionNotes(
+  ticket: DispatchAuthorizationTicket,
   chunkSummaries: ChunkSummary[],
   videoTitle: string,
   options?: SynthesizeSectionNotesOptions
+): Promise<SynthesizedNotes>;
+export async function synthesizeSectionNotes(
+  chunkSummaries: ChunkSummary[],
+  videoTitle: string,
+  options?: SynthesizeSectionNotesOptions
+): Promise<SynthesizedNotes>;
+export async function synthesizeSectionNotes(
+  arg1: DispatchAuthorizationTicket | ChunkSummary[],
+  arg2: ChunkSummary[] | string,
+  arg3?: string | SynthesizeSectionNotesOptions,
+  arg4?: SynthesizeSectionNotesOptions
 ): Promise<SynthesizedNotes> {
+  let ticket: DispatchAuthorizationTicket | null = null;
+  let chunkSummaries: ChunkSummary[];
+  let videoTitle: string;
+  let options: SynthesizeSectionNotesOptions | undefined;
+
+  if (arg1 instanceof DispatchAuthorizationTicket) {
+    ticket = arg1;
+    chunkSummaries = arg2 as ChunkSummary[];
+    videoTitle = arg3 as string;
+    options = arg4;
+    ticket.consume('synthesis', ticket.attemptId);
+  } else {
+    chunkSummaries = arg1 as ChunkSummary[];
+    videoTitle = arg2 as string;
+    options = arg3 as SynthesizeSectionNotesOptions | undefined;
+    if (process.env.NODE_ENV !== 'test' || process.env.ENFORCE_DISPATCH_TICKET === 'true') {
+      throw new AiClientError({
+        code: 'UNAUTHORIZED_DISPATCH',
+        message: 'A valid DispatchAuthorizationTicket is required to synthesize section notes.',
+        isRetryable: false,
+      });
+    }
+  }
+
   const model = options?.model || process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
   const rawRequestId = options?.requestId;
   const requestId = normalizeRequestId(rawRequestId);

@@ -28,7 +28,7 @@ describe('GET /api/notes - Keyset Pagination, Search, Sorting & Validation', () 
   it('should return 401 when user is unauthenticated', async () => {
     vi.mocked(auth.requireUser).mockRejectedValueOnce(new auth.UnauthorizedError());
 
-    const response = await GET();
+    const response = await GET(new Request('http://localhost/api/notes'));
     expect(response.status).toBe(401);
 
     const body = await response.json();
@@ -58,7 +58,7 @@ describe('GET /api/notes - Keyset Pagination, Search, Sorting & Validation', () 
       fields: [],
     } as any);
 
-    const response = await GET();
+    const response = await GET(new Request('http://localhost/api/notes'));
     expect(response.status).toBe(200);
 
     const body = await response.json();
@@ -310,7 +310,7 @@ describe('GET /api/notes - Keyset Pagination, Search, Sorting & Validation', () 
     vi.mocked(auth.requireUser).mockResolvedValueOnce({ id: mockUserId } as any);
     vi.mocked(db.query).mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
 
-    const response = await GET();
+    const response = await GET(new Request('http://localhost/api/notes'));
     expect(response.status).toBe(500);
 
     const body = await response.json();

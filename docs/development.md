@@ -60,7 +60,7 @@ cd ../..
 | :--- | :---: | :--- | :--- |
 | `FASTAPI_SERVICE_SECRET` | **Yes** | Shared Bearer token. Must match `FASTAPI_SERVICE_SECRET` in `.env.local`. | `your-secure-random-secret-token` |
 | `GEMINI_API_KEY` | **Yes** | Google Gemini API key from [Google AI Studio](https://aistudio.google.com/). | `AIza...` |
-| `GEMINI_MODEL` | No | Model name for note generation. Default: `gemini-2.5-flash`. | `gemini-2.5-flash` |
+| `GEMINI_MODEL` | No | Model name for note generation. Default: `gemini-3.5-flash-lite`. | `gemini-3.5-flash-lite` |
 | `GEMINI_TIMEOUT_MS` | No | Outbound Gemini API timeout in milliseconds. Default: `75000` (75s). | `75000` |
 | `HOST` | No | Bind host. Default: `0.0.0.0`. | `0.0.0.0` |
 | `PORT` | No | Bind port. Default: `8000`. | `8000` |

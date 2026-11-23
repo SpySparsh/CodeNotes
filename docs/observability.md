@@ -63,8 +63,8 @@ The application registers and exposes Prometheus metrics at `/api/metrics` via a
 | `codenotes_generation_duration_seconds` | Histogram | `status` (`completed`, `failed`) | End-to-end duration of the entire generation pipeline |
 | `codenotes_transcript_requests_total` | Counter | `source` (`cache_hit`, `supadata`, `youtube_transcript_fallback`), `status` (`success`, `error`) | Transcript acquisition attempts by provider and outcome |
 | `codenotes_transcript_duration_seconds` | Histogram | `provider` (`supadata`, `youtube_transcript`) | Upstream transcript provider network latency |
-| `codenotes_ai_requests_total` | Counter | `model` (`gemini-2.5-flash`), `status` (`success`, `error`, `malformed_output`) | Gemini AI inference call counts and error classifications |
-| `codenotes_ai_duration_seconds` | Histogram | `model` (`gemini-2.5-flash`) | Gemini AI inference latency (buckets: 1s to 90s) |
+| `codenotes_ai_requests_total` | Counter | `model` (`gemini-3.5-flash-lite`), `status` (`success`, `error`, `malformed_output`) | Gemini AI inference call counts and error classifications |
+| `codenotes_ai_duration_seconds` | Histogram | `model` (`gemini-3.5-flash-lite`) | Gemini AI inference latency (buckets: 1s to 90s) |
 | `codenotes_rate_limit_rejections_total` | Counter | `endpoint` | Count of HTTP requests rejected due to token bucket exhaustion |
 | `codenotes_reconciliation_runs_total` | Counter | `status` (`success`, `error`) | Executions of the stale generation reconciliation cron job |
 | `codenotes_stale_jobs_recovered_total` | Counter | None | Total count of orphaned/stale jobs re-dispatched by the reconciler |

@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         description="Google Gemini API key from Google AI Studio",
     )
     gemini_model: str = Field(
-        default="gemini-1.5-flash",
+        default="gemini-3.5-flash-lite",
         description="Gemini model name to use for note generation",
     )
     gemini_timeout_ms: int = Field(

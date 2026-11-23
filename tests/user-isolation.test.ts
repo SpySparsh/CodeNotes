@@ -140,7 +140,7 @@ describe('User Isolation & IDOR Protection (User A vs User B)', () => {
       fields: [],
     } as any);
 
-    const response = await getNotesList();
+    const response = await getNotesList(new Request('http://localhost/api/notes'));
     expect(response.status).toBe(200);
     const body = await response.json();
 

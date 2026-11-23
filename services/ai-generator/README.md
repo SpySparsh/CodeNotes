@@ -17,7 +17,7 @@ Standalone FastAPI microservice responsible for generating structured technical 
    ├── Verify Service Bearer Token (constant-time compare)
    ├── Validate Input Payload (transcript, videoTitle)
    ├── Construct Technical Content Architect Prompt
-   ├── Invoke Google Gemini (gemini-2.5-flash) via google-genai SDK (75s timeout)
+   ├── Invoke Google Gemini (gemini-3.5-flash-lite) via google-genai SDK (75s timeout)
    ├── Parse & Validate JSON into Pydantic schema
    └── Return camelCase response: { overview, keyConcepts, detailedNotes, shorthands }
 ```
@@ -144,7 +144,7 @@ cp .env.example .env
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `GEMINI_API_KEY` | **Yes** | — | Google Gemini API key from Google AI Studio. |
-| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model name for note generation. |
+| `GEMINI_MODEL` | No | `gemini-3.5-flash-lite` | Gemini model name for note generation. |
 | `FASTAPI_SERVICE_SECRET` | **Yes** | — | Internal shared secret Bearer token. Must not be empty or placeholder. |
 | `GEMINI_TIMEOUT_MS` | No | `75000` | Gemini outbound request timeout in milliseconds (75s). |
 | `HOST` | No | `0.0.0.0` | Server bind host. |
@@ -276,7 +276,7 @@ Configure the following variables in the FastAPI project settings under **Settin
 | Variable | Environment | Example Value / Description |
 | :--- | :---: | :--- |
 | `GEMINI_API_KEY` | Preview, Production | Google AI Studio Gemini API key (`AIza...`) |
-| `GEMINI_MODEL` | Preview, Production | `gemini-2.5-flash` |
+| `GEMINI_MODEL` | Preview, Production | `gemini-3.5-flash-lite` |
 | `GEMINI_TIMEOUT_MS` | Preview, Production | `75000` (75s outbound API timeout) |
 | `FASTAPI_SERVICE_SECRET` | Preview, Production | High-entropy shared secret (minimum 32 random characters) |
 | `ENVIRONMENT` | Preview: `preview`, Production: `production` | Runtime environment name |

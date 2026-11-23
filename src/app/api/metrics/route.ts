@@ -21,7 +21,7 @@ function safeCompareSecret(provided: string, expected: string): boolean {
   return crypto.timingSafeEqual(bufProvided, bufExpected);
 }
 
-export async function GET(request?: Request) {
+export async function GET(request: Request) {
   const metricsSecret = process.env.METRICS_SECRET?.trim() || null;
   const isProductionOrPreview =
     process.env.NODE_ENV === 'production' ||

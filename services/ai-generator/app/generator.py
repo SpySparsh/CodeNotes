@@ -24,11 +24,144 @@ from app.schemas import (
     ChunkGeneratedNotes,
     ChunkSummary,
     GeneratedNotes,
+    GeneratedNotesContent,
     SynthesizedNotes,
     UsageMetadata,
 )
 
 logger = logging.getLogger("ai_generator.generator")
+
+SAFE_METADATA_KEYS = frozenset({"quota_metric", "quota_limit", "consumer", "quota_location"})
+SENSITIVE_KEY_PATTERN = re.compile(r"(AIza[0-9A-Za-z-_]{35}|Bearer\s+[A-Za-z0-9_\-\.]+)", re.IGNORECASE)
+
+
+def sanitize_diagnostic_string(val: Any, max_len: int = 500) -> str | None:
+    """Sanitize and truncate strings for safe diagnostic logging."""
+    if not isinstance(val, str):
+        return None
+    sanitized = SENSITIVE_KEY_PATTERN.sub("[REDACTED]", val.strip())
+    if len(sanitized) > max_len:
+        return sanitized[:max_len] + "...[TRUNCATED]"
+    return sanitized
+
+
+def extract_api_error_diagnostics(exc: Any) -> dict[str, Any]:
+    """Safely extract structured Google API error and quota diagnostic details.
+
+    Never raises an exception, never leaks API keys, authorization tokens,
+    transcripts, or unparsed request/response bodies.
+    """
+    diagnostics: dict[str, Any] = {
+        "status_code": None,
+        "grpc_status": None,
+        "error_message": None,
+        "quota_failures": None,
+        "error_info": None,
+        "retry_delay": None,
+        "retry_after_header": None,
+    }
+
+    try:
+        raw_code = getattr(exc, "code", None)
+        diagnostics["status_code"] = raw_code if isinstance(raw_code, int) else None
+        diagnostics["grpc_status"] = sanitize_diagnostic_string(getattr(exc, "status", None), max_len=100)
+
+        raw_msg = getattr(exc, "message", None)
+        if raw_msg is None and isinstance(exc, Exception) and not hasattr(exc, "details"):
+            raw_msg = str(exc)
+        diagnostics["error_message"] = sanitize_diagnostic_string(raw_msg, max_len=500)
+
+        # Extract Retry-After from response headers if available
+        response = getattr(exc, "response", None)
+        if response is not None:
+            headers = getattr(response, "headers", None)
+            if headers is not None and hasattr(headers, "get"):
+                raw_retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                if raw_retry_after is not None:
+                    diagnostics["retry_after_header"] = sanitize_diagnostic_string(str(raw_retry_after), max_len=50)
+
+        # Extract structured details from exc.details (parsed JSON response body)
+        raw_details = getattr(exc, "details", None)
+        details_list: list[Any] = []
+        if isinstance(raw_details, dict):
+            err_dict = raw_details.get("error")
+            if isinstance(err_dict, dict) and isinstance(err_dict.get("details"), list):
+                details_list = err_dict["details"]
+            elif isinstance(raw_details.get("details"), list):
+                details_list = raw_details["details"]
+        elif isinstance(raw_details, list):
+            details_list = raw_details
+
+        quota_failures: list[dict[str, str]] = []
+        error_info: dict[str, Any] | None = None
+        retry_delay: str | None = None
+
+        for item in details_list:
+            if not isinstance(item, dict):
+                continue
+
+            type_name = str(item.get("@type", "") or item.get("type", ""))
+
+            # Handle QuotaFailure
+            if "QuotaFailure" in type_name:
+                violations = item.get("violations")
+                if isinstance(violations, list):
+                    for v in violations[:5]:
+                        if isinstance(v, dict):
+                            entry: dict[str, str] = {}
+                            subject = sanitize_diagnostic_string(v.get("subject"), max_len=150)
+                            desc = sanitize_diagnostic_string(v.get("description"), max_len=300)
+                            if subject:
+                                entry["subject"] = subject
+                            if desc:
+                                entry["description"] = desc
+                            if entry:
+                                quota_failures.append(entry)
+
+            # Handle ErrorInfo
+            elif "ErrorInfo" in type_name:
+                reason = sanitize_diagnostic_string(item.get("reason"), max_len=100)
+                meta = item.get("metadata")
+                safe_meta: dict[str, str] = {}
+                if isinstance(meta, dict):
+                    for k, v in meta.items():
+                        if k in SAFE_METADATA_KEYS and v is not None:
+                            safe_val = sanitize_diagnostic_string(str(v), max_len=150)
+                            if safe_val is not None:
+                                safe_meta[k] = safe_val
+                if reason or safe_meta:
+                    error_info = {}
+                    if reason:
+                        error_info["reason"] = reason
+                    if safe_meta:
+                        error_info["metadata"] = safe_meta
+
+            # Handle RetryInfo
+            elif "RetryInfo" in type_name:
+                raw_delay = item.get("retryDelay")
+                if isinstance(raw_delay, str):
+                    retry_delay = sanitize_diagnostic_string(raw_delay, max_len=50)
+                elif isinstance(raw_delay, dict):
+                    sec = raw_delay.get("seconds")
+                    nanos = raw_delay.get("nanos")
+                    if sec is not None or nanos is not None:
+                        s = sec if sec is not None else 0
+                        retry_delay = f"{s}s" if not nanos else f"{s}.{str(nanos)[:3]}s"
+                elif isinstance(raw_delay, (int, float)):
+                    retry_delay = f"{raw_delay}s"
+
+        if quota_failures:
+            diagnostics["quota_failures"] = quota_failures
+        if error_info:
+            diagnostics["error_info"] = error_info
+        if retry_delay:
+            diagnostics["retry_delay"] = retry_delay
+
+    except Exception:
+        # Failsafe: never allow diagnostic extraction failure to crash exception handler
+        pass
+
+    return diagnostics
 
 
 def build_prompt(transcript: str, video_title: str) -> str:
@@ -50,6 +183,8 @@ Your objective is to generate premium, highly structured technical study notes b
 
 3. **Comparison Tables:** Whenever the transcript compares two or more topics, concepts, or tools (e.g., if-else vs switch, React vs Vue), you MUST generate a Markdown comparison table to highlight differences (Performance, Use Case, Readability, etc.) inline within the 'detailedNotes' markdown string.
 
+4. **Original Synthesis:** Synthesize, explain, and organize the concepts in your own original words. Do not quote or recite long segments of the transcript verbatim. Extract code snippets and technical keywords accurately, but articulate the explanations independently.
+
 Return the result strictly as a JSON object matching this schema:
 {{
   "overview": "A compelling overview of the video's purpose (2-3 sentences).",
@@ -65,7 +200,7 @@ Here is the transcript:
 """
 
 
-def parse_and_validate_notes(raw_text: str) -> GeneratedNotes:
+def parse_and_validate_notes(raw_text: str) -> GeneratedNotesContent:
     """Parse raw text from model output, strip markdown code fences, and validate schema."""
     cleaned = raw_text.strip()
     if cleaned.startswith("```json"):
@@ -90,7 +225,7 @@ def parse_and_validate_notes(raw_text: str) -> GeneratedNotes:
         raise MalformedOutputException("AI returned non-object JSON output.")
 
     try:
-        return GeneratedNotes.model_validate(data)
+        return GeneratedNotesContent.model_validate(data)
     except ValidationError as exc:
         logger.error(
             "gemini_schema_validation_failed",
@@ -118,6 +253,8 @@ Your objective is to generate detailed, structured technical study notes based o
 2. **Contextual Code Mapping:** Do NOT clump code blocks at the end. When you process a theory block or topic within the 'detailedNotes' markdown, you MUST immediately locate and insert the syntactically correct code block exactly where it belongs conceptually. All code must reside inline within the appropriate detailed topic sections using standard markdown fences (e.g., ```typescript).
 
 3. **Comparison Tables:** Whenever the transcript section compares two or more topics, concepts, or tools (e.g., if-else vs switch, React vs Vue), you MUST generate a Markdown comparison table to highlight differences (Performance, Use Case, Readability, etc.) inline within the 'detailedNotes' markdown string.
+
+4. **Original Synthesis:** Synthesize, explain, and organize the concepts in your own original words. Do not quote or recite long segments of the transcript verbatim. Extract code snippets and technical keywords accurately, but articulate the explanations independently.
 
 Return the result strictly as a JSON object matching this schema:
 {{
@@ -215,9 +352,9 @@ def parse_and_validate_synthesized_notes(raw_text: str) -> SynthesizedNotesConte
 def extract_usage_metadata(response: Any) -> UsageMetadata:
     """Extract prompt, candidate, thoughts, and total token metrics from Google GenAI SDK response."""
     usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = 0
-    candidate_tokens = 0
-    thoughts_tokens = 0
+    prompt_tokens = None
+    candidate_tokens = None
+    thoughts_tokens = None
     total_tokens = 0
 
     if usage is not None:
@@ -294,7 +431,7 @@ class GeminiNoteGenerator:
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=GeneratedNotes,
+            response_schema=GeneratedNotesContent,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
 
@@ -380,6 +517,15 @@ class GeminiNoteGenerator:
             # Log diagnostic metadata immediately before JSON parsing / validation
             logger.info("gemini_generation_response_received", extra=diagnostic_context)
 
+            usage_meta: UsageMetadata | None = None
+            if usage is not None and total_tokens is not None:
+                usage_meta = UsageMetadata(
+                    prompt_tokens=prompt_tokens,
+                    candidate_tokens=candidate_tokens,
+                    thoughts_tokens=thoughts_tokens,
+                    total_tokens=total_tokens,
+                )
+
             # Handle text extraction failure or absent textual content
             if text_extraction_exc is not None:
                 logger.error(
@@ -397,7 +543,8 @@ class GeminiNoteGenerator:
                     },
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -415,12 +562,17 @@ class GeminiNoteGenerator:
                         "duration_ms": round(duration_ms, 2),
                     },
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             # Attempt parsing and schema validation
             try:
-                notes = parse_and_validate_notes(raw_text)
+                content = parse_and_validate_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_generation_parsing_failed",
                     extra={
@@ -436,6 +588,18 @@ class GeminiNoteGenerator:
                     },
                 )
                 raise
+
+            notes = GeneratedNotes(
+                overview=content.overview,
+                key_concepts=content.key_concepts,
+                detailed_notes=content.detailed_notes,
+                shorthands=content.shorthands,
+                usage=usage_meta,
+                prompt_tokens=usage_meta.prompt_tokens if usage_meta else None,
+                candidate_tokens=usage_meta.candidate_tokens if usage_meta else None,
+                thoughts_tokens=usage_meta.thoughts_tokens if usage_meta else None,
+                total_tokens=usage_meta.total_tokens if usage_meta else None,
+            )
 
             logger.info(
                 "gemini_generation_completed",
@@ -454,13 +618,14 @@ class GeminiNoteGenerator:
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_code = exc.code
             error_message = exc.message or ""
+            diagnostics = extract_api_error_diagnostics(exc)
 
             logger.warning(
                 "gemini_api_error",
                 extra={
                     **log_context,
                     "duration_ms": round(duration_ms, 2),
-                    "status_code": error_code,
+                    **diagnostics,
                 },
             )
 
@@ -541,7 +706,7 @@ class GeminiNoteGenerator:
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=GeneratedNotes,
+            response_schema=GeneratedNotesContent,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
 
@@ -618,7 +783,8 @@ class GeminiNoteGenerator:
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -626,11 +792,16 @@ class GeminiNoteGenerator:
                     "gemini_chunk_parsing_failed",
                     extra={**diagnostic_context, "exception_category": "MalformedOutputException"},
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             try:
                 notes = parse_and_validate_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_chunk_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(parse_exc).__name__},
@@ -666,10 +837,15 @@ class GeminiNoteGenerator:
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_code = exc.code
             error_message = exc.message or ""
+            diagnostics = extract_api_error_diagnostics(exc)
 
             logger.warning(
                 "gemini_chunk_api_error",
-                extra={**log_context, "duration_ms": round(duration_ms, 2), "status_code": error_code},
+                extra={
+                    **log_context,
+                    "duration_ms": round(duration_ms, 2),
+                    **diagnostics,
+                },
             )
 
             if error_code == 429 or "RESOURCE_EXHAUSTED" in error_message or "rate limit" in error_message.lower():
@@ -807,7 +983,8 @@ class GeminiNoteGenerator:
                     extra={**diagnostic_context, "exception_category": type(text_extraction_exc).__name__},
                 )
                 raise MalformedOutputException(
-                    "Failed to extract textual content from AI response."
+                    "Failed to extract textual content from AI response.",
+                    usage=usage_meta,
                 ) from text_extraction_exc
 
             if not raw_text or not raw_text.strip():
@@ -815,11 +992,16 @@ class GeminiNoteGenerator:
                     "gemini_synthesis_parsing_failed",
                     extra={**diagnostic_context, "exception_category": "MalformedOutputException"},
                 )
-                raise MalformedOutputException("AI model returned no usable text content in response candidates.")
+                raise MalformedOutputException(
+                    "AI model returned no usable text content in response candidates.",
+                    usage=usage_meta,
+                )
 
             try:
                 synth_data = parse_and_validate_synthesized_notes(raw_text)
             except Exception as parse_exc:
+                if isinstance(parse_exc, MalformedOutputException):
+                    parse_exc.usage = usage_meta
                 logger.error(
                     "gemini_synthesis_parsing_failed",
                     extra={**diagnostic_context, "exception_category": type(parse_exc).__name__},
@@ -856,10 +1038,15 @@ class GeminiNoteGenerator:
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_code = exc.code
             error_message = exc.message or ""
+            diagnostics = extract_api_error_diagnostics(exc)
 
             logger.warning(
                 "gemini_synthesis_api_error",
-                extra={**log_context, "duration_ms": round(duration_ms, 2), "status_code": error_code},
+                extra={
+                    **log_context,
+                    "duration_ms": round(duration_ms, 2),
+                    **diagnostics,
+                },
             )
 
             if error_code == 429 or "RESOURCE_EXHAUSTED" in error_message or "rate limit" in error_message.lower():
