@@ -6,7 +6,7 @@ import { withSpan, SpanStatusCode, sanitizeErrorMessage, createSafeSpan, type Sp
 import { DispatchAuthorizationTicket } from '@/lib/quota-client';
 
 export const DEFAULT_AI_TIMEOUT_MS = 85_000;
-export const DEFAULT_AI_MODEL = 'gemini-1.5-flash';
+export const DEFAULT_AI_MODEL = 'gemini-3.5-flash-lite';
 
 /**
  * Token usage metadata extracted from Gemini responses.

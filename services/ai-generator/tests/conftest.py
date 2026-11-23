@@ -16,7 +16,7 @@ def override_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     """Provide deterministic test settings for all tests."""
     test_settings = Settings(
         gemini_api_key=SecretStr("mock-test-gemini-api-key"),
-        gemini_model="gemini-1.5-flash",
+        gemini_model="gemini-3.5-flash-lite",
         gemini_timeout_ms=75000,
         fastapi_service_secret=SecretStr("mock-test-service-secret"),
         host="127.0.0.1",

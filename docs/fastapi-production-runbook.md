@@ -120,7 +120,7 @@ All error responses from FastAPI conform to the standardized schema `{"error": {
 | `FASTAPI_SERVICE_URL` | **CodeNotes** (Preview & Prod) | Safe URL | Base URL of the FastAPI microservice. Local: `http://127.0.0.1:8000`. **Production MUST use `https://`** pointing to the stable production domain (e.g. `https://codenotes-ai-generator.vercel.app`). |
 | `FASTAPI_SERVICE_SECRET` | **Both** CodeNotes & FastAPI | **Secret** | Cryptographic shared token (minimum 32 random characters). Transmitted via `Authorization: Bearer <FASTAPI_SERVICE_SECRET>`. Must match identically across both projects. |
 | `GEMINI_API_KEY` | **FastAPI only** | **Secret** | Google AI Studio API key used by the `google-genai` Python SDK. |
-| `GEMINI_MODEL` | **FastAPI only** (Optional) | Safe | Model name. Default: `gemini-2.5-flash`. |
+| `GEMINI_MODEL` | **FastAPI only** (Optional) | Safe | Model name. Default: `gemini-3.5-flash-lite`. |
 | `GEMINI_TIMEOUT_MS` | **FastAPI only** (Optional) | Safe | Outbound Gemini API timeout. Default: `75000` (75 seconds). |
 | `FASTAPI_VERCEL_PROTECTION_BYPASS` | **CodeNotes** (Preview only) | **Secret** | Platform-level secret used to bypass Vercel Deployment Protection on FastAPI Preview deployments. Transmitted via `x-vercel-protection-bypass`. Leave empty in local and production. |
 
@@ -159,7 +159,7 @@ Do not confuse the two bypass mechanisms:
    - `GEMINI_API_KEY`: Google AI Studio production API key.
    - `FASTAPI_SERVICE_SECRET`: High-entropy 32+ character random string.
    - `ENVIRONMENT`: `production`
-   - `GEMINI_MODEL`: `gemini-2.5-flash`
+   - `GEMINI_MODEL`: `gemini-3.5-flash-lite`
    - `GEMINI_TIMEOUT_MS`: `75000`
 3. **Deploy the Service**:
    Deploy from `main` or merge to `main`.
