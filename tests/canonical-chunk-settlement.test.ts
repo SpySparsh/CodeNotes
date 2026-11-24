@@ -15,7 +15,7 @@ import * as quotaClient from '@/lib/quota-client';
  */
 describe('Canonical Chunk Settlement & Quota Replay Hardening', () => {
   const sqlPath = path.resolve(__dirname, '../scripts/migrate-canonical-chunk-settlement.sql');
-  const sql = fs.readFileSync(sqlPath, 'utf8');
+  const sql = fs.readFileSync(sqlPath, 'utf8').replace(/\r\n/g, '\n');
 
   // =========================================================================
   // 1. TypeScript Contract: Preservation of Attempt Identity on Normal & Adopted Paths
