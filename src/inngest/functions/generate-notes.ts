@@ -28,7 +28,6 @@ import {
 import {
   reserveQuota,
   markReservationDispatching,
-  completeChunkAndCommitQuota,
   releaseQuotaReservation,
   releaseAbortedDispatch,
   claimOrAdoptDispatchSlot,
@@ -944,6 +943,7 @@ export const generateNotesFunction = inngest.createFunction(
 
           if (slotRes.adopted && slotRes.adoptedPayload) {
             chunkNotes = slotRes.adoptedPayload;
+            lastAttemptId = slotRes.attemptId;
             break;
           }
 
@@ -1031,56 +1031,35 @@ export const generateNotesFunction = inngest.createFunction(
           }
         }
 
-        // 4. Complete Chunk and Commit Quota (Attempt Ledger & Chunk Generations)
-        if (lastAttemptId) {
-          const compRes = await completeDispatchAttempt({
-            attemptId: lastAttemptId,
-            reservationToken,
-            leaseToken,
-            workerId,
-            fencingGeneration: generation,
-            operationType: 'chunk',
-            responsePayload: {
-              overview: chunkNotes.overview,
-              keyConcepts: chunkNotes.keyConcepts,
-              detailedNotes: chunkNotes.detailedNotes,
-              shorthands: chunkNotes.shorthands,
-            },
-            totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
-            promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
-            candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
-            thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
-            modelName: DEFAULT_AI_MODEL,
-          });
+        // 4. Complete Chunk and Commit Quota (Canonical Attempt Ledger & Chunk Generations Settlement)
+        if (!lastAttemptId) {
+          throw new Error(`Cannot settle chunk ${chunk.chunkIndex}: missing dispatch attempt identity`);
+        }
 
-          if (!compRes.success && compRes.statusCode !== 'ALREADY_COMPLETED') {
-            throw new Error(`Complete chunk dispatch attempt failed: ${compRes.statusCode}`);
-          }
-        } else {
-          const commitRes = await completeChunkAndCommitQuota({
-            userId,
-            parentKey: idempotencyKey,
-            chunkIndex: chunk.chunkIndex,
-            reservationToken,
-            leaseToken,
-            workerId,
-            fencingGeneration: generation,
-            chunkNotes: {
-              overview: chunkNotes.overview,
-              keyConcepts: chunkNotes.keyConcepts,
-              detailedNotes: chunkNotes.detailedNotes,
-              shorthands: chunkNotes.shorthands,
-            },
-            totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
-            promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
-            candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
-            thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
-            modelName: DEFAULT_AI_MODEL,
-          });
+        const compRes = await completeDispatchAttempt({
+          attemptId: lastAttemptId,
+          reservationToken,
+          leaseToken,
+          workerId,
+          fencingGeneration: generation,
+          operationType: 'chunk',
+          responsePayload: {
+            overview: chunkNotes.overview,
+            keyConcepts: chunkNotes.keyConcepts,
+            detailedNotes: chunkNotes.detailedNotes,
+            shorthands: chunkNotes.shorthands,
+          },
+          totalTokens: chunkNotes.usage?.totalTokens ?? chunkNotes.totalTokens ?? 0,
+          promptTokens: chunkNotes.usage?.promptTokens ?? chunkNotes.promptTokens ?? 0,
+          candidateTokens: chunkNotes.usage?.candidateTokens ?? chunkNotes.candidateTokens ?? 0,
+          thoughtsTokens: chunkNotes.usage?.thoughtsTokens ?? chunkNotes.thoughtsTokens ?? 0,
+          modelName: DEFAULT_AI_MODEL,
+          userId,
+          parentKey: idempotencyKey,
+        });
 
-          if (!commitRes.success) {
-            throw new Error(`Complete chunk and commit quota failed: ${commitRes.statusCode}`);
-          }
+        if (!compRes.success && compRes.statusCode !== 'ALREADY_COMPLETED') {
+          throw new Error(`Complete chunk dispatch attempt failed: ${compRes.statusCode}`);
         }
 
         logger.info('inngest_chunk_committed_successfully', {
