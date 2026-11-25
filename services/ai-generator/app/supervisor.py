@@ -164,9 +164,7 @@ async def execute_chunk_supervised(
                 # Case C: inf_task was cancelled independently while in-flight
                 if is_parent_cancelled():
                     raise asyncio.CancelledError("Parent supervisor was cancelled.")
-                disconnect_observed = (
-                    disc_task in done and not disc_task.cancelled() and disc_task.exception() is None
-                )
+                disconnect_observed = disc_task in done and not disc_task.cancelled() and disc_task.exception() is None
                 if not disconnect_observed:
                     cancelled_err = asyncio.CancelledError("Inference task was cancelled independently.")
                     original_exception = cancelled_err
@@ -183,15 +181,19 @@ async def execute_chunk_supervised(
             if disc_task.cancelled():
                 # Case D: Monitor was cancelled independently
                 return await _settle_inference(
-                    inf_task, curr, initial_parent_cancelling,
-                    lambda: asyncio.CancelledError("Disconnect monitor was cancelled independently.")
+                    inf_task,
+                    curr,
+                    initial_parent_cancelling,
+                    lambda: asyncio.CancelledError("Disconnect monitor was cancelled independently."),
                 )
 
             disc_exc = disc_task.exception()
             if disc_exc is not None:
                 # Case E: Monitor failed with an internal exception
                 return await _settle_inference(
-                    inf_task, curr, initial_parent_cancelling,
+                    inf_task,
+                    curr,
+                    initial_parent_cancelling,
                     lambda: disc_exc,
                     context_exc=disc_exc,
                 )
@@ -200,8 +202,10 @@ async def execute_chunk_supervised(
         # 4. Confirmed Disconnect Won FIRST_COMPLETED: Verified Clean Monitor Exit
         # ----------------------------------------------------------------------
         return await _settle_inference(
-            inf_task, curr, initial_parent_cancelling,
-            lambda: ClientDisconnectException("Inference task cancelled due to client disconnect.")
+            inf_task,
+            curr,
+            initial_parent_cancelling,
+            lambda: ClientDisconnectException("Inference task cancelled due to client disconnect."),
         )
 
     except BaseException as e:
@@ -220,9 +224,7 @@ async def execute_chunk_supervised(
 
         while any(not c.done() for c in children):
             try:
-                await asyncio.shield(
-                    asyncio.gather(*[c for c in children if not c.done()], return_exceptions=True)
-                )
+                await asyncio.shield(asyncio.gather(*[c for c in children if not c.done()], return_exceptions=True))
             except asyncio.CancelledError:
                 cleanup_cancellation_count += 1
 
@@ -235,8 +237,7 @@ async def execute_chunk_supervised(
                     if original_exception is None:
                         original_exception = c_exc
                     elif (
-                        isinstance(original_exception, asyncio.CancelledError)
-                        and original_exception.__cause__ is None
+                        isinstance(original_exception, asyncio.CancelledError) and original_exception.__cause__ is None
                     ):
                         original_exception.__cause__ = c_exc
 

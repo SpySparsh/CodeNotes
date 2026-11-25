@@ -62,6 +62,7 @@ class MockRequest:
 # 1. CORE FOCUSED SCENARIOS
 # ==============================================================================
 
+
 @pytest.mark.asyncio
 async def test_normal_inference_success_preserves_notes_and_tokens():
     """Scenario 1: Normal inference success preserves notes and token metadata."""
@@ -204,6 +205,7 @@ async def test_parent_cancellation_propagates_during_inference_and_cleanup():
 @pytest.mark.asyncio
 async def test_provider_exceptions_propagate_when_parent_cancel_absent():
     """Scenario 5: Provider exceptions propagate directly when parent cancel is absent."""
+
     async def inf_fn():
         raise RateLimitedException("AI generation service is temporarily busy (429).")
 
@@ -222,6 +224,7 @@ async def test_provider_exceptions_propagate_when_parent_cancel_absent():
 @pytest.mark.asyncio
 async def test_no_child_tasks_leak_after_normal_terminations():
     """Scenario 6: Verify zero leaked child tasks across all termination paths."""
+
     async def inf_fn():
         return {"notes": "ok", "total_tokens": 10}
 
@@ -265,6 +268,7 @@ async def test_generator_type_error_propagates_without_retry():
 # 2. BASELINE CAPTURE AND CORNER-CASE SCENARIOS
 # ==============================================================================
 
+
 @pytest.mark.asyncio
 async def test_preflight_disconnect_cancels_before_dispatch():
     """Preflight check raises ClientDisconnectException without spawning inference."""
@@ -286,6 +290,7 @@ async def test_preflight_disconnect_cancels_before_dispatch():
 @pytest.mark.asyncio
 async def test_legitimate_none_result_supported():
     """Legitimate None result from generator is cleanly returned without RuntimeError."""
+
     async def inf_none():
         return None
 
@@ -346,6 +351,7 @@ async def test_true_barrier_simultaneous_completion():
 # ==============================================================================
 # 3. FASTAPI ENDPOINT INTEGRATION
 # ==============================================================================
+
 
 def test_endpoint_generate_chunk_supervised_success(client: TestClient, auth_headers: dict):
     """POST /api/v1/generate-chunk executes supervised generation and returns 200 with tokens."""
