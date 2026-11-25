@@ -1,34 +1,27 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Youtube, ArrowRight } from 'lucide-react';
-import { useRouter } from 'next/navigation';
-import { useQueryClient } from '@tanstack/react-query';
 import LoadingState from '@/components/LoadingState';
-import { createClient } from '@/lib/supabase/client';
 import { generateUrlSchema, GenerateUrlInput } from '@/lib/validations/generate';
-import { useGenerationStatus } from '@/hooks/useGenerationStatus';
-import { toast } from 'sonner';
-import { captureEvent, sanitizeErrorCode } from '@/lib/analytics';
+import { useGeneration } from '@/hooks/useGeneration';
 
 export default function UrlInput() {
-  const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [serverError, setServerError] = useState('');
-  const isSubmittingRef = useRef(false);
-  const startTimeRef = useRef<number | null>(null);
-  const terminalFiredRef = useRef<boolean>(false);
-  const router = useRouter();
-  const queryClient = useQueryClient();
-  const supabase = createClient();
+  const {
+    activeKey,
+    isSubmitting,
+    isGenerating,
+    status,
+    serverError,
+    startGeneration,
+  } = useGeneration();
 
   const {
     register,
     handleSubmit,
     formState: { errors },
-    watch,
+    control,
     reset,
   } = useForm<GenerateUrlInput>({
     resolver: zodResolver(generateUrlSchema),
@@ -37,141 +30,17 @@ export default function UrlInput() {
     },
   });
 
-  const urlValue = watch('url');
-
-  // TanStack Query status polling hook
-  const { data: statusData, error: statusError } = useGenerationStatus(activeKey);
-
-  // Monitor generation status changes
-  useEffect(() => {
-    if (!statusData) return;
-
-    if (statusData.status === 'completed' && statusData.noteId) {
-      if (!terminalFiredRef.current) {
-        terminalFiredRef.current = true;
-        const durationMs = startTimeRef.current
-          ? Math.round(performance.now() - startTimeRef.current)
-          : undefined;
-        captureEvent('generation_completed', durationMs !== undefined ? { duration_ms: durationMs } : undefined);
-      }
-
-      toast.success('Notes generated successfully!');
-      queryClient.invalidateQueries({ queryKey: ['notes'] });
-      const targetNoteId = statusData.noteId;
-      setActiveKey(null);
-      setIsSubmitting(false);
-      isSubmittingRef.current = false;
-      reset();
-      router.push(`/notes/${targetNoteId}`);
-    } else if (statusData.status === 'failed') {
-      if (!terminalFiredRef.current) {
-        terminalFiredRef.current = true;
-        captureEvent('generation_failed', {
-          error_code: sanitizeErrorCode(statusData.code),
-        });
-      }
-
-      const errorMsg = statusData.error || 'Failed to generate notes';
-      toast.error(errorMsg);
-      setServerError(errorMsg);
-      setActiveKey(null);
-      setIsSubmitting(false);
-      isSubmittingRef.current = false;
-    }
-  }, [statusData, queryClient, router, reset]);
-
-  // Handle polling network / authorization errors
-  useEffect(() => {
-    if (statusError) {
-      if (!terminalFiredRef.current) {
-        terminalFiredRef.current = true;
-        captureEvent('generation_failed', {
-          error_code: 'UNKNOWN_ERROR',
-        });
-      }
-
-      const errorMsg = statusError.message || 'Failed to verify generation status';
-      setServerError(errorMsg);
-      toast.error(errorMsg);
-      setActiveKey(null);
-      setIsSubmitting(false);
-      isSubmittingRef.current = false;
-    }
-  }, [statusError]);
+  const urlValue = useWatch({ control, name: 'url' });
 
   const onSubmit = async (data: GenerateUrlInput) => {
-    if (isSubmittingRef.current) return;
-    isSubmittingRef.current = true;
-
-    // Verify user is authenticated before sending generation request
-    try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) {
-        isSubmittingRef.current = false;
-        router.push(`/login?next=${encodeURIComponent('/')}`);
-        return;
-      }
-    } catch {
-      isSubmittingRef.current = false;
-      router.push(`/login?next=${encodeURIComponent('/')}`);
-      return;
-    }
-
-    setServerError('');
-    setIsSubmitting(true);
-
-    const idempotencyKey = crypto.randomUUID();
-
-    try {
-      const response = await fetch('/api/generate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Idempotency-Key': idempotencyKey,
-        },
-        body: JSON.stringify({ url: data.url }),
-      });
-
-      const resData = await response.json();
-
-      if (response.status === 401) {
-        router.push(`/login?next=${encodeURIComponent('/')}`);
-        return;
-      }
-
-      if (!response.ok && response.status !== 202) {
-        throw new Error(resData.error || 'Failed to submit generation request');
-      }
-
-      if (response.status === 200 && resData.status === 'completed' && resData.noteId) {
-        // Cache hit / already completed
-        captureEvent('generation_requested');
-        captureEvent('generation_completed', { duration_ms: 0 });
-        toast.success('Notes loaded from library!');
-        queryClient.invalidateQueries({ queryKey: ['notes'] });
-        reset();
-        router.push(`/notes/${resData.noteId}`);
-        return;
-      }
-
-      // 202 Accepted: asynchronous job in flight
-      captureEvent('generation_requested');
-      startTimeRef.current = performance.now();
-      terminalFiredRef.current = false;
-      const returnedKey = resData.idempotencyKey || idempotencyKey;
-      setActiveKey(returnedKey);
-    } catch (err: any) {
-      console.error(err);
-      setServerError(err.message || 'Something went wrong');
-      setIsSubmitting(false);
-      isSubmittingRef.current = false;
+    const res = await startGeneration(data.url);
+    if (res.success) {
+      reset();
     }
   };
 
-  if (isSubmitting || activeKey) {
-    return <LoadingState status={statusData?.status || 'pending'} />;
+  if (isSubmitting || activeKey || isGenerating) {
+    return <LoadingState status={status || 'pending'} />;
   }
 
   const displayError = errors.url?.message || serverError;
@@ -190,12 +59,12 @@ export default function UrlInput() {
           {...register('url')}
           className="block w-full pl-14 pr-36 py-5 bg-white border border-slate-200 rounded-2xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-4 focus:ring-purple-100 focus:border-purple-400 transition-all text-lg shadow-lg shadow-slate-200/40"
           placeholder="Paste a YouTube coding tutorial URL..."
-          disabled={isSubmitting || !!activeKey}
+          disabled={isSubmitting || isGenerating}
         />
         <div className="absolute inset-y-0 right-2 flex items-center">
           <button
             type="submit"
-            disabled={!urlValue || isSubmitting || !!activeKey}
+            disabled={!urlValue || isSubmitting || isGenerating}
             className="flex items-center gap-2 px-6 py-3 bg-primary hover:bg-purple-700 text-white font-semibold rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md cursor-pointer"
           >
             <span className="flex items-center gap-2">
