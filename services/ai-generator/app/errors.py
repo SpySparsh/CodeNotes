@@ -14,6 +14,7 @@ ERR_RATE_LIMITED = "RATE_LIMITED"
 ERR_TIMEOUT = "TIMEOUT"
 ERR_MALFORMED_OUTPUT = "MALFORMED_OUTPUT"
 ERR_UPSTREAM_ERROR = "UPSTREAM_ERROR"
+ERR_CLIENT_DISCONNECTED = "CLIENT_DISCONNECTED"
 
 
 class ServiceException(Exception):
@@ -108,6 +109,17 @@ class UpstreamErrorException(ServiceException):
             code=ERR_UPSTREAM_ERROR,
             message=message,
             status_code=502,
+        )
+
+
+class ClientDisconnectException(ServiceException):
+    """Raised when client disconnect is observed prior to or during chunk generation."""
+
+    def __init__(self, message: str = "Client disconnected prior to or during chunk generation."):
+        super().__init__(
+            code=ERR_CLIENT_DISCONNECTED,
+            message=message,
+            status_code=499,
         )
 
 
