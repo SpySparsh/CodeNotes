@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { useNotesInfiniteQuery, useDeleteNoteMutation } from '@/lib/queries/useNotes';
 import { useLibraryStore } from '@/lib/stores/useLibraryStore';
+import { useGeneration } from '@/hooks/useGeneration';
 import { SortField, SortOrder } from '@/lib/validations/notes';
 import {
   Select,
@@ -35,6 +36,7 @@ import { captureEvent } from '@/lib/analytics';
 export default function LibraryPage() {
   const router = useRouter();
   const { viewMode, setViewMode } = useLibraryStore();
+  const { isGenerating } = useGeneration();
 
   // Local search input state with debouncing
   const [searchInput, setSearchInput] = useState('');
@@ -145,8 +147,17 @@ export default function LibraryPage() {
 
         <Link href="/">
           <Button className="flex items-center gap-2 bg-primary hover:bg-purple-700 text-white rounded-xl shadow-md">
-            <PlusCircle size={18} />
-            <span>Generate New Note</span>
+            {isGenerating ? (
+              <>
+                <Loader2 size={18} className="animate-spin" />
+                <span>View Generation Progress</span>
+              </>
+            ) : (
+              <>
+                <PlusCircle size={18} />
+                <span>Generate New Note</span>
+              </>
+            )}
           </Button>
         </Link>
       </div>
@@ -290,8 +301,15 @@ export default function LibraryPage() {
               Start generating AI-powered tech notes and code snippets from any YouTube coding tutorial.
             </p>
             <Link href="/">
-              <Button className="bg-primary hover:bg-purple-700 text-white rounded-xl shadow-md">
-                Generate Your First Note
+              <Button className="flex items-center gap-2 bg-primary hover:bg-purple-700 text-white rounded-xl shadow-md">
+                {isGenerating ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    <span>View Note Being Generated</span>
+                  </>
+                ) : (
+                  <span>Generate Your First Note</span>
+                )}
               </Button>
             </Link>
           </div>

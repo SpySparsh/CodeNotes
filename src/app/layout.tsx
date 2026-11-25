@@ -4,6 +4,7 @@ import './globals.css';
 import Navbar from '@/components/Navbar';
 import QueryProvider from '@/components/providers/QueryProvider';
 import PostHogProvider from '@/components/providers/PostHogProvider';
+import { GenerationProvider } from '@/components/providers/GenerationProvider';
 import { Toaster } from '@/components/ui/sonner';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -23,11 +24,13 @@ export default function RootLayout({
       <body className={`${inter.className} bg-background text-foreground min-h-screen flex flex-col antialiased selection:bg-cyan-500/30`}>
         <QueryProvider>
           <PostHogProvider>
-            <Navbar />
-            <main className="flex-1 flex flex-col items-center w-full">
-              {children}
-            </main>
-            <Toaster richColors position="top-right" />
+            <GenerationProvider>
+              <Navbar />
+              <main className="flex-1 flex flex-col items-center w-full">
+                {children}
+              </main>
+              <Toaster richColors position="top-right" />
+            </GenerationProvider>
           </PostHogProvider>
         </QueryProvider>
       </body>

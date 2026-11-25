@@ -7,12 +7,14 @@ import { Library, Video, LogOut, User as UserIcon } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import type { User } from '@supabase/supabase-js';
 import { trackAuthSuccess, resetUser } from '@/lib/analytics';
+import { useGeneration } from '@/hooks/useGeneration';
 
 export default function Navbar() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const router = useRouter();
   const supabase = createClient();
+  const { isGenerating, clearGeneration } = useGeneration();
 
   useEffect(() => {
     const getUser = async () => {
@@ -48,6 +50,7 @@ export default function Navbar() {
   }, [supabase]);
 
   const handleSignOut = async () => {
+    clearGeneration();
     await supabase.auth.signOut();
     resetUser();
     setUser(null);
@@ -72,6 +75,20 @@ export default function Navbar() {
           <div className="flex items-center gap-4 sm:gap-6">
             {!loading && user ? (
               <>
+                {isGenerating && (
+                  <Link
+                    href="/"
+                    className="flex items-center gap-1.5 text-xs font-semibold text-purple-600 bg-purple-50 hover:bg-purple-100 transition-colors px-3 py-1.5 rounded-full border border-purple-200 shadow-xs"
+                    title="Generation in progress - click to view"
+                  >
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-600"></span>
+                    </span>
+                    <span className="hidden xs:inline sm:inline">Generating notes...</span>
+                  </Link>
+                )}
+
                 <Link
                   href="/library"
                   className="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-purple-600 transition-colors"
