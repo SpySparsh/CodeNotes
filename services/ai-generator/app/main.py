@@ -33,6 +33,7 @@ from app.schemas import (
     SynthesizedNotes,
     SynthesizeRequest,
 )
+from app.supervisor import execute_chunk_supervised
 
 # Explicitly allowlisted diagnostic and operational fields for JSON logging
 ALLOWLISTED_LOG_FIELDS = frozenset(
@@ -326,6 +327,10 @@ def create_app() -> FastAPI:
                 "model": ErrorResponse,
                 "description": "Too Many Requests - Upstream Rate Limited",
             },
+            499: {
+                "model": ErrorResponse,
+                "description": "Client Closed Request - Disconnect Observed",
+            },
             502: {
                 "model": ErrorResponse,
                 "description": "Bad Gateway - Malformed Model Output or Upstream Failure",
@@ -347,7 +352,9 @@ def create_app() -> FastAPI:
         x_request_id: str | None = Header(None),
     ) -> ChunkGeneratedNotes:
         req_id = getattr(request.state, "request_id", None) or sanitize_request_id(x_request_id)
-        return await generator.generate_chunk(
+        return await execute_chunk_supervised(
+            generator=generator,
+            request=request,
             chunk_text=payload.chunk_text,
             video_title=payload.video_title,
             chunk_index=payload.chunk_index,
