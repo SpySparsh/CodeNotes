@@ -191,8 +191,8 @@ test.describe('Note Generation Flow', () => {
     await input.fill(targetUrl);
     await page.getByRole('button', { name: /Generate/i }).click();
 
-    // Verify rate limit banner error
-    await expect(page.getByText(rateLimitMessage)).toBeVisible();
+    // Verify rate limit banner error scoped to the main landmark to distinguish from global toast notification
+    await expect(page.getByRole('main').getByText(rateLimitMessage)).toBeVisible();
   });
 
   test('should reject invalid YouTube URLs with client-side validation', async ({ page }) => {
